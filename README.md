@@ -1,4 +1,5 @@
 ## HIDL Bot — бытовой помощник в Telegram
+<img width="1024" height="1024" alt="ChatGPT Image 26 нояб  2025 г , 21_39_18" src="https://github.com/user-attachments/assets/b8785613-2b1d-48cb-a9b9-90ffa4be2bbd" />
 
 Python + aiogram бот, который помогает взрослым держать быт под контролем: рутины утро/день/вечер, свои напоминания, финансы, домашние планы и «мамин» справочник.
 
