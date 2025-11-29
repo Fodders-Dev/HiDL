@@ -12,6 +12,7 @@ from keyboards.common import main_menu_keyboard
 from utils.time import local_date_str
 from utils.tone import tone_message
 from utils.finance import payday_summary
+from utils.texts import register_text
 
 router = Router()
 
@@ -118,7 +119,7 @@ async def bills_reminder(message: types.Message, db) -> None:
 async def budget_set(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     parts = message.text.strip().split()
     if len(parts) < 2:
@@ -139,7 +140,7 @@ async def budget_set(message: types.Message, db) -> None:
 async def budget_cat(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     parts = message.text.strip().split(maxsplit=2)
     if len(parts) < 3:
@@ -162,7 +163,7 @@ async def tone_set(callback: types.CallbackQuery, db) -> None:
     _, tone = callback.data.split(":")
     user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
     if not user:
-        await callback.answer("Нужно зарегистрироваться: /start", show_alert=True)
+        await callback.answer(register_text(), show_alert=True)
         return
     await repo.upsert_wellness(db, user["id"], tone=tone)
     await callback.answer("Тон обновлён")
@@ -173,7 +174,7 @@ async def tone_set(callback: types.CallbackQuery, db) -> None:
 async def tone_select(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     await message.answer(
         "Выбери стиль общения:",

@@ -62,7 +62,10 @@ async def food_menu(message: types.Message) -> None:
 
 @router.message(lambda m: m.text and "дом" in m.text.lower())
 async def home_menu(message: types.Message) -> None:
-    await message.answer("Дом: уборка, зоны, стирка/запах.", reply_markup=home_menu_keyboard())
+    await message.answer(
+        "Дом: помогу навести порядок по-человечески.\nВыбирай, что актуальнее: быстренько убраться, посмотреть план на неделю или разобраться с регулярными делами.",
+        reply_markup=home_menu_keyboard(),
+    )
 
 
 @router.message(lambda m: m.text and "движ" in m.text.lower())
@@ -97,23 +100,26 @@ async def food_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("home:"))
-async def home_callbacks(callback: types.CallbackQuery, db) -> None:
+async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -> None:
     action = callback.data.split(":")[1]
     if action == "menu":
-        await callback.message.answer("Дом: уборка, зоны, стирка/запах.", reply_markup=home_menu_keyboard())
-    elif action == "clean":
-        await guides.clean_schedule(callback.message)
-    elif action == "zone":
-        from handlers import zones
-
-        await zones.zones(callback.message)
-    elif action == "regular":
+        await callback.message.answer(
+            "Дом: помогу навести порядок по-человечески.\nВыбирай, что актуальнее: быстренько убраться, посмотреть план на неделю или разобраться с регулярными делами.",
+            reply_markup=home_menu_keyboard(),
+        )
+    elif action == "now":
         from handlers import home_tasks
 
-        await home_tasks.home_audit(callback.message, db)
-    elif action == "quick":
-        await guides.clean_schedule(callback.message)
-    elif action == "laundry":
+        await home_tasks.start_clean_now(callback, db, state)
+    elif action == "week":
+        from handlers import home_tasks
+
+        await home_tasks.show_week_plan(callback.message, db)
+    elif action == "all":
+        from handlers import home_tasks
+
+        await home_tasks.show_all_tasks(callback.message, db)
+    elif action == "smell":
         from handlers.ask_mom import ask_menu_keyboard
 
         await callback.message.answer(

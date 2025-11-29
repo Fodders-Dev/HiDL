@@ -8,6 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils import texts
+from utils.texts import register_text
 from utils.time import local_date_str, parse_hhmm
 from utils.user import ensure_user
 
@@ -184,7 +185,7 @@ async def wellness_toggle(callback: types.CallbackQuery, db) -> None:
 async def focus_mode(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     row = await repo.get_wellness(db, user["id"])
     current = dict(row) if row else {"focus_mode": 0}
@@ -240,7 +241,7 @@ async def focus_again(callback: types.CallbackQuery) -> None:
 async def gentle_mode(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     now_utc = datetime.datetime.utcnow()
     local_date = local_date_str(now_utc, user["timezone"])
@@ -255,7 +256,7 @@ async def gentle_mode(message: types.Message, db) -> None:
 async def gentle_off(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     await repo.clear_user_pause(db, user["id"])
     await message.answer(

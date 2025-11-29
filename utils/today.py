@@ -71,26 +71,22 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         custom_kb = custom_kb[:3]
 
     await repo.ensure_regular_tasks(db, user["id"], local_date)
-    reg_due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=local_date)
+    reg_due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=local_date, due_in_days=1)
     reg_done_today = await repo.list_regular_tasks_done_on_date(db, user["id"], local_date)
     regular_lines = []
     regular_kb = []
-    for r in reg_due:
+    for r in reg_due[:3]:
         regular_lines.append(f"• {r['title']} — до {format_date_display(r['next_due_date'])}")
         regular_kb.append(
             [
-                types.InlineKeyboardButton(text=f"✅ {r['title'][:16]}", callback_data=f"reg:done:{r['id']}"),
-                types.InlineKeyboardButton(text="↪️ +1", callback_data=f"reg:later1:{r['id']}"),
-                types.InlineKeyboardButton(text="+3", callback_data=f"reg:later3:{r['id']}"),
-                types.InlineKeyboardButton(text="+7", callback_data=f"reg:later7:{r['id']}"),
+                types.InlineKeyboardButton(text=f"✅ {r['title'][:16]}", callback_data=f"hweek:done:{r['id']}"),
+                types.InlineKeyboardButton(text="↪️ +1", callback_data=f"hweek:later:1:{r['id']}"),
+                types.InlineKeyboardButton(text="+3", callback_data=f"hweek:later:3:{r['id']}"),
+                types.InlineKeyboardButton(text="+7", callback_data=f"hweek:later:7:{r['id']}"),
             ]
         )
-    # показываем только ближайшие задачи по дому (до 3), остальное — в разделе Дом
-    if len(regular_lines) > 3:
-        regular_lines = regular_lines[:3]
-        regular_kb = regular_kb[:3]
     if reg_done_today:
-        done_lines = [f"• {r['title']} — следующая дата {format_date_display(r['next_due_date'])}" for r in reg_done_today]
+        done_lines = [f"• {r['title']} — следующая дата {format_date_display(r['next_due_date'])}" for r in reg_done_today[:2]]
         regular_lines += ["Выполнено сегодня:"] + done_lines
 
     pause_note = ""
@@ -116,8 +112,17 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         f"✅ Прогресс: {done_today}/{important_total or total_today or 0} задач за сегодня",
     ]
     finance_line = await payday_summary(db, user, local_date)
+    home_summary = ""
+    if reg_due:
+        names = ", ".join(r["title"] for r in reg_due[:2])
+        extra = "" if len(reg_due) <= 2 else f" и ещё {len(reg_due)-2}"
+        home_summary = f"🧹 Дом: сегодня {len(reg_due)} дела — {names}{extra}."
+    else:
+        home_summary = "🧹 Дом: на эту неделю всё чисто, можно отдохнуть."
     if finance_line:
         summary_lines.append(finance_line)
+    if home_summary:
+        summary_lines.append(home_summary)
     blocks = [f"{pause_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
     blocks.append("<b>🌞 Рутины:</b>\n" + ("\n".join(routine_lines) if routine_lines else "Нет данных на сегодня"))
     if custom_lines:
@@ -132,11 +137,8 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
     else:
         kb_buttons.append([types.InlineKeyboardButton(text="➕ Добавить напоминание", callback_data="rem:add")])
-    if regular_kb:
-        kb_buttons.append([types.InlineKeyboardButton(text="Дела по дому", callback_data="home:regular")])
-        kb_buttons.append([types.InlineKeyboardButton(text="Все дела по дому", callback_data="home:regular_all")])
+    kb_buttons.append([types.InlineKeyboardButton(text="📅 План по дому", callback_data="home:week")])
     kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
-    kb_buttons.append([types.InlineKeyboardButton(text="Дом", callback_data="home:menu")])
     kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
     inline_kb = types.InlineKeyboardMarkup(inline_keyboard=kb_buttons) if kb_buttons else None
 

@@ -1,10 +1,13 @@
+import datetime
+
 from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from utils.mom_tips import pick_tip, find_tip_by_tag
+from utils.mom_tips import pick_tip, find_tip_by_tag, get_tip
+from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 
 router = Router()
@@ -98,22 +101,12 @@ async def ask_start(callback: types.CallbackQuery, state: FSMContext) -> None:
         )
     elif kind == "cleaning":
         await state.clear()
-        await send_tip(callback.message, "cleaning")
+        await send_tip(callback.message, "уборка")
     elif kind == "cook":
         await start_cook_flow(callback.message, state)
     elif kind == "odor":
         await state.clear()
-        await callback.message.answer(
-            "Запахи: выбери проблему.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Стиралка/бельё", callback_data="ask:odor:wash")],
-                    [InlineKeyboardButton(text="Кухня/раковина/холод", callback_data="ask:odor:kitchen")],
-                    [InlineKeyboardButton(text="Ванная/туалет/сливы", callback_data="ask:odor:bath")],
-                    [InlineKeyboardButton(text="Общий запах в комнате", callback_data="ask:odor:room")],
-                ]
-            ),
-        )
+        await send_tip(callback.message, "запахи")
     elif kind == "money":
         await state.clear()
         await send_tip(callback.message, "money")
@@ -175,7 +168,6 @@ async def ask_odor(callback: types.CallbackQuery) -> None:
 async def cook_profile(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     _, profile = callback.data.split(":")
     await state.update_data(profile=profile)
-    from db import repositories as repo
     from utils.user import ensure_user
 
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
@@ -232,20 +224,20 @@ def cook_suggestion(ingredients_text: str, profile: str = "omnivore") -> str:
 
 
 async def send_tip(message: types.Message, category: str, tip_id: str | None = None) -> None:
-    if tip_id:
-        tip = find_tip_by_tag(tip_id) or pick_tip(category)
-    else:
-        tip = pick_tip(category)
+    tip = get_tip(tip_id) if tip_id else pick_tip(category)
     if not tip:
         await message.answer("Пока нет готового совета на эту тему. Спроси текстом — отвечу по ситуации.", reply_markup=ask_menu_keyboard())
         return
     lines = [f"{tip.get('title','Совет')}:"]
-    for b in tip.get("body", []):
+    for b in tip.get("tips", []):
         lines.append(f"• {b}")
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Ещё совет", callback_data=f"ask:tip:{category}")],
-            [InlineKeyboardButton(text="Сделать напоминанием", callback_data=f"ask:tiprem:{category}:{tip.get('id','')}")],
+            [
+                InlineKeyboardButton(text="✅ Сделать делом", callback_data=f"ask:do:{tip['id']}"),
+                InlineKeyboardButton(text="🔁 Напоминать", callback_data=f"ask:rem:{tip['id']}"),
+            ],
+            [InlineKeyboardButton(text="➕ Ещё совет", callback_data=f"ask:more:{tip.get('category','') or category}")],
             [InlineKeyboardButton(text="Назад к темам", callback_data="ask:back")],
         ]
     )
@@ -277,30 +269,46 @@ async def ask_back(callback: types.CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("ask:tiprem:"))
-async def ask_tip_reminder(callback: types.CallbackQuery, db) -> None:
-    _, _, category, tip_id = callback.data.split(":")
-    from utils.user import ensure_user
-    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    title = "Совет по дому"
-    tip = find_tip_by_tag(tip_id) or pick_tip(category)
-    if tip:
-        title = tip.get("title", title)
-    # ставим напоминание на завтра 10:00, раз в неделю
-    today = datetime.date.today().isoformat()
-    rid = await repo.create_custom_reminder(
-        db,
-        user_id=user["id"],
-        title=title,
-        reminder_time="10:00",
-        frequency_days=7,
-    )
-    await repo.set_custom_reminder_sent(db, rid, today)  # чтобы первое пришло завтра
-    await callback.message.answer(
-        f"Сделала напоминание раз в неделю: «{title}» в 10:00. Первый раз придёт завтра.",
-        reply_markup=main_menu_keyboard(),
-    )
-    await callback.answer("Добавила напоминание")
+@router.callback_query(lambda c: c.data and c.data.startswith("ask:more:"))
+async def ask_more(callback: types.CallbackQuery) -> None:
+    _, _, category = callback.data.split(":")
+    await send_tip(callback.message, category)
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("ask:do:"))
+async def ask_do(callback: types.CallbackQuery, db) -> None:
+    tip_id = callback.data.split(":")[2]
+    tip = get_tip(tip_id)
+    if not tip:
+        await callback.answer("Нет такого совета", show_alert=True)
+        return
+    user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
+    if not user:
+        await callback.answer(register_text(), show_alert=True)
+        return
+    await repo.create_custom_reminder(db, user["id"], tip.get("title", "Дело по дому"), "12:00", 1)
+    await callback.message.answer("Добавила как дело на сегодня (напомню в течение дня).", reply_markup=main_menu_keyboard())
+    await callback.answer("Записала")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("ask:rem:"))
+async def ask_rem(callback: types.CallbackQuery, db) -> None:
+    tip_id = callback.data.split(":")[2]
+    tip = get_tip(tip_id)
+    if not tip:
+        await callback.answer("Нет такого совета", show_alert=True)
+        return
+    user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
+    if not user:
+        await callback.answer(register_text(), show_alert=True)
+        return
+    if not tip.get("can_create_reminder", False):
+        await callback.answer("Эту штуку лучше делать по настроению, без напоминаний.", show_alert=True)
+        return
+    await repo.create_custom_reminder(db, user["id"], tip.get("title", "Совет по дому"), "11:00", 7)
+    await callback.message.answer("Буду напоминать раз в неделю. Отменить можно в «Напоминания».", reply_markup=main_menu_keyboard())
+    await callback.answer("Добавлено")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("ask:laundry:item"))

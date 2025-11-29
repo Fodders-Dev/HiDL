@@ -13,6 +13,7 @@ from utils.time import parse_hhmm
 from utils.tone import tone_short_ack
 from utils.time import local_date_str
 from utils.nlp import match_simple_intent, parse_when
+from utils.texts import register_text
 
 router = Router()
 
@@ -100,7 +101,7 @@ async def add_reminder_title(message: types.Message, state: FSMContext) -> None:
 async def reminder_when(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
     if not user:
-        await callback.answer("Нужно зарегистрироваться: жми /start", show_alert=True)
+        await callback.answer(register_text(), show_alert=True)
         return
     _, _, choice = callback.data.split(":")
     if choice == "plus1":
@@ -150,7 +151,7 @@ async def add_reminder_time(message: types.Message, state: FSMContext, db) -> No
     data = await state.get_data()
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         await state.clear()
         return
     when_choice = data.get("when_choice", "today")
@@ -304,7 +305,7 @@ async def _save_reminder_with_frequency(
 async def list_reminders(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     reminders = await repo.list_custom_reminders(db, user["id"])
     kb = list_keyboard(reminders, with_add=True)
@@ -321,7 +322,7 @@ async def list_reminders(message: types.Message, db) -> None:
 async def list_reminders_button(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer("Нужно зарегистрироваться: жми /start")
+        await message.answer(register_text())
         return
     reminders = await repo.list_custom_reminders(db, user["id"])
     kb = list_keyboard(reminders, with_add=True)
@@ -339,7 +340,7 @@ async def delete_reminder(callback: types.CallbackQuery, db) -> None:
     reminder_id = int(callback.data.split(":")[1])
     user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
     if not user:
-        await callback.answer("Нужно зарегистрироваться: жми /start", show_alert=True)
+        await callback.answer(register_text(), show_alert=True)
         return
     await repo.delete_custom_reminder(db, user["id"], reminder_id)
     await callback.answer("Удалено")
@@ -417,7 +418,9 @@ async def custom_action(callback: types.CallbackQuery, db) -> None:
 
     # Вместо полной сводки — короткое подтверждение
     if action == "done":
-        await callback.message.answer("✅ Отметила напоминание.", reply_markup=main_menu_keyboard())
+        from utils.tone import tone_ack
+
+        await callback.message.answer(tone_ack(tone, "напоминание"), reply_markup=main_menu_keyboard())
     elif action == "skip":
         await callback.message.answer("⏭ Пропустила напоминание.", reply_markup=main_menu_keyboard())
 
@@ -426,7 +429,7 @@ async def custom_action(callback: types.CallbackQuery, db) -> None:
 async def reminder_menu_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
     if not user:
-        await callback.answer("Нужно зарегистрироваться: жми /start", show_alert=True)
+        await callback.answer(register_text(), show_alert=True)
         return
     action = callback.data.split(":")[1]
     if action == "add":

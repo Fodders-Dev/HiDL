@@ -46,13 +46,10 @@ def money_menu_keyboard() -> InlineKeyboardMarkup:
 def home_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="График уборки", callback_data="home:clean")],
-            [InlineKeyboardButton(text="Зона недели", callback_data="home:zone")],
-            [InlineKeyboardButton(text="Регулярные дела", callback_data="home:regular")],
-            [InlineKeyboardButton(text="План по дому", callback_data="home:plan")],
-            [InlineKeyboardButton(text="Настроить план", callback_data="home:audit")],
-            [InlineKeyboardButton(text="Быстрая уборка 10–20 мин", callback_data="home:quick")],
-            [InlineKeyboardButton(text="Стирка/запах", callback_data="home:laundry")],
+            [InlineKeyboardButton(text="🧽 Уборка сейчас", callback_data="home:now")],
+            [InlineKeyboardButton(text="📅 План на неделю", callback_data="home:week")],
+            [InlineKeyboardButton(text="📋 Все дела по дому", callback_data="home:all")],
+            [InlineKeyboardButton(text="🧴 Запахи / стирка", callback_data="home:smell")],
         ]
     )
 

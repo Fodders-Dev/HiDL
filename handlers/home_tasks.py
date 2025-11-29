@@ -1,4 +1,7 @@
 import datetime
+from typing import List, Optional
+
+import aiosqlite
 
 from aiogram import Router, types
 from aiogram.filters import Command
@@ -8,201 +11,409 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from utils.time import local_date_str
+from utils.time import format_date_display, local_date_str
+from utils.user import ensure_user
 
 router = Router()
 
 
-class HomeAuditState(StatesGroup):
-    step = State()
-    during_start = State()
+class CleanNowState(StatesGroup):
+    choose_type = State()
+    choose_energy = State()
+    process = State()
 
 
-AUDIT_QUESTIONS = [
-    ("Поменять полотенца", 4, "Когда последний раз менял(а) полотенца для тела?"),
-    ("Поменять постельное", 14, "Когда менял(а) постельное бельё?"),
-    ("Полы/пылесос", 7, "Когда была влажная уборка пола?"),
-    ("Ванна/раковина/унитаз", 7, "Когда нормально мыл(а) санузел?"),
-    ("Разбор холодильника", 30, "Когда разбирал(а) холодильник (выкидывал просрочку/протирал полки)?"),
-    ("Ревизия стиралки (манжета/фильтр)", 60, "Когда чистил(а) стиралку (фильтр/резинка/горячая стирка без вещей)?"),
-]
-
-
-def audit_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Сегодня", callback_data="audit:ans:0"),
-                InlineKeyboardButton(text="На этой неделе", callback_data="audit:ans:3"),
-            ],
-            [
-                InlineKeyboardButton(text="Больше недели", callback_data="audit:ans:10"),
-                InlineKeyboardButton(text="Не помню", callback_data="audit:ans:14"),
-            ],
-        ]
-    )
+class HomeFreqState(StatesGroup):
+    wait_custom = State()
 
 
 def _regular_keyboard(tasks):
     rows = []
     for t in tasks:
-        status_icon = "✅ " if t.get("last_done_date") else ""
+        row = dict(t)
+        status_icon = "✅ " if row.get("last_done_date") else ""
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{status_icon}{t['title']}", callback_data=f"reg:done:{t['id']}"
+                    text=f"{status_icon}{row['title']}", callback_data=f"hweek:done:{row['id']}"
                 ),
-                InlineKeyboardButton(
-                    text="⏭ +1", callback_data=f"reg:later1:{t['id']}"
-                ),
-                InlineKeyboardButton(
-                    text="+3", callback_data=f"reg:later3:{t['id']}"
-                ),
-                InlineKeyboardButton(
-                    text="+7", callback_data=f"reg:later7:{t['id']}"
-                ),
+                InlineKeyboardButton(text="⏭ +1", callback_data=f"hweek:later:1:{row['id']}"),
+                InlineKeyboardButton(text="+3", callback_data=f"hweek:later:3:{row['id']}"),
+                InlineKeyboardButton(text="+7", callback_data=f"hweek:later:7:{row['id']}"),
             ]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-def _freq_keyboard(tasks):
+def _all_tasks_keyboard(tasks):
     rows = []
     for t in tasks:
         rows.append(
             [
-                InlineKeyboardButton(text=f"{t['title']}", callback_data=f"freq:sel:{t['id']}"),
-                InlineKeyboardButton(text="-", callback_data=f"freq:dec:{t['id']}"),
-                InlineKeyboardButton(text="+", callback_data=f"freq:inc:{t['id']}"),
+                InlineKeyboardButton(text="✅", callback_data=f"hall:done:{t['id']}"),
+                InlineKeyboardButton(text="⚙️ Частота", callback_data=f"hall:freq:{t['id']}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"hall:hide:{t['id']}"),
             ]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-async def _send_all_regular(message: types.Message, db):
-    from utils.user import ensure_user
+def _freq_presets_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="7", callback_data=f"hall:freqset:{task_id}:7"),
+                InlineKeyboardButton(text="14", callback_data=f"hall:freqset:{task_id}:14"),
+                InlineKeyboardButton(text="30", callback_data=f"hall:freqset:{task_id}:30"),
+                InlineKeyboardButton(text="90", callback_data=f"hall:freqset:{task_id}:90"),
+            ],
+            [InlineKeyboardButton(text="Своя", callback_data=f"hall:freqset:{task_id}:custom")],
+        ]
+    )
+
+
+def _format_task_line(t) -> str:
+    row = dict(t)
+    status = "✅" if row.get("last_done_date") else "⏳"
+    return f"{status} {row['title']} — каждые {row['frequency_days']} д., до {format_date_display(row['next_due_date'])}"
+
+
+async def show_week_plan(message: types.Message, db) -> None:
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    await repo.ensure_regular_tasks(db, user["id"])
-    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False)
+    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    await repo.ensure_regular_tasks(db, user["id"], today)
+    tasks = await repo.list_regular_tasks(
+        db, user["id"], local_date=today, due_in_days=7, include_inactive=False
+    )
     if not tasks:
-        await message.answer("Пока нет регулярных дел.", reply_markup=main_menu_keyboard())
+        await message.answer("План по дому на неделю: пока ничего срочного, можно выдохнуть.", reply_markup=main_menu_keyboard())
         return
-    lines = ["Все регулярные дела:"]
+    lines = ["План по дому на ближайшие 7 дней:"]
     for t in tasks:
-        from utils.time import format_date_display
-        status = "✅" if t["last_done_date"] else "⏳"
-        lines.append(f"{status} {t['title']} — до {format_date_display(t['next_due_date'])}")
+        lines.append(f"• До {format_date_display(t['next_due_date'])} — {t['title']}")
     kb = _regular_keyboard(tasks)
     await message.answer("\n".join(lines), reply_markup=kb or main_menu_keyboard())
 
 
-async def _send_audit(message: types.Message, db):
-    from utils.user import ensure_user
+async def show_all_tasks(message: types.Message, db) -> None:
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     await repo.ensure_regular_tasks(db, user["id"], today)
-    due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=today)
-    if not due:
-        next_due = await repo.next_regular_task_date(db, user["id"])
-        extra = f" Все ок, следующий пункт до {next_due}." if next_due else ""
-        await message.answer("Регулярные дела: пока ничего не горит." + extra, reply_markup=main_menu_keyboard())
+    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False)
+    if not tasks:
+        await message.answer("Пока нет дел по дому.", reply_markup=main_menu_keyboard())
         return
-    lines = ["Регулярные дела, которые пора сделать:"]
-    for t in due:
-        from utils.time import format_date_display
-        lines.append(f"• {t['title']} (дата: {format_date_display(t['next_due_date'])})")
-    kb = _regular_keyboard(due)
+    lines = ["Все дела по дому:"]
+    for t in tasks:
+        lines.append(_format_task_line(t))
+    kb = _all_tasks_keyboard(tasks)
     await message.answer("\n".join(lines), reply_markup=kb or main_menu_keyboard())
 
 
-@router.message(Command("home_audit"))
-async def home_audit(message: types.Message, db) -> None:
-    await _send_audit(message, db)
-
-
-@router.message(Command("home_plan"))
-async def home_plan(message: types.Message, db) -> None:
-    from utils.user import ensure_user
-    from utils.time import format_date_display
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    await repo.ensure_regular_tasks(db, user["id"], today)
-    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False)
-    lines = ["План по дому:"]
-    for t in tasks:
-        lines.append(f"• {t['title']} — каждые {t['frequency_days']} д., следующий дедлайн: {format_date_display(t['next_due_date'])}")
-    lines.append("\nЕсли хочешь настроить частоту — жми «✏ Изменить частоту» ниже.")
-    kb_rows = [[InlineKeyboardButton(text="✏ Изменить частоту", callback_data="plan:edit")]]
-    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-
-
-@router.message(Command("home_audit_setup"))
-async def home_audit_setup(message: types.Message, state: FSMContext, db) -> None:
-    from utils.user import ensure_user
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    await state.set_state(HomeAuditState.step)
-    await state.update_data(step=0, during_start=False)
-    title, freq, prompt = AUDIT_QUESTIONS[0]
-    await message.answer(f"Домашний аудит.\n\n{prompt}", reply_markup=audit_keyboard())
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("home:regular"))
-async def home_regular_entry(callback: types.CallbackQuery, db) -> None:
-    await _send_audit(callback.message, db)
-    await callback.answer()
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("home:regular_all"))
-async def home_regular_all(callback: types.CallbackQuery, db) -> None:
-    await _send_all_regular(callback.message, db)
-    await callback.answer()
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("home:plan"))
-async def home_plan_cb(callback: types.CallbackQuery, db) -> None:
-    await home_plan(callback.message, db)
-    await callback.answer()
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("plan:edit"))
-async def plan_edit(callback: types.CallbackQuery, db) -> None:
-    from utils.user import ensure_user
+@router.callback_query(lambda c: c.data and c.data.startswith("hweek:done:"))
+async def plan_mark_done(callback: types.CallbackQuery, db) -> None:
+    task_id = int(callback.data.split(":")[2])
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    await repo.ensure_regular_tasks(db, user["id"], today)
-    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False)
-    kb = _freq_keyboard(tasks)
-    lines = [f"{t['title']}: каждые {t['frequency_days']} д." for t in tasks]
-    await callback.message.answer("Частоты:\n" + "\n".join(lines), reply_markup=kb or main_menu_keyboard())
+    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False)
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    await repo.mark_regular_done(db, user["id"], task_id, today)
+    if task is not None:
+        task = dict(task)
+    pts = (task.get("points") if task else 3) or 3
+    await repo.add_points(db, user["id"], pts, local_date=today)
+    await callback.answer("Готово")
+    await _refresh_plan(callback, db)
+
+
+async def _refresh_plan(callback: types.CallbackQuery, db) -> None:
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    tasks = await repo.list_regular_tasks(db, user["id"], local_date=today, due_in_days=7, include_inactive=False)
+    if not tasks:
+        try:
+            await callback.message.edit_text("План по дому на неделю пуст — всё чисто.", reply_markup=None)
+        except Exception:
+            await callback.message.answer("План по дому на неделю пуст — всё чисто.", reply_markup=main_menu_keyboard())
+        return
+    lines = ["План по дому на ближайшие 7 дней:"]
+    for t in tasks:
+        lines.append(f"• До {format_date_display(t['next_due_date'])} — {t['title']}")
+    kb = _regular_keyboard(tasks)
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+    except Exception:
+        await callback.message.answer("\n".join(lines), reply_markup=kb or main_menu_keyboard())
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("hweek:later:"))
+async def plan_postpone(callback: types.CallbackQuery, db) -> None:
+    _, _, days, task_id = callback.data.split(":")
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    await repo.postpone_regular_task(db, user["id"], int(task_id), int(days))
+    await callback.answer(f"Отложила на +{days} д.")
+    await _refresh_plan(callback, db)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("hall:done:"))
+async def all_done(callback: types.CallbackQuery, db) -> None:
+    task_id = int(callback.data.split(":")[2])
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False)
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    await repo.mark_regular_done(db, user["id"], task_id, today)
+    if task is not None:
+        task = dict(task)
+    pts = (task.get("points") if task else 3) or 3
+    await repo.add_points(db, user["id"], pts, local_date=today)
+    await callback.answer("Отметила")
+    await _refresh_all(callback, db)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("hall:hide:"))
+async def all_hide(callback: types.CallbackQuery, db) -> None:
+    task_id = int(callback.data.split(":")[2])
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    await repo.deactivate_regular_task(db, user["id"], task_id)
+    await callback.answer("Скрыла задачу")
+    await _refresh_all(callback, db)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("hall:freq:"))
+async def all_freq(callback: types.CallbackQuery, state: FSMContext) -> None:
+    task_id = int(callback.data.split(":")[2])
+    await callback.message.answer("Выбери новую частоту (дни) или введи свою цифру сообщением.", reply_markup=_freq_presets_keyboard(task_id))
+    await state.update_data(freq_task_id=task_id)
+    await state.set_state(HomeFreqState.wait_custom)
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("freq:"))
-async def freq_change(callback: types.CallbackQuery, db) -> None:
+@router.callback_query(lambda c: c.data and c.data.startswith("hall:freqset:"))
+async def freq_set(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    _, _, task_id, days = callback.data.split(":")
+    if days == "custom":
+        await callback.answer()
+        return
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    await repo.set_regular_frequency(db, user["id"], int(task_id), int(days))
+    await callback.answer("Обновила частоту")
+    await _refresh_all(callback, db)
+    await state.clear()
+
+
+@router.message(HomeFreqState.wait_custom)
+async def freq_custom(message: types.Message, state: FSMContext, db) -> None:
+    data = await state.get_data()
+    task_id = data.get("freq_task_id")
+    try:
+        days = int(message.text.strip())
+    except Exception:
+        await message.answer("Нужно число дней, например 14.")
+        return
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    await repo.set_regular_frequency(db, user["id"], int(task_id), days)
+    await message.answer(f"Частота обновлена: каждые {days} дней.")
+    await state.clear()
+    await show_all_tasks(message, db)
+
+
+async def _refresh_all(callback: types.CallbackQuery, db) -> None:
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False)
+    if not tasks:
+        await callback.message.edit_text("Пока нет дел по дому.", reply_markup=None)
+        return
+    lines = ["Все дела по дому:"]
+    for t in tasks:
+        lines.append(_format_task_line(t))
+    kb = _all_tasks_keyboard(tasks)
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+    except Exception:
+        await callback.message.answer("\n".join(lines), reply_markup=kb or main_menu_keyboard())
+
+
+# --- Уборка сейчас ---
+
+def _clean_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✨ Быстрый порядок", callback_data="clean:type:surface")],
+            [InlineKeyboardButton(text="🧹 Нормальная уборка", callback_data="clean:type:normal")],
+            [InlineKeyboardButton(text="🧽 Одна зона поглубже", callback_data="clean:type:deep")],
+        ]
+    )
+
+
+def _clean_energy_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Почти не живая", callback_data="clean:energy:low")],
+            [InlineKeyboardButton(text="Могу нормально", callback_data="clean:energy:mid")],
+            [InlineKeyboardButton(text="Готова поработать", callback_data="clean:energy:high")],
+        ]
+    )
+
+
+async def start_clean_now(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(CleanNowState.choose_type)
+    await callback.message.answer("Что делаем по дому?", reply_markup=_clean_type_keyboard())
+    await callback.answer()
+
+
+def _surface_steps(energy: str) -> List[dict]:
+    steps = [
+        {"text": "Собери одежду в одну корзину/стопку", "points": 1},
+        {"text": "Протри стол или главную поверхность", "points": 1},
+        {"text": "Разгрузи раковину или замочи посуду", "points": 1},
+        {"text": "Вынеси мусор, если ведро полное", "points": 2},
+    ]
+    target = 3 if energy == "low" else (4 if energy == "mid" else 5)
+    return steps[:target]
+
+
+def _zone_steps(zone: str, energy: str) -> List[dict]:
+    base = {
+        "kitchen": [
+            {"text": "Разобрать одну полку/ящик на кухне", "points": 2},
+            {"text": "Протереть фасады шкафов и ручки", "points": 2},
+            {"text": "Плита/стол: протереть жирные пятна", "points": 2},
+            {"text": "Пол/плинтус в кухне быстро пройтись", "points": 3},
+        ],
+        "bathroom": [
+            {"text": "Протереть раковину и кран", "points": 2},
+            {"text": "Быстро пройтись по унитазу/сиденью", "points": 2},
+            {"text": "Душ/ванна: ополоснуть стены, протереть уголки", "points": 3},
+            {"text": "Сменить полотенца, проветрить", "points": 2},
+        ],
+        "room": [
+            {"text": "Разобрать одну поверхность (стол/тумба)", "points": 2},
+            {"text": "Собрать мелочи в коробку «разобрать позже»", "points": 1},
+            {"text": "Пропылесосить/пройтись влажной салфеткой под кроватью/диваном", "points": 3},
+            {"text": "Протереть пыль на видимых местах", "points": 2},
+        ],
+        "hallway": [
+            {"text": "Разложить обувь, убрать грязь у входа", "points": 2},
+            {"text": "Протереть зеркало/полку в прихожей", "points": 1},
+            {"text": "Быстро пройтись пылесосом/шваброй у входа", "points": 3},
+        ],
+    }
+    steps = base.get(zone, base["room"])
+    target = 3 if energy == "low" else (4 if energy == "mid" else 5)
+    return steps[:target]
+
+
+def _normal_steps(home_tasks: List[aiosqlite.Row], energy: str) -> List[dict]:
+    steps: List[dict] = []
+    for t in home_tasks[:2]:
+        row = dict(t)
+        points = row.get("points") or 3
+        steps.append({"text": f"{row['title']} (по плану)", "points": points, "task_id": row["id"]})
+    steps.extend(_surface_steps(energy))
+    target = 4 if energy == "low" else (5 if energy == "mid" else 7)
+    return steps[:target]
+
+
+async def _build_steps(db, user_id: int, energy: str, clean_type: str, today: str) -> List[dict]:
+    tasks = await repo.list_regular_tasks(db, user_id, local_date=today, due_in_days=7, include_inactive=False)
+    if clean_type == "surface":
+        return _surface_steps(energy)
+    if clean_type == "normal":
+        return _normal_steps(tasks, energy)
+    zone = (tasks[0]["zone"] if tasks else "room") or "room"
+    return _zone_steps(zone, energy)
+
+
+def _steps_keyboard(steps: List[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, step in enumerate(steps):
+        status = step.get("status", "pending")
+        label = "✅" if status == "done" else ("⏭" if status == "skip" else "•")
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"{label} {idx+1}", callback_data=f"clean:mark:done:{idx}"),
+                InlineKeyboardButton(text="Пропустить", callback_data=f"clean:mark:skip:{idx}"),
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _steps_text(steps: List[dict]) -> str:
+    lines = ["Сделай эти шаги:"]
+    for idx, step in enumerate(steps):
+        status = step.get("status", "pending")
+        prefix = "✅" if status == "done" else ("⏭" if status == "skip" else "•")
+        lines.append(f"{prefix} {idx+1}. {step['text']}")
+    return "\n".join(lines)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("clean:type:"))
+async def clean_choose_energy(callback: types.CallbackQuery, state: FSMContext) -> None:
+    clean_type = callback.data.split(":")[2]
+    await state.update_data(clean_type=clean_type)
+    await state.set_state(CleanNowState.choose_energy)
+    await callback.message.answer("Сколько сил есть?", reply_markup=_clean_energy_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("clean:energy:"))
+async def clean_generate(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    energy = callback.data.split(":")[2]
+    data = await state.get_data()
+    clean_type = data.get("clean_type", "surface")
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    steps = await _build_steps(db, user["id"], energy, clean_type, today)
+    await state.update_data(steps=steps, energy=energy, today=today)
+    text = _steps_text(steps)
+    kb = _steps_keyboard(steps)
+    await callback.message.answer(text, reply_markup=kb)
+    await state.set_state(CleanNowState.process)
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("clean:mark:"))
+async def clean_mark(callback: types.CallbackQuery, db, state: FSMContext) -> None:
     parts = callback.data.split(":")
-    action = parts[1]
-    task_id = int(parts[2])
-    user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
-    if not user:
-        await callback.answer("Нужно зарегистрироваться: нажми /start", show_alert=True)
+    action = parts[2]
+    idx = int(parts[3])
+    data = await state.get_data()
+    steps: List[dict] = data.get("steps", [])
+    if idx >= len(steps):
+        await callback.answer()
         return
-    # fetch task
-    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False)
-    task = next((t for t in tasks if t["id"] == task_id), None)
-    if not task:
-        await callback.answer("Не нашла задачу", show_alert=True)
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    today = data.get("today") or local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    step = steps[idx]
+    if step.get("status") in ("done", "skip"):
+        await callback.answer("Уже отмечено")
         return
-    freq = task["frequency_days"]
-    if action == "inc":
-        freq += 7 if freq >= 14 else 3
-    elif action == "dec":
-        freq = max(3, freq - (7 if freq > 14 else 3))
-    await repo.set_regular_frequency(db, user["id"], task_id, freq)
-    tasks = await repo.list_regular_tasks(db, user["id"], due_only=False)
-    kb = _freq_keyboard(tasks)
-    lines = [f"{t['title']}: каждые {t['frequency_days']} д." for t in tasks]
-    await callback.message.edit_text("Частоты:\n" + "\n".join(lines), reply_markup=kb)
-    await callback.answer("Обновила.")
+    step["status"] = "done" if action == "done" else "skip"
+    if action == "done":
+        points = step.get("points", 2)
+        await repo.add_points(db, user["id"], points, local_date=today)
+        if step.get("task_id"):
+            await repo.mark_regular_done(db, user["id"], step["task_id"], today)
+    steps[idx] = step
+    await state.update_data(steps=steps, today=today)
+    pending = [s for s in steps if s.get("status") == "pending"]
+    kb = _steps_keyboard(steps)
+    text = _steps_text(steps)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    if not pending:
+        done_cnt = len([s for s in steps if s.get("status") == "done"])
+        total_points = sum(s.get("points", 0) for s in steps if s.get("status") == "done")
+        await callback.message.answer(
+            f"Ты закрыла {done_cnt} из {len(steps)} шагов, +{total_points} очков.\nДома уже заметно легче — можешь остановиться или сделать ещё один круг позже.",
+            reply_markup=main_menu_keyboard(),
+        )
+        await state.clear()
+    await callback.answer("Обновлено")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("care:"))
@@ -210,30 +421,62 @@ async def care_mark(callback: types.CallbackQuery, db) -> None:
     _, col, date_str = callback.data.split(":")
     user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
     if not user:
-        await callback.answer("Нужно зарегистрироваться: /start", show_alert=True)
+        await callback.answer(register_text(), show_alert=True)
         return
     await repo.update_care_date(db, user["id"], col, date_str)
     await callback.answer("Отметила.")
     await callback.message.edit_text("Отметила заботу как выполненную.", reply_markup=None)
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("home:audit"))
-async def home_audit_cb(callback: types.CallbackQuery, state: FSMContext, db) -> None:
-    await home_audit_setup(callback.message, state, db)
+# Fallbacks на старые кнопки
+@router.callback_query(lambda c: c.data and c.data.startswith("home:regular"))
+async def home_regular_entry(callback: types.CallbackQuery, db) -> None:
+    await show_week_plan(callback.message, db)
     await callback.answer()
 
 
+@router.callback_query(lambda c: c.data and c.data.startswith("home:regular_all"))
+async def home_regular_all(callback: types.CallbackQuery, db) -> None:
+    await show_all_tasks(callback.message, db)
+    await callback.answer()
+
+
+@router.message(Command("home_audit"))
+async def home_audit(message: types.Message, db) -> None:
+    await show_week_plan(message, db)
+
+
+@router.message(Command("home_audit_setup"))
+async def home_audit_setup(message: types.Message, state: FSMContext, db) -> None:
+    """Упрощённый аудит: создаём базовые задачи и показываем план."""
+    await state.clear()
+    await show_week_plan(message, db)
+
+
+@router.message(Command("home_plan"))
+async def home_plan(message: types.Message, db) -> None:
+    await show_week_plan(message, db)
+
+
+# Алиасы для старых колбэков reg:*
 @router.callback_query(lambda c: c.data and c.data.startswith("reg:"))
-async def regular_actions(callback: types.CallbackQuery, db) -> None:
+async def legacy_reg(callback: types.CallbackQuery, db) -> None:
     parts = callback.data.split(":")
-    action, task_id = parts[1], int(parts[2])
-    from utils.user import ensure_user
-    from utils.today import render_today
+    if len(parts) < 3:
+        await callback.answer()
+        return
+    action = parts[1]
+    task_id = int(parts[2])
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     if action == "done":
+        tasks = await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False)
+        task = next((t for t in tasks if t["id"] == task_id), None)
         await repo.mark_regular_done(db, user["id"], task_id, today)
-        await repo.add_points(db, user["id"], 4, local_date=today)
+        if task is not None:
+            task = dict(task)
+        pts = (task.get("points") if task else 3) or 3
+        await repo.add_points(db, user["id"], pts, local_date=today)
         await callback.answer("Готово")
     elif action.startswith("later"):
         days = 1
@@ -242,64 +485,5 @@ async def regular_actions(callback: types.CallbackQuery, db) -> None:
         elif "later7" in action:
             days = 7
         await repo.postpone_regular_task(db, user["id"], task_id, days)
-        await callback.answer(f"Перенёс на +{days} д.")
-    # обновить список дел по дому, не перерисовывая /today
-    due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=today)
-    if not due:
-        next_due = await repo.next_regular_task_date(db, user["id"])
-        extra = f" Все ок, следующий пункт до {next_due}." if next_due else ""
-        text = "Регулярные дела: пока ничего не горит." + extra
-        kb = None
-    else:
-        from utils.time import format_date_display
-        lines = ["Регулярные дела, которые пора сделать:"]
-        for t in due:
-            lines.append(f"• {t['title']} (дата: {format_date_display(t['next_due_date'])})")
-        kb = _regular_keyboard(due)
-        text = "\n".join(lines)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb or main_menu_keyboard())
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb or main_menu_keyboard())
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("audit:ans:"))
-async def audit_answer(callback: types.CallbackQuery, state: FSMContext, db) -> None:
-    user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
-    if not user:
-        await callback.answer("Нужно зарегистрироваться: нажми /start", show_alert=True)
-        return
-    data = await state.get_data()
-    step = data.get("step", 0)
-    offset_days = int(callback.data.split(":")[2])
-    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    title, freq, prompt = AUDIT_QUESTIONS[step]
-    # last_done_date = today - offset
-    last_done_date = (
-        (datetime.date.fromisoformat(today) - datetime.timedelta(days=offset_days)).isoformat()
-        if offset_days >= 0
-        else None
-    )
-    next_due = datetime.date.fromisoformat(today) + datetime.timedelta(days=freq - offset_days if offset_days < freq else 0)
-    await repo.upsert_regular_task(
-        db,
-        user_id=user["id"],
-        title=title,
-        frequency_days=freq,
-        last_done_date=last_done_date,
-        next_due_date=next_due.isoformat(),
-    )
-    step += 1
-    if step >= len(AUDIT_QUESTIONS):
-        await state.clear()
-        await callback.message.answer(
-            "План по дому обновлён. Проверю дедлайны и буду напоминать в разделе Дом и в «Сегодня».",
-            reply_markup=main_menu_keyboard(),
-        )
-        await _send_audit(callback.message, db)
-        await callback.answer("Сохранено")
-        return
-    await state.update_data(step=step)
-    _, _, next_prompt = AUDIT_QUESTIONS[step]
-    await callback.message.answer(next_prompt, reply_markup=audit_keyboard())
-    await callback.answer("Сохранено")
+        await callback.answer(f"Отложила на +{days} д.")
+    await _refresh_plan(callback, db)

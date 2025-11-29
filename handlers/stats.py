@@ -75,6 +75,7 @@ async def stats(message: types.Message, db) -> None:
     custom_done = sum(v["done"] for v in custom_by_date.values())
     today_points = await repo.points_today(db, user["id"], local_date=local_today)
     points7 = await repo.points_window(db, user["id"], days=7)
+    home_cnt, home_pts = await repo.home_stats_window(db, user["id"], days=7)
     user_full = await repo.get_user(db, user["id"])
     points_month = user_full["points_month"]
     points_total = user_full["points_total"]
@@ -98,6 +99,13 @@ async def stats(message: types.Message, db) -> None:
         + "\n".join(custom_summary)
     )
     text += f"\n\nОчки: сегодня — {today_points}, за 7 дней — {points7}, за месяц — {points_month}, всего — {points_total}"
+    text += f"\nДом: за 7 дней {home_cnt} дел, очков {home_pts}. "
+    if home_cnt == 0:
+        text += "Если не до уборки — нормально. Можно начать с одного пункта."
+    elif home_cnt < 4:
+        text += "Даже пара дел в неделю — это движение, квартира уже легче дышит."
+    else:
+        text += "Отличный темп — квартира точно благодарит."
     if achievements:
         text += "\n\nАчивки:\n" + "\n".join(f"- {a}" for a in achievements)
     tone = "neutral"
@@ -109,6 +117,12 @@ async def stats(message: types.Message, db) -> None:
     elif points7 > 40:
         tone = "pushy"
     await message.answer(tone_message(tone, text), reply_markup=main_menu_keyboard())
+
+
+@router.callback_query(lambda c: c.data == "stats:view")
+async def stats_view(callback: types.CallbackQuery, db) -> None:
+    await stats(callback.message, db)
+    await callback.answer()
 
 
 @router.message(Command("weekly_report"))

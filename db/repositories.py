@@ -383,8 +383,10 @@ async def log_custom_task(
 async def ensure_regular_tasks(
     conn: aiosqlite.Connection, user_id: int, local_date: Optional[str] = None
 ) -> None:
+    """Seed default home tasks with zones/points if none exist."""
     cursor = await conn.execute(
-        "SELECT COUNT(*) as cnt FROM regular_tasks WHERE user_id = ?", (user_id,)
+        "SELECT COUNT(*) as cnt FROM regular_tasks WHERE user_id = ? AND (is_active IS NULL OR is_active=1)",
+        (user_id,),
     )
     row = await cursor.fetchone()
     if row and row["cnt"] > 0:
@@ -392,41 +394,55 @@ async def ensure_regular_tasks(
     today = local_date or datetime.date.today().isoformat()
     now = utc_now_str()
     defaults = [
-        ("Поменять полотенца", 7),
-        ("Поменять постельное", 14),
-        ("Полы/пылесос", 7),
-        ("Ванна/раковина/унитаз", 7),
-        ("Разбор холодильника", 7),
-        ("Ревизия стиралки (манжета/фильтр)", 14),
+        ("Полотенца", 7, "bathroom", 3),
+        ("Полы/пылесос", 7, "hallway", 3),
+        ("Ванна/раковина/унитаз", 7, "bathroom", 3),
+        ("Проверить холодильник", 7, "fridge", 3),
+        ("Стол/поверхности на кухне", 7, "kitchen", 3),
+        ("Постельное бельё", 14, "bedroom", 3),
+        ("Генерально помыть холодильник", 30, "fridge", 5),
+        ("Прожиг стиралки", 30, "laundry", 5),
+        ("Плинтусы/ручки/выключатели", 30, "misc", 4),
+        ("Уборка труднодоступных мест", 30, "misc", 4),
+        ("Фильтр стиралки/пылесоса", 90, "laundry", 5),
+        ("Разобрать аптечку", 90, "misc", 5),
+        ("Разобрать хаос-угол", 90, "misc", 4),
     ]
-    for title, freq in defaults:
+    for title, freq, zone, points in defaults:
+        next_due = datetime.date.fromisoformat(today) + datetime.timedelta(days=freq)
         await conn.execute(
             """
-            INSERT INTO regular_tasks (user_id, title, frequency_days, last_done_date, next_due_date, created_at, updated_at)
-            VALUES (?, ?, ?, NULL, ?, ?, ?)
+            INSERT INTO regular_tasks (user_id, title, frequency_days, zone, points, is_active, last_done_date, next_due_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?, ?)
             """,
-            (user_id, title, freq, today, now, now),
+            (user_id, title, freq, zone, points, next_due.isoformat(), now, now),
         )
     await conn.commit()
 
 
 async def list_regular_tasks(
-    conn: aiosqlite.Connection, user_id: int, due_only: bool = False, local_date: Optional[str] = None
+    conn: aiosqlite.Connection,
+    user_id: int,
+    due_only: bool = False,
+    local_date: Optional[str] = None,
+    due_in_days: Optional[int] = None,
+    include_inactive: bool = False,
 ) -> List[aiosqlite.Row]:
+    conditions = ["user_id = ?"]
+    params: list[Any] = [user_id]
+    if not include_inactive:
+        conditions.append("(is_active IS NULL OR is_active=1)")
     if due_only and local_date:
-        cursor = await conn.execute(
-            """
-            SELECT * FROM regular_tasks
-            WHERE user_id = ? AND date(next_due_date) <= date(?)
-            ORDER BY date(next_due_date), id
-            """,
-            (user_id, local_date),
-        )
-    else:
-        cursor = await conn.execute(
-            "SELECT * FROM regular_tasks WHERE user_id = ? ORDER BY date(next_due_date), id",
-            (user_id,),
-        )
+        conditions.append("date(next_due_date) <= date(?)")
+        params.append(local_date)
+    if due_in_days is not None and local_date:
+        conditions.append("date(next_due_date) <= date(?, '+' || ? || ' day')")
+        params.extend([local_date, due_in_days])
+    where_clause = " AND ".join(conditions)
+    cursor = await conn.execute(
+        f"SELECT * FROM regular_tasks WHERE {where_clause} ORDER BY date(next_due_date), id",
+        params,
+    )
     return await cursor.fetchall()
 
 
@@ -434,7 +450,7 @@ async def next_regular_task_date(
     conn: aiosqlite.Connection, user_id: int
 ) -> Optional[str]:
     cursor = await conn.execute(
-        "SELECT next_due_date FROM regular_tasks WHERE user_id = ? ORDER BY date(next_due_date) LIMIT 1",
+        "SELECT next_due_date FROM regular_tasks WHERE user_id = ? AND (is_active IS NULL OR is_active=1) ORDER BY date(next_due_date) LIMIT 1",
         (user_id,),
     )
     row = await cursor.fetchone()
@@ -464,7 +480,7 @@ async def postpone_regular_task(
         """
         UPDATE regular_tasks
         SET next_due_date = date(next_due_date, '+' || ? || ' day'), updated_at = ?
-        WHERE id = ? AND user_id = ?
+        WHERE id = ? AND user_id = ? AND (is_active IS NULL OR is_active=1)
         """,
         (days, now, task_id, user_id),
     )
@@ -479,10 +495,10 @@ async def set_regular_frequency(
     await conn.execute(
         """
         UPDATE regular_tasks
-        SET frequency_days = ?, updated_at = ?
-        WHERE id = ? AND user_id = ?
+        SET frequency_days = ?, next_due_date = date(coalesce(last_done_date, next_due_date), '+' || ? || ' day'), updated_at = ?
+        WHERE id = ? AND user_id = ? AND (is_active IS NULL OR is_active=1)
         """,
-        (freq, now, task_id, user_id),
+        (freq, freq, now, task_id, user_id),
     )
     await conn.commit()
 
@@ -493,7 +509,7 @@ async def list_regular_tasks_done_on_date(
     cursor = await conn.execute(
         """
         SELECT * FROM regular_tasks
-        WHERE user_id = ? AND last_done_date = ?
+        WHERE user_id = ? AND last_done_date = ? AND (is_active IS NULL OR is_active=1)
         ORDER BY id
         """,
         (user_id, done_date),
@@ -568,6 +584,9 @@ async def upsert_regular_task(
     frequency_days: int,
     last_done_date: Optional[str],
     next_due_date: str,
+    zone: str = "",
+    points: int = 3,
+    is_active: int = 1,
 ) -> None:
     now = utc_now_str()
     cursor = await conn.execute(
@@ -578,19 +597,28 @@ async def upsert_regular_task(
         await conn.execute(
             """
             UPDATE regular_tasks
-            SET frequency_days = ?, last_done_date = ?, next_due_date = ?, updated_at = ?
+            SET frequency_days = ?, last_done_date = ?, next_due_date = ?, zone = ?, points = ?, is_active = ?, updated_at = ?
             WHERE id = ?
             """,
-            (frequency_days, last_done_date, next_due_date, now, row["id"]),
+            (frequency_days, last_done_date, next_due_date, zone, points, is_active, now, row["id"]),
         )
     else:
         await conn.execute(
             """
-            INSERT INTO regular_tasks (user_id, title, frequency_days, last_done_date, next_due_date, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO regular_tasks (user_id, title, frequency_days, zone, points, is_active, last_done_date, next_due_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, title, frequency_days, last_done_date, next_due_date, now, now),
+            (user_id, title, frequency_days, zone, points, is_active, last_done_date, next_due_date, now, now),
         )
+    await conn.commit()
+
+
+async def deactivate_regular_task(conn: aiosqlite.Connection, user_id: int, task_id: int) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE regular_tasks SET is_active = 0, updated_at = ? WHERE id = ? AND user_id = ?",
+        (now, task_id, user_id),
+    )
     await conn.commit()
 
 
@@ -1130,6 +1158,22 @@ async def points_streak(conn: aiosqlite.Connection, user_id: int, today: Optiona
         else:
             break
     return streak
+
+
+async def home_stats_window(conn: aiosqlite.Connection, user_id: int, days: int = 7) -> Tuple[int, int]:
+    """Количество дел по дому и очков за последние N дней."""
+    since = datetime.date.today() - datetime.timedelta(days=days - 1)
+    cursor = await conn.execute(
+        """
+        SELECT COUNT(*) as cnt, COALESCE(SUM(points),0) as pts
+        FROM regular_tasks
+        WHERE user_id = ? AND last_done_date IS NOT NULL AND date(last_done_date) >= date(?)
+          AND (is_active IS NULL OR is_active=1)
+        """,
+        (user_id, since.isoformat()),
+    )
+    row = await cursor.fetchone()
+    return (row["cnt"] if row else 0, row["pts"] if row else 0)
 
 
 async def reset_month_points(conn: aiosqlite.Connection, current_month: str) -> None:

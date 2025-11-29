@@ -326,6 +326,9 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
                 user_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 frequency_days INTEGER NOT NULL,
+                zone TEXT DEFAULT '',
+                points INTEGER DEFAULT 3,
+                is_active INTEGER DEFAULT 1,
                 last_done_date TEXT,
                 next_due_date TEXT,
                 created_at TEXT NOT NULL,
@@ -334,6 +337,23 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         );
             """
         )
+    else:
+        reg_cols = {row["name"] for row in reg_info}
+        if "zone" not in reg_cols:
+            try:
+                await conn.execute("ALTER TABLE regular_tasks ADD COLUMN zone TEXT DEFAULT '';")
+            except Exception:
+                pass
+        if "points" not in reg_cols:
+            try:
+                await conn.execute("ALTER TABLE regular_tasks ADD COLUMN points INTEGER DEFAULT 3;")
+            except Exception:
+                pass
+        if "is_active" not in reg_cols:
+            try:
+                await conn.execute("ALTER TABLE regular_tasks ADD COLUMN is_active INTEGER DEFAULT 1;")
+            except Exception:
+                pass
     budgets_info = await conn.execute_fetchall("PRAGMA table_info(budgets);")
     budget_cols = {row["name"] for row in budgets_info}
     if "payday_day" not in budget_cols:
