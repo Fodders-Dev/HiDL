@@ -1,0 +1,143 @@
+import datetime
+from typing import Tuple
+
+from aiogram import types
+
+from db import repositories as repo
+from utils.finance import payday_summary
+from utils.time import local_date_str, format_date_display
+
+
+async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
+    """Build /today text and inline keyboard as dashboard."""
+    user = dict(user)
+    now_utc = datetime.datetime.utcnow()
+    local_date = local_date_str(now_utc, user["timezone"])
+    adhd = user.get("adhd_mode") == 1
+
+    await repo.ensure_user_tasks_for_date(db, user["id"], local_date)
+    tasks = await repo.get_tasks_for_day(db, user["id"], local_date)
+    routines = await repo.list_user_routines(db, user["id"])
+
+    status_emoji = {"pending": "⏳", "done": "✅", "skip": "⏭", "later": "🔔"}
+    routine_status = {t["routine_id"]: t["status"] for t in tasks}
+
+    routine_lines = []
+    routine_kb = []
+    for r in routines:
+        st = routine_status.get(r["routine_id"], "pending")
+        label = f"{status_emoji.get(st,'⏳')} {r['title']} ({r['reminder_time']})"
+        if st == "skip":
+            label = f"⏭ {r['title']} ({r['reminder_time']})"
+        routine_lines.append(label)
+        routine_kb.append(
+            [
+                types.InlineKeyboardButton(
+                    text=f"✅ {r['title']}",
+                    callback_data=f"routine:{r['routine_id']}:{local_date}:done",
+                ),
+                types.InlineKeyboardButton(
+                    text=f"⏭ {r['title']}",
+                    callback_data=f"routine:{r['routine_id']}:{local_date}:skip",
+                ),
+            ]
+        )
+    if adhd and len(routine_lines) > 3:
+        routine_lines = routine_lines[:3]
+        routine_kb = routine_kb[:3]
+
+    custom = await repo.list_custom_reminders(db, user["id"])
+    custom_status = await repo.custom_statuses_for_date(db, user["id"], local_date)
+    custom_lines = []
+    custom_kb = []
+    for c in custom:
+        status = custom_status.get(c["id"], "pending")
+        if status != "done":  # не показываем уже закрытые
+            custom_lines.append(f"• {c['title']} — {c['reminder_time']}")
+            custom_kb.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=f"✅ {c['title'][:18]}",
+                        callback_data=f"custom:{c['id']}:{local_date}:done",
+                    ),
+                    types.InlineKeyboardButton(
+                        text=f"↪️ {c['title'][:18]}",
+                        callback_data=f"custom:{c['id']}:{local_date}:later",
+                    ),
+                ]
+            )
+    if adhd and len(custom_lines) > 3:
+        custom_lines = custom_lines[:3]
+        custom_kb = custom_kb[:3]
+
+    await repo.ensure_regular_tasks(db, user["id"], local_date)
+    reg_due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=local_date)
+    reg_done_today = await repo.list_regular_tasks_done_on_date(db, user["id"], local_date)
+    regular_lines = []
+    regular_kb = []
+    for r in reg_due:
+        regular_lines.append(f"• {r['title']} — до {format_date_display(r['next_due_date'])}")
+        regular_kb.append(
+            [
+                types.InlineKeyboardButton(text=f"✅ {r['title'][:16]}", callback_data=f"reg:done:{r['id']}"),
+                types.InlineKeyboardButton(text="↪️ +1", callback_data=f"reg:later1:{r['id']}"),
+                types.InlineKeyboardButton(text="+3", callback_data=f"reg:later3:{r['id']}"),
+                types.InlineKeyboardButton(text="+7", callback_data=f"reg:later7:{r['id']}"),
+            ]
+        )
+    # показываем только ближайшие задачи по дому (до 3), остальное — в разделе Дом
+    if len(regular_lines) > 3:
+        regular_lines = regular_lines[:3]
+        regular_kb = regular_kb[:3]
+    if reg_done_today:
+        done_lines = [f"• {r['title']} — следующая дата {format_date_display(r['next_due_date'])}" for r in reg_done_today]
+        regular_lines += ["Выполнено сегодня:"] + done_lines
+
+    pause_note = ""
+    if user.get("pause_until") and user["pause_until"] >= local_date:
+        pause_note = "🧘 Сейчас включён щадящий режим: уведомлений меньше, можно вернуть /resume.\n\n"
+
+    bills_lines = []
+    bills = await repo.bills_due_soon(db, user["id"], local_date, days_ahead=3)
+    if bills:
+        bills_lines = [f"• {b['title']} — до {format_date_display(b['due_date'])} (~{b['amount']:.0f} ₽)" for b in bills]
+
+    # summary block
+    points7 = await repo.points_window(db, user["id"], days=7)
+    points_today = await repo.points_today(db, user["id"], local_date)
+    streak = await repo.points_streak(db, user["id"], today=local_date)
+    stats_r = await repo.routine_stats(db, user["id"], days=1)
+    stats_c = await repo.custom_stats(db, user["id"], days=1)
+    done_today = sum(r["cnt"] for r in stats_r if r["status"] == "done") + sum(r["cnt"] for r in stats_c if r["status"] == "done")
+    total_today = sum(r["cnt"] for r in stats_r) + sum(r["cnt"] for r in stats_c)
+    important_total = min(3, len(routine_lines) + len(custom_lines) + len(regular_lines)) if adhd else total_today
+    summary_lines = [
+        f"🎯 Очки: сегодня {points_today}, за 7 дней {points7}, стрик {streak} дн.",
+        f"✅ Прогресс: {done_today}/{important_total or total_today or 0} задач за сегодня",
+    ]
+    finance_line = await payday_summary(db, user, local_date)
+    if finance_line:
+        summary_lines.append(finance_line)
+    blocks = [f"{pause_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
+    blocks.append("<b>🌞 Рутины:</b>\n" + ("\n".join(routine_lines) if routine_lines else "Нет данных на сегодня"))
+    if custom_lines:
+        blocks.append("<b>🔔 Свои напоминания на сегодня:</b>\n" + "\n".join(custom_lines))
+    if regular_lines:
+        blocks.append("<b>🔁 Регулярка по дому:</b>\n" + "\n".join(regular_lines))
+    if bills_lines:
+        blocks.append("<b>📅 Счета в ближайшие дни:</b>\n" + "\n".join(bills_lines))
+
+    kb_buttons = []
+    if custom_kb:
+        kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
+    else:
+        kb_buttons.append([types.InlineKeyboardButton(text="➕ Добавить напоминание", callback_data="rem:add")])
+    if regular_kb:
+        kb_buttons.append([types.InlineKeyboardButton(text="Дела по дому", callback_data="home:regular")])
+        kb_buttons.append([types.InlineKeyboardButton(text="Все дела по дому", callback_data="home:regular_all")])
+    kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
+    kb_buttons.append([types.InlineKeyboardButton(text="Дом", callback_data="home:menu")])
+    kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
+    inline_kb = types.InlineKeyboardMarkup(inline_keyboard=kb_buttons) if kb_buttons else None
+
+    return "\n\n".join(blocks), inline_kb
