@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils.rows import row_to_dict
 from utils.time import parse_hhmm
 from utils.tone import tone_short_ack
 from utils.time import local_date_str
@@ -44,7 +45,7 @@ def list_keyboard(reminders, with_add: bool = True) -> InlineKeyboardMarkup:
     if with_add:
         buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data="rem:add")])
     for r in reminders:
-        row = dict(r)
+        row = row_to_dict(r)
         tw = row.get("target_weekday")
         wd = ""
         if tw is not None:
@@ -270,10 +271,12 @@ async def _save_reminder_with_frequency(
     user_tz = data.get("user_tz")
     user = None
     if user_id is not None:
-        user = await repo.get_user(db, user_id)
+        urow = await repo.get_user(db, user_id)
+        user = row_to_dict(urow) if urow else None
     if not user:
         # попытка найти по телеграм-id (важно для callback, где message.from_user может быть бот)
-        user = await repo.get_user_by_telegram_id(db, tg_user_id)
+        urow = await repo.get_user_by_telegram_id(db, tg_user_id)
+        user = row_to_dict(urow) if urow else None
     if not user:
         # финальный fallback — создаём пользователя
         user = await _ensure_user(message, db, tg_user_id, tg_full_name)
@@ -303,7 +306,8 @@ async def _save_reminder_with_frequency(
 
 @router.message(Command("reminders"))
 async def list_reminders(message: types.Message, db) -> None:
-    user = await repo.get_user_by_telegram_id(db, message.from_user.id)
+    urow = await repo.get_user_by_telegram_id(db, message.from_user.id)
+    user = row_to_dict(urow) if urow else None
     if not user:
         await message.answer(register_text())
         return
@@ -320,7 +324,8 @@ async def list_reminders(message: types.Message, db) -> None:
 
 @router.message(lambda m: m.text and "напомин" in m.text.lower())
 async def list_reminders_button(message: types.Message, db) -> None:
-    user = await repo.get_user_by_telegram_id(db, message.from_user.id)
+    urow = await repo.get_user_by_telegram_id(db, message.from_user.id)
+    user = row_to_dict(urow) if urow else None
     if not user:
         await message.answer(register_text())
         return
@@ -338,7 +343,8 @@ async def list_reminders_button(message: types.Message, db) -> None:
 @router.callback_query(lambda c: c.data and c.data.startswith("customdel:"))
 async def delete_reminder(callback: types.CallbackQuery, db) -> None:
     reminder_id = int(callback.data.split(":")[1])
-    user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
+    urow = await repo.get_user_by_telegram_id(db, callback.from_user.id)
+    user = row_to_dict(urow) if urow else None
     if not user:
         await callback.answer(register_text(), show_alert=True)
         return

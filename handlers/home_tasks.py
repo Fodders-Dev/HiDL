@@ -30,7 +30,8 @@ class HomeFreqState(StatesGroup):
 def _regular_keyboard(tasks):
     rows = []
     for t in tasks:
-        row = dict(t)
+        from utils.rows import row_to_dict
+        row = row_to_dict(t)
         status_icon = "✅ " if row.get("last_done_date") else ""
         rows.append(
             [
@@ -48,11 +49,12 @@ def _regular_keyboard(tasks):
 def _all_tasks_keyboard(tasks):
     rows = []
     for t in tasks:
+        row = dict(t)
         rows.append(
             [
-                InlineKeyboardButton(text="✅", callback_data=f"hall:done:{t['id']}"),
-                InlineKeyboardButton(text="⚙️ Частота", callback_data=f"hall:freq:{t['id']}"),
-                InlineKeyboardButton(text="🗑", callback_data=f"hall:hide:{t['id']}"),
+                InlineKeyboardButton(text="✅", callback_data=f"hall:done:{row['id']}"),
+                InlineKeyboardButton(text="⚙️ Частота", callback_data=f"hall:freq:{row['id']}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"hall:hide:{row['id']}"),
             ]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
@@ -73,7 +75,8 @@ def _freq_presets_keyboard(task_id: int) -> InlineKeyboardMarkup:
 
 
 def _format_task_line(t) -> str:
-    row = dict(t)
+    from utils.rows import row_to_dict
+    row = row_to_dict(t)
     status = "✅" if row.get("last_done_date") else "⏳"
     return f"{status} {row['title']} — каждые {row['frequency_days']} д., до {format_date_display(row['next_due_date'])}"
 
@@ -138,7 +141,8 @@ async def _refresh_plan(callback: types.CallbackQuery, db) -> None:
         return
     lines = ["План по дому на ближайшие 7 дней:"]
     for t in tasks:
-        lines.append(f"• До {format_date_display(t['next_due_date'])} — {t['title']}")
+        row = dict(t)
+        lines.append(f"• До {format_date_display(row['next_due_date'])} — {row['title']}")
     kb = _regular_keyboard(tasks)
     try:
         await callback.message.edit_text("\n".join(lines), reply_markup=kb)
@@ -322,7 +326,11 @@ async def _build_steps(db, user_id: int, energy: str, clean_type: str, today: st
         return _surface_steps(energy)
     if clean_type == "normal":
         return _normal_steps(tasks, energy)
-    zone = (tasks[0]["zone"] if tasks else "room") or "room"
+    if tasks:
+        first = dict(tasks[0])
+        zone = first.get("zone") or "room"
+    else:
+        zone = "room"
     return _zone_steps(zone, energy)
 
 

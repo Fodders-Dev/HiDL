@@ -80,13 +80,16 @@ async def _compose_spent_week(db, user) -> str:
     per_cat = defaultdict(float)
     total = 0.0
     for e in rows:
-        per_cat[e["category"]] += e["amount"]
-        total += e["amount"]
+        row = dict(e)
+        per_cat[row["category"]] += row["amount"]
+        total += row["amount"]
     if total == 0:
         return "За последние 7 дней расходов не записано."
     lines = [f"{cat}: {amt:.0f}" for cat, amt in per_cat.items()]
     text = f"Траты за 7 дней: {total:.0f}\n" + "\n".join(lines)
     budget = await repo.get_budget(db, user["id"])
+    if budget:
+        budget = dict(budget)
     if budget and budget["monthly_limit"] > 0:
         month_total = await repo.monthly_expense_sum(db, user["id"])
         text += f"\nМесяц: {month_total:.0f} / лимит {budget['monthly_limit']:.0f}"
@@ -95,8 +98,9 @@ async def _compose_spent_week(db, user) -> str:
     if cats:
         cat_lines = []
         for c in cats:
-            spent_cat = await repo.category_expense_sum(db, user["id"], c["category"], days=30)
-            cat_lines.append(f"{c['category']}: {spent_cat:.0f} / {c['limit_amount']:.0f}")
+            row = dict(c)
+            spent_cat = await repo.category_expense_sum(db, user["id"], row["category"], days=30)
+            cat_lines.append(f"{row['category']}: {spent_cat:.0f} / {row['limit_amount']:.0f}")
         text += "\nКатегории:\n" + "\n".join(cat_lines)
     return text
 
