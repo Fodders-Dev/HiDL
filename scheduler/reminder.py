@@ -303,7 +303,7 @@ class ReminderScheduler:
             care_items = [
                 ("last_care_dentist", 180, "🦷 Давно не было стоматолога? Запишись на осмотр/чистку."),
                 ("last_care_vision", 365, "👓 Проверь зрение, если давно не проверял(а)."),
-                ("last_care_firstaid", 180, "🩹 Проверь аптечку: сроки годности, что нужно докупить."),
+                ("last_care_firstaid", 180, "🩹 Загляни в аптечку: сроки годности, что нужно докупить."),
                 ("last_care_brush", 90, "🪥 Пора сменить щётку/насадку?"),
             ]
             for col, days, text in care_items:
@@ -316,12 +316,17 @@ class ReminderScheduler:
                     except Exception:
                         due = True
                 if due:
+                    note_date = format_date_display(local_date)
                     kb = InlineKeyboardMarkup(
                         inline_keyboard=[
                             [InlineKeyboardButton(text="Отметить сделанным", callback_data=f"care:{col}:{local_date}")]
                         ]
                     )
-                    await self.bot.send_message(chat_id=user["telegram_id"], text=text, reply_markup=kb)
+                    await self.bot.send_message(
+                        chat_id=user["telegram_id"],
+                        text=f"{text}\nДата сегодня: {note_date}",
+                        reply_markup=kb,
+                    )
 
     async def _tick_weight_prompt(self) -> None:
         """Раз в день напоминаем про вес, если не спрашивали 7 дней."""

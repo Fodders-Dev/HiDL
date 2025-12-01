@@ -6,6 +6,9 @@ from aiogram import types
 from db import repositories as repo
 from utils.finance import payday_summary
 from utils.time import local_date_str, format_date_display
+from utils.formatting import format_money
+from utils.rows import row_to_dict
+from utils.texts import gentle_streak
 
 
 async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
@@ -20,25 +23,28 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     routines = await repo.list_user_routines(db, user["id"])
 
     status_emoji = {"pending": "⏳", "done": "✅", "skip": "⏭", "later": "🔔"}
-    routine_status = {t["routine_id"]: t["status"] for t in tasks}
+    routine_status = {row_to_dict(t).get("routine_id"): row_to_dict(t).get("status") for t in tasks}
 
     routine_lines = []
     routine_kb = []
-    for r in routines:
-        st = routine_status.get(r["routine_id"], "pending")
-        label = f"{status_emoji.get(st,'⏳')} {r['title']} ({r['reminder_time']})"
+    for r_raw in routines:
+        r = row_to_dict(r_raw)
+        if not r.get("routine_id"):
+            continue
+        st = routine_status.get(r.get("routine_id"), "pending")
+        label = f"{status_emoji.get(st,'⏳')} {r.get('title')} ({r.get('reminder_time')})"
         if st == "skip":
-            label = f"⏭ {r['title']} ({r['reminder_time']})"
+            label = f"⏭ {r.get('title')} ({r.get('reminder_time')})"
         routine_lines.append(label)
         routine_kb.append(
             [
                 types.InlineKeyboardButton(
-                    text=f"✅ {r['title']}",
-                    callback_data=f"routine:{r['routine_id']}:{local_date}:done",
+                    text=f"✅ {r.get('title')}",
+                    callback_data=f"routine:{r.get('routine_id')}:{local_date}:done",
                 ),
                 types.InlineKeyboardButton(
-                    text=f"⏭ {r['title']}",
-                    callback_data=f"routine:{r['routine_id']}:{local_date}:skip",
+                    text=f"⏭ {r.get('title')}",
+                    callback_data=f"routine:{r.get('routine_id')}:{local_date}:skip",
                 ),
             ]
         )
@@ -50,23 +56,27 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     custom_status = await repo.custom_statuses_for_date(db, user["id"], local_date)
     custom_lines = []
     custom_kb = []
-    for c in custom:
-        status = custom_status.get(c["id"], "pending")
+    for c_raw in custom:
+        c = row_to_dict(c_raw)
+        status = custom_status.get(c.get("id"), "pending")
         if status != "done":  # не показываем уже закрытые
-            custom_lines.append(f"• {c['title']} — {c['reminder_time']}")
+            custom_lines.append(f"• {c.get('title')} — {c.get('reminder_time')}")
             custom_kb.append(
                 [
                     types.InlineKeyboardButton(
-                        text=f"✅ {c['title'][:18]}",
-                        callback_data=f"custom:{c['id']}:{local_date}:done",
+                        text=f"✅ {c.get('title','')[:18]}",
+                        callback_data=f"custom:{c.get('id')}:{local_date}:done",
                     ),
                     types.InlineKeyboardButton(
-                        text=f"↪️ {c['title'][:18]}",
-                        callback_data=f"custom:{c['id']}:{local_date}:later",
+                        text=f"↪️ {c.get('title','')[:18]}",
+                        callback_data=f"custom:{c.get('id')}:{local_date}:later",
                     ),
                 ]
             )
     if adhd and len(custom_lines) > 3:
+        custom_lines = custom_lines[:3]
+        custom_kb = custom_kb[:3]
+    elif len(custom_lines) > 3:
         custom_lines = custom_lines[:3]
         custom_kb = custom_kb[:3]
 
@@ -75,18 +85,29 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     reg_done_today = await repo.list_regular_tasks_done_on_date(db, user["id"], local_date)
     regular_lines = []
     regular_kb = []
-    for r in reg_due[:3]:
-        regular_lines.append(f"• {r['title']} — до {format_date_display(r['next_due_date'])}")
+    for r_raw in reg_due[:3]:
+        r = row_to_dict(r_raw)
+        zone = r.get("zone") or "misc"
+        icon = {
+            "kitchen": "🍳",
+            "bathroom": "🚿",
+            "bedroom": "🛏",
+            "hallway": "🚪",
+            "laundry": "🧺",
+            "fridge": "🧊",
+            "misc": "🧰",
+        }.get(zone, "🧰")
+        regular_lines.append(f"{icon} {r.get('title')} — до {format_date_display(r.get('next_due_date'))}")
         regular_kb.append(
             [
-                types.InlineKeyboardButton(text=f"✅ {r['title'][:16]}", callback_data=f"hweek:done:{r['id']}"),
-                types.InlineKeyboardButton(text="↪️ +1", callback_data=f"hweek:later:1:{r['id']}"),
-                types.InlineKeyboardButton(text="+3", callback_data=f"hweek:later:3:{r['id']}"),
-                types.InlineKeyboardButton(text="+7", callback_data=f"hweek:later:7:{r['id']}"),
+                types.InlineKeyboardButton(text=f"✅ {r.get('title','')[:16]}", callback_data=f"hweek:done:{r.get('id')}"),
+                types.InlineKeyboardButton(text="↪️ +1", callback_data=f"hweek:later:1:{r.get('id')}"),
+                types.InlineKeyboardButton(text="+3", callback_data=f"hweek:later:3:{r.get('id')}"),
+                types.InlineKeyboardButton(text="+7", callback_data=f"hweek:later:7:{r.get('id')}"),
             ]
         )
     if reg_done_today:
-        done_lines = [f"• {r['title']} — следующая дата {format_date_display(r['next_due_date'])}" for r in reg_done_today[:2]]
+        done_lines = [f"• {row_to_dict(r).get('title')} — следующая дата {format_date_display(row_to_dict(r).get('next_due_date'))}" for r in reg_done_today[:2]]
         regular_lines += ["Выполнено сегодня:"] + done_lines
 
     pause_note = ""
@@ -96,7 +117,12 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     bills_lines = []
     bills = await repo.bills_due_soon(db, user["id"], local_date, days_ahead=3)
     if bills:
-        bills_lines = [f"• {b['title']} — до {format_date_display(b['due_date'])} (~{b['amount']:.0f} ₽)" for b in bills]
+        bills_lines = []
+        for b in bills[:3]:
+            row = row_to_dict(b)
+            bills_lines.append(
+                f"• {row.get('title')} — до {format_date_display(row.get('due_date'))} (~{format_money(row.get('amount',0))} ₽)"
+            )
 
     # summary block
     points7 = await repo.points_window(db, user["id"], days=7)
@@ -110,6 +136,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     summary_lines = [
         f"🎯 Очки: сегодня {points_today}, за 7 дней {points7}, стрик {streak} дн.",
         f"✅ Прогресс: {done_today}/{important_total or total_today or 0} задач за сегодня",
+        gentle_streak(streak),
     ]
     finance_line = await payday_summary(db, user, local_date)
     home_summary = ""
@@ -124,22 +151,20 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     if home_summary:
         summary_lines.append(home_summary)
     blocks = [f"{pause_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
-    blocks.append("<b>🌞 Рутины:</b>\n" + ("\n".join(routine_lines) if routine_lines else "Нет данных на сегодня"))
+    if routine_lines:
+        blocks.append("<b>🌞 Рутины:</b>\n" + "\n".join(routine_lines))
     if custom_lines:
-        blocks.append("<b>🔔 Свои напоминания на сегодня:</b>\n" + "\n".join(custom_lines))
+        blocks.append("<b>🔔 Свои напоминания:</b>\n" + "\n".join(custom_lines))
     if regular_lines:
         blocks.append("<b>🔁 Регулярка по дому:</b>\n" + "\n".join(regular_lines))
     if bills_lines:
         blocks.append("<b>📅 Счета в ближайшие дни:</b>\n" + "\n".join(bills_lines))
 
     kb_buttons = []
-    if custom_kb:
-        kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
-    else:
-        kb_buttons.append([types.InlineKeyboardButton(text="➕ Добавить напоминание", callback_data="rem:add")])
+    kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
     kb_buttons.append([types.InlineKeyboardButton(text="📅 План по дому", callback_data="home:week")])
     kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
     kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
-    inline_kb = types.InlineKeyboardMarkup(inline_keyboard=kb_buttons) if kb_buttons else None
+    inline_kb = types.InlineKeyboardMarkup(inline_keyboard=kb_buttons)
 
     return "\n\n".join(blocks), inline_kb

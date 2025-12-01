@@ -6,6 +6,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils import texts
 from utils.time import is_valid_timezone, parse_hhmm, tzinfo_from_string
 
 router = Router()
@@ -76,7 +77,9 @@ async def reg_name(message: types.Message, state: FSMContext) -> None:
 async def reg_timezone(message: types.Message, state: FSMContext) -> None:
     tz_raw = message.text.strip()
     if not is_valid_timezone(tz_raw):
-        await message.answer("Не понял часовой пояс. Пример: Europe/Moscow или UTC+3.")
+        await message.answer(
+            texts.error("не распознала часовой пояс. Пример: Europe/Moscow или UTC+3."),
+        )
         return
 
     await state.update_data(timezone=tz_raw)
@@ -88,7 +91,9 @@ async def reg_timezone(message: types.Message, state: FSMContext) -> None:
 async def reg_wake_up(message: types.Message, state: FSMContext) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
-        await message.answer("Не распознал время. Введи в формате HH:MM, например 07:30.")
+        await message.answer(
+            texts.error("не распознала время. Формат HH:MM, например 07:30."),
+        )
         return
     await state.update_data(wake_up=message.text.strip())
     await state.set_state(Registration.sleep)
@@ -99,7 +104,9 @@ async def reg_wake_up(message: types.Message, state: FSMContext) -> None:
 async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
-        await message.answer("Не распознал время. Введи в формате HH:MM, например 23:30.")
+        await message.answer(
+            texts.error("не распознала время. Формат HH:MM, например 23:30."),
+        )
         return
 
     data = await state.get_data()

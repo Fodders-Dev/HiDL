@@ -61,9 +61,17 @@ async def food_menu(message: types.Message) -> None:
 
 
 @router.message(lambda m: m.text and "дом" in m.text.lower())
-async def home_menu(message: types.Message) -> None:
+async def home_menu(message: types.Message, db) -> None:
+    from utils.user import ensure_user
+    from utils.time import local_date_str
+    import datetime
+
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    # гарантируем наличие базовой регулярки
+    await repo.ensure_regular_tasks(db, user["id"], today)
     await message.answer(
-        "Дом: помогу навести порядок по-человечески.\nВыбирай, что актуальнее: быстренько убраться, посмотреть план на неделю или разобраться с регулярными делами.",
+        "Дом: помогу навести порядок по-человечески. Выбирай, что актуально сейчас:",
         reply_markup=home_menu_keyboard(),
     )
 
@@ -73,11 +81,35 @@ async def move_menu(message: types.Message) -> None:
     await message.answer("Движение: прогулки, фокус.", reply_markup=movement_menu_keyboard())
 
 
+@router.message(lambda m: m.text and ("поговор" in m.text.lower() or "болта" in m.text.lower()))
+async def talk_menu(message: types.Message) -> None:
+    from handlers import talk
+
+    await talk.talk_placeholder(message)
+
+
+@router.callback_query(lambda c: c.data and c.data == "today:menu")
+async def today_menu(callback: types.CallbackQuery, db) -> None:
+    user_row = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    user = dict(user_row)
+    from utils.today import render_today
+    text, kb = await render_today(db, user)
+    await callback.message.edit_text(text, reply_markup=kb or main_menu_keyboard())
+    await callback.answer()
+
+
 @router.message(lambda m: m.text and ("⚙" in m.text or "настрой" in m.text.lower()))
 async def settings_menu(message: types.Message, db, state: FSMContext) -> None:
     from handlers import settings as settings_handler
 
     await settings_handler.settings_entry(message, state=state, db=db)
+
+
+@router.message(lambda m: m.text and "очк" in m.text.lower())
+async def points_menu(message: types.Message, db) -> None:
+    from handlers import stats
+
+    await stats.stats(message, db)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("food:"))
@@ -104,13 +136,22 @@ async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
     action = callback.data.split(":")[1]
     if action == "menu":
         await callback.message.answer(
-            "Дом: помогу навести порядок по-человечески.\nВыбирай, что актуальнее: быстренько убраться, посмотреть план на неделю или разобраться с регулярными делами.",
+            "Дом: помогу навести порядок по-человечески. Выбирай, что актуально сейчас:",
             reply_markup=home_menu_keyboard(),
         )
     elif action == "now":
         from handlers import home_tasks
 
         await home_tasks.start_clean_now(callback, db, state)
+    elif action == "quickmenu":
+        from handlers import home_tasks
+
+        resumed = await home_tasks._resume_any_cleanup(callback.message, state)  # noqa: SLF001
+        if not resumed:
+            await callback.message.answer(
+                "Быстрые сценарии по зонам — выбери и пройдись по шагам:",
+                reply_markup=home_tasks._quick_menu_keyboard(),  # noqa: SLF001
+            )
     elif action == "week":
         from handlers import home_tasks
 
@@ -120,12 +161,13 @@ async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
 
         await home_tasks.show_all_tasks(callback.message, db)
     elif action == "smell":
-        from handlers.ask_mom import ask_menu_keyboard
+        from handlers import home_tasks
 
-        await callback.message.answer(
-            "Стирка/запах: выбери, что сейчас актуально.",
-            reply_markup=ask_menu_keyboard(),
-        )
+        await home_tasks.send_smell_menu(callback.message)
+    elif action == "points":
+        from handlers import stats
+
+        await stats.stats(callback.message, db)
     await callback.answer()
 
 

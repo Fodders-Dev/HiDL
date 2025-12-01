@@ -27,6 +27,7 @@ from handlers import (
 )
 from middlewares.db import DbSessionMiddleware
 from middlewares.ensure_user import EnsureUserMiddleware
+from middlewares.error_log import ErrorLogMiddleware
 from scheduler.reminder import ReminderScheduler
 
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +43,7 @@ async def main() -> None:
     dp = Dispatcher()
     dp.update.middleware(DbSessionMiddleware(conn))
     dp.update.middleware(EnsureUserMiddleware(conn))
+    dp.update.middleware(ErrorLogMiddleware())
     dp.include_router(start.router)
     dp.include_router(menu.router)
     dp.include_router(knowledge.router)

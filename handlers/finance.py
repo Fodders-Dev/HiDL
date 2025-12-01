@@ -9,10 +9,14 @@ from aiogram.fsm.context import FSMContext
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils.rows import row_to_dict
 from utils.time import local_date_str
 from utils.tone import tone_message
 from utils.finance import payday_summary
 from utils.texts import register_text
+from utils.nl_parser import parse_command
+from utils.formatting import format_money
+from utils.texts import error as gentle_error
 
 router = Router()
 
@@ -53,6 +57,14 @@ async def budget_info(message: types.Message) -> None:
 @router.message(Command("spent"))
 async def spent_add(message: types.Message, db) -> None:
     user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
+    parsed = parse_command(message.text or "")
+    if parsed and parsed.type == "expense":
+        amount = parsed.payload.get("amount")
+        category = parsed.payload.get("category", "другое")
+        if amount:
+            await repo.add_expense(db, user["id"], amount, category)
+            await message.answer(f"Записала трату: {amount:.0f} ₽, категория {category}.", reply_markup=main_menu_keyboard())
+            return
     await message.answer("Через команду /spent можно добавить трату так: /spent 500 еда. Но проще пользоваться кнопкой «Записать трату» в разделе Деньги.")
     budget = await repo.get_budget(db, user["id"])
     if budget and budget["monthly_limit"] > 0:
@@ -85,14 +97,28 @@ async def _compose_spent_week(db, user) -> str:
         total += row["amount"]
     if total == 0:
         return "За последние 7 дней расходов не записано."
-    lines = [f"{cat}: {amt:.0f}" for cat, amt in per_cat.items()]
-    text = f"Траты за 7 дней: {total:.0f}\n" + "\n".join(lines)
+    lines = [f"{cat}: {format_money(amt)}" for cat, amt in per_cat.items()]
+    text = f"Траты за 7 дней: {format_money(total)}\n" + "\n".join(lines)
     budget = await repo.get_budget(db, user["id"])
     if budget:
         budget = dict(budget)
     if budget and budget["monthly_limit"] > 0:
         month_total = await repo.monthly_expense_sum(db, user["id"])
-        text += f"\nМесяц: {month_total:.0f} / лимит {budget['monthly_limit']:.0f}"
+        text += f"\nМесяц: {format_money(month_total)} / лимит {format_money(budget['monthly_limit'])}"
+        # грубая оценка дневного лимита до зарплаты
+        today = datetime.date.today()
+        payday = int(budget.get("payday_day") or 1)
+        year = today.year
+        month = today.month
+        if today.day > payday:
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        next_pay = datetime.date(year, month, payday)
+        days_left = max(1, (next_pay - today).days)
+        left_money = max(0.0, (budget["monthly_limit"] - month_total))
+        text += f"\nДо зарплаты {days_left} дн., можно тратить ≈{format_money(left_money/days_left)} ₽/день."
     # категории лимитов
     cats = await repo.list_budget_categories(db, user["id"])
     if cats:
@@ -100,7 +126,7 @@ async def _compose_spent_week(db, user) -> str:
         for c in cats:
             row = dict(c)
             spent_cat = await repo.category_expense_sum(db, user["id"], row["category"], days=30)
-            cat_lines.append(f"{row['category']}: {spent_cat:.0f} / {row['limit_amount']:.0f}")
+            cat_lines.append(f"{row['category']}: {format_money(spent_cat)} / {format_money(row['limit_amount'])}")
         text += "\nКатегории:\n" + "\n".join(cat_lines)
     return text
 
@@ -144,7 +170,7 @@ async def budget_set(message: types.Message, db) -> None:
 async def budget_cat(message: types.Message, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if not user:
-        await message.answer(register_text())
+        await message.answer(gentle_error("Нужно пройти /start, чтобы сохранить лимит"))
         return
     parts = message.text.strip().split(maxsplit=2)
     if len(parts) < 3:
@@ -200,14 +226,14 @@ async def money_menu_entry(message: types.Message, state: FSMContext, db) -> Non
         inline_keyboard=[
             [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
             [types.InlineKeyboardButton(text="📊 Отчёт за неделю", callback_data="money:report")],
-            [types.InlineKeyboardButton(text="🎯 Лимиты по категориям", callback_data="money:cat")],
+            [types.InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
             [types.InlineKeyboardButton(text="⏳ До зарплаты", callback_data="money:payday")],
             [types.InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
             [types.InlineKeyboardButton(text="💡 Советы", callback_data="money:tips")],
         ]
     )
     await message.answer(
-        "Деньги:\n• Записать новую трату\n• Посмотреть отчёт за неделю\n• Настроить лимиты по категориям",
+        "Деньги:\n• Записать новую трату\n• Посмотреть отчёт за неделю\n• Настроить лимиты\n• Управлять счетами и оплатами",
         reply_markup=kb,
     )
 
@@ -222,7 +248,19 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
     elif action == "report":
         user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         text = await _compose_spent_week(db, user)
-        await callback.message.answer(text, reply_markup=main_menu_keyboard())
+        now_utc = datetime.datetime.utcnow()
+        local_today = local_date_str(now_utc, user["timezone"])
+        payday_line = await payday_summary(db, user, local_today)
+        if payday_line:
+            text += f"\n\n{payday_line}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
+                [types.InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
+                [types.InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
+            ]
+        )
+        await callback.message.answer(text, reply_markup=kb)
     elif action == "cat":
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -260,13 +298,31 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
     await callback.answer()
 
 
+# Свободный ввод для трат (натуральные команды)
+@router.message(lambda m: m.text and any(ch.isdigit() for ch in m.text))
+async def money_free_parse(message: types.Message, db) -> None:
+    parsed = parse_command(message.text)
+    if not parsed or parsed.type != "expense":
+        return
+    user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
+    amount = parsed.payload.get("amount")
+    category = parsed.payload.get("category", "другое")
+    if amount is None:
+        return
+    await repo.add_expense(db, user["id"], amount, category)
+    await message.answer(
+        f"Записала трату: {amount:.0f} ₽, категория {category}.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("limit:cat:"))
 async def limit_cat(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     _, _, cat = callback.data.split(":")
     await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     await state.update_data(limit_category=cat)
     await state.set_state(SpendState.category)
-    await callback.message.answer(f"Лимит для {cat}: введи сумму в месяц (₽).")
+    await callback.message.answer(f"Лимит для {cat}: введи сумму в месяц (₽).", reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
@@ -302,7 +358,11 @@ async def spend_category(message: types.Message, state: FSMContext, db) -> None:
         try:
             limit = float(category.replace(",", "."))
         except Exception:
-            await message.answer("Лимит должен быть числом.")
+            from utils import texts
+
+            await message.answer(
+                texts.error("лимит должен быть числом, например 15000"),
+            )
             return
         limit_cat_name = data.get("limit_category", "другое")
         await repo.upsert_budget_category(db, user["id"], limit_cat_name, limit)
@@ -321,7 +381,11 @@ async def payday_day_set(message: types.Message, state: FSMContext, db) -> None:
         if day < 1 or day > 31:
             raise ValueError
     except Exception:
-        await message.answer("Нужно число от 1 до 31. Попробуй ещё раз.")
+        from utils import texts
+
+        await message.answer(
+            texts.error("день должен быть от 1 до 31. Попробуй ещё раз."),
+        )
         return
     await state.update_data(payday_day=day)
     await state.set_state(SpendState.payday_budget)
@@ -337,7 +401,11 @@ async def payday_budget_set(message: types.Message, state: FSMContext, db) -> No
         if budget < 0:
             raise ValueError
     except Exception:
-        await message.answer("Нужно неотрицательное число. Введи сумму в ₽.")
+        from utils import texts
+
+        await message.answer(
+            texts.error("нужно неотрицательное число. Введи сумму в ₽."),
+        )
         return
     user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
     await repo.upsert_budget(db, user["id"], monthly_limit=budget, payday_day=day, food_budget=budget)
@@ -358,8 +426,21 @@ async def _render_bills(db, user_id: int) -> str:
         return "Счета: список пуст. Добавь первый платёж."
     lines = []
     for b in bills:
-        paid = "✅" if b["last_paid_month"] == current_month else "⏳"
-        lines.append(f"{paid} {b['title']}: ~{b['amount']:.0f} ₽, день {b['day_of_month']}")
+        row = row_to_dict(b)
+        paid = "✅" if row.get("last_paid_month") == current_month else "⏳"
+        # вычислим ближайшую дату оплаты
+        day = int(row.get("day_of_month", 1) or 1)
+        year = today.year
+        month = today.month
+        if today.day > day:
+            # следующий месяц
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        due_date = datetime.date(year, month, day)
+        due_text = due_date.strftime("%d.%m.%Y")
+        lines.append(f"{paid} {row.get('title')}: ~{row.get('amount',0):.0f} ₽, до {due_text}")
     return "Счета:\n" + "\n".join(lines)
 
 
@@ -370,11 +451,12 @@ async def bills_menu(message: types.Message, state: FSMContext, db) -> None:
     kb_rows = []
     bills = await repo.list_bills(db, user["id"])
     for b in bills:
+        row = row_to_dict(b)
         kb_rows.append(
             [
                 types.InlineKeyboardButton(
-                    text=f"Оплачено {b['title']}",
-                    callback_data=f"bill:pay:{b['id']}",
+                    text=f"Оплачено {row['title']}",
+                    callback_data=f"bill:pay:{row['id']}",
                 )
             ]
         )

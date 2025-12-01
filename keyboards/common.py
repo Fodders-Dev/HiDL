@@ -13,7 +13,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="💰 Деньги"), KeyboardButton(text="🧹 Дом")],
             [KeyboardButton(text="🚶 Движение"), KeyboardButton(text="⚙ Настройки")],
             [KeyboardButton(text="⏰ Напоминания"), KeyboardButton(text="🤱 Спросить маму")],
-            [KeyboardButton(text="☕ Поддержать")],
+            [KeyboardButton(text="💬 Поговорить"), KeyboardButton(text="☕ Поддержать")],
         ],
         resize_keyboard=True,
     )
@@ -36,9 +36,9 @@ def money_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Записать трату", callback_data="money:spent")],
             [InlineKeyboardButton(text="Отчёт за неделю", callback_data="money:report")],
-            [InlineKeyboardButton(text="Лимит по категории", callback_data="money:cat")],
-            [InlineKeyboardButton(text="Пинг счетов", callback_data="money:bills")],
-            [InlineKeyboardButton(text="Финсоветы", callback_data="money:tips")],
+            [InlineKeyboardButton(text="Лимиты", callback_data="money:cat")],
+            [InlineKeyboardButton(text="Счета", callback_data="money:bills")],
+            [InlineKeyboardButton(text="Советы", callback_data="money:tips")],
         ]
     )
 
@@ -47,6 +47,7 @@ def home_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🧽 Уборка сейчас", callback_data="home:now")],
+            [InlineKeyboardButton(text="⚡ Быстрые сценарии", callback_data="home:quickmenu")],
             [InlineKeyboardButton(text="📅 План на неделю", callback_data="home:week")],
             [InlineKeyboardButton(text="📋 Все дела по дому", callback_data="home:all")],
             [InlineKeyboardButton(text="🧴 Запахи / стирка", callback_data="home:smell")],

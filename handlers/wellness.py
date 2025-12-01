@@ -68,7 +68,9 @@ async def wellness_settings(message: types.Message, db) -> None:
 async def focus_edit_input(message: types.Message, db) -> None:
     parts = message.text.strip().split()
     if len(parts) < 2:
-        await message.answer("Нужно два числа: работа отдых, например 20 10 или 10 5.")
+        await message.answer(
+            texts.error("нужно два числа: работа отдых, например 20 10 или 10 5."),
+        )
         return
     try:
         work = int(parts[0])
@@ -76,7 +78,9 @@ async def focus_edit_input(message: types.Message, db) -> None:
         if work < 2 or rest < 1:
             raise ValueError
     except Exception:
-        await message.answer("Нужно два целых числа (работа отдых), минимум 2 и 1.")
+        await message.answer(
+            texts.error("нужны целые числа (работа отдых), минимум 2 и 1."),
+        )
         return
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -110,7 +114,9 @@ async def time_edit_input(message: types.Message, db) -> None:
     raw = message.text.strip()
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     if not parts or any(not parse_hhmm(p) for p in parts):
-        await message.answer("Формат: HH:MM,HH:MM ... Пример: 11:00,16:00")
+        await message.answer(
+            texts.error("формат времени: HH:MM,HH:MM. Пример: 11:00,16:00"),
+        )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     if kind == "water":

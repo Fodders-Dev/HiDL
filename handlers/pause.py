@@ -18,14 +18,18 @@ async def pause(message: types.Message, db) -> None:
 
     parts = message.text.strip().split()
     if len(parts) < 2:
-        await message.answer("Укажи на сколько дней поставить на паузу, например «3».")
+        await message.answer(
+            texts.error("указать, на сколько дней поставить на паузу, например «3»."),
+        )
         return
     try:
         days = int(parts[1])
         if days < 1:
             raise ValueError
     except Exception:
-        await message.answer("Нужно целое число дней, например «3».")
+        await message.answer(
+            texts.error("нужно целое число дней, например «3»."),
+        )
         return
 
     now_utc = datetime.datetime.utcnow()

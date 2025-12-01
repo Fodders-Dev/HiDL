@@ -8,7 +8,9 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.time import local_date_str
 from utils.tone import tone_message
+from utils.time import format_date_display
 from utils.user import ensure_user
+from utils.texts import gentle_streak
 
 router = Router()
 
@@ -16,9 +18,10 @@ router = Router()
 def _aggregate(rows):
     by_date = defaultdict(lambda: {"done": 0, "total": 0})
     for row in rows:
-        date = row["routine_date"] if "routine_date" in row.keys() else row["reminder_date"]
-        status = row["status"]
-        count = row["cnt"]
+        r = dict(row)
+        date = r["routine_date"] if "routine_date" in r.keys() else r["reminder_date"]
+        status = r["status"]
+        count = r["cnt"]
         by_date[date]["total"] += count
         if status == "done":
             by_date[date]["done"] += count
@@ -60,7 +63,7 @@ async def stats(message: types.Message, db) -> None:
         out = []
         for date in sorted(by_date.keys(), reverse=True):
             d = by_date[date]
-            out.append(f"{date}: {d['done']}/{d['total']}")
+            out.append(f"{format_date_display(date)}: {d['done']}/{d['total']}")
         return out
 
     routine_streak = _streak(routine_by_date, local_today)
@@ -106,6 +109,7 @@ async def stats(message: types.Message, db) -> None:
         text += "Даже пара дел в неделю — это движение, квартира уже легче дышит."
     else:
         text += "Отличный темп — квартира точно благодарит."
+    text += "\n\n" + gentle_streak(routine_streak)
     if achievements:
         text += "\n\nАчивки:\n" + "\n".join(f"- {a}" for a in achievements)
     tone = "neutral"

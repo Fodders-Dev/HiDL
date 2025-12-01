@@ -8,6 +8,15 @@ def utc_now_str() -> str:
     return datetime.datetime.utcnow().isoformat()
 
 
+def calc_next_due(base_date: str, freq_days: int) -> str:
+    """Helper: add freq_days to base_date (ISO) and return ISO string."""
+    try:
+        base = datetime.date.fromisoformat(base_date)
+    except Exception:
+        base = datetime.date.today()
+    return (base + datetime.timedelta(days=freq_days)).isoformat()
+
+
 async def get_user_by_telegram_id(
     conn: aiosqlite.Connection, telegram_id: int
 ) -> Optional[aiosqlite.Row]:
@@ -332,6 +341,36 @@ async def delete_custom_reminder(conn: aiosqlite.Connection, user_id: int, remin
     await conn.commit()
 
 
+async def update_custom_reminder_time(
+    conn: aiosqlite.Connection, user_id: int, reminder_id: int, reminder_time: str
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE custom_reminders SET reminder_time = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        (reminder_time, now, reminder_id, user_id),
+    )
+    await conn.commit()
+
+
+async def update_custom_reminder_freq(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    reminder_id: int,
+    frequency_days: int,
+    target_weekday: Optional[int] = None,
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE custom_reminders
+        SET frequency_days = ?, target_weekday = ?, updated_at = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (frequency_days, target_weekday, now, reminder_id, user_id),
+    )
+    await conn.commit()
+
+
 async def set_custom_reminder_sent(
     conn: aiosqlite.Connection, reminder_id: int, sent_date: str
 ) -> None:
@@ -461,13 +500,20 @@ async def mark_regular_done(
     conn: aiosqlite.Connection, user_id: int, task_id: int, done_date: str
 ) -> None:
     now = utc_now_str()
+    cursor = await conn.execute(
+        "SELECT frequency_days FROM regular_tasks WHERE id = ? AND user_id = ?",
+        (task_id, user_id),
+    )
+    row = await cursor.fetchone()
+    freq = row["frequency_days"] if row else 7
+    next_due = calc_next_due(done_date, freq)
     await conn.execute(
         """
         UPDATE regular_tasks
-        SET last_done_date = ?, next_due_date = date(?, '+' || frequency_days || ' day'), updated_at = ?
+        SET last_done_date = ?, next_due_date = ?, updated_at = ?
         WHERE id = ? AND user_id = ?
         """,
-        (done_date, done_date, now, task_id, user_id),
+        (done_date, next_due, now, task_id, user_id),
     )
     await conn.commit()
 
@@ -476,13 +522,20 @@ async def postpone_regular_task(
     conn: aiosqlite.Connection, user_id: int, task_id: int, days: int = 1
 ) -> None:
     now = utc_now_str()
+    cursor = await conn.execute(
+        "SELECT next_due_date FROM regular_tasks WHERE id = ? AND user_id = ?",
+        (task_id, user_id),
+    )
+    row = await cursor.fetchone()
+    current_due = row["next_due_date"] if row and row["next_due_date"] else datetime.date.today().isoformat()
+    new_due = calc_next_due(current_due, days)
     await conn.execute(
         """
         UPDATE regular_tasks
-        SET next_due_date = date(next_due_date, '+' || ? || ' day'), updated_at = ?
+        SET next_due_date = ?, updated_at = ?
         WHERE id = ? AND user_id = ? AND (is_active IS NULL OR is_active=1)
         """,
-        (days, now, task_id, user_id),
+        (new_due, now, task_id, user_id),
     )
     await conn.commit()
 

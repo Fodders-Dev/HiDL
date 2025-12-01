@@ -9,8 +9,70 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from utils.mom_tips import pick_tip, find_tip_by_tag, get_tip
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils.nl_parser import parse_command
+from utils.time import local_date_str
+from utils.tone import tone_message, tone_ack
 
 router = Router()
+
+EXTRA_TIPS = {
+    "laundry_symbols": {
+        "id": "laundry_symbols",
+        "title": "Символы стирки, коротко",
+        "body": [
+            "Тазик с числом — стирка при этой температуре.",
+            "Перечёркнутый тазик — нельзя стирать.",
+            "Рука в тазике — ручная стирка.",
+            "Треугольник — отбеливание (перечёркнут — нельзя).",
+            "Кружок в квадрате — сушка в барабане, точки — температура.",
+            "Утюг с точками — температура глажки (3 точки — горячо).",
+        ],
+    },
+    "laundry_drawer": {
+        "id": "laundry_drawer",
+        "title": "Куда сыпать/лить в стиралке",
+        "body": [
+            "Отсек I (иногда «1») — предстирка, почти никогда не нужен.",
+            "Отсек II (иногда «2») — основной порошок/гель, сюда клади дозу.",
+            "Цветочек/звёздочка — кондиционер, не переливай (до метки).",
+            "Капсулы — сразу в барабан, не в лоток.",
+            "Не пересыпай: лучше меньше, чем комки порошка.",
+        ],
+    },
+    "laundry_programs": {
+        "id": "laundry_programs",
+        "title": "Режимы стиралки, коротко",
+        "body": [
+            "Хлопок/Повседневный 40°: тёмные/цветные вещи без белого.",
+            "Синтетика/Деликатная 30–40°: смешанные вещи, меньше отжим.",
+            "Постельное/Полотенца 60°: если есть силы — горячее, но не каждый раз.",
+            "Быстрая стирка: лёгко загрязнённые вещи, не перегружай барабан.",
+            "Отжим/Полоскание отдельно: если надо добить воду или освежить.",
+        ],
+    },
+    "low_energy": {
+        "id": "low_energy",
+        "title": "Если совсем нет сил",
+        "body": [
+            "Выбери одну вещь: вынести мусор или помыть 3 тарелки.",
+            "Попей воды, умойся, открой окно на 5 минут.",
+            "Сложи одежду/вещи в одну корзину — разберёшь позже.",
+            "Съешь что-то простое: банан, йогурт, тост с яйцом.",
+            "Не ругай себя: маленький шаг лучше нуля.",
+        ],
+    },
+    "clean_shortcuts": {
+        "id": "clean_shortcuts",
+        "title": "Быстрые лайфхаки по уборке",
+        "body": [
+            "Раковина: сода + уксус, через 5 мин кипяток — запахи уходят.",
+            "Ванна/раковина: посыпь пемолюкс/соду, сбрызни — пусть поработает, потом смой.",
+            "Плита: сбрызни средством и оставь на 5–10 мин, потом протри тёплой тряпкой.",
+            "Полы: сначала сухо собрать мусор/крошки, потом влажной салфеткой по пятнам.",
+            "Кухонный стол/скамья: протри сверху и подручные ручки — сразу видно результат.",
+        ],
+    },
+}
 
 
 class AskMomLaundry(StatesGroup):
@@ -58,19 +120,91 @@ async def start_cook_flow(message: types.Message, state: FSMContext) -> None:
 @router.message(lambda m: m.text and "спроси" in m.text.lower())
 async def ask_mom_entry(message: types.Message, state: FSMContext) -> None:
     await state.clear()
+    # попробовать разобрать как естественную команду (NL)
+    parsed = parse_command(message.text or "")
+    if parsed and parsed.type == "ask":
+        await handle_question(message, parsed.payload.get("question") or message.text)
+        return
     # если пользователь задал вопрос текстом сразу после команды
     text = message.text.replace("/ask_mom", "").strip()
     if text:
         tip = find_tip_by_tag(text)
         if tip:
-            lines = [f"{tip.get('title','Совет')}:"]
-            lines += [f"• {b}" for b in tip.get("body", [])]
-            await message.answer("\n".join(lines), reply_markup=ask_menu_keyboard())
+            await message.answer(_tip_to_text(tip), reply_markup=_tip_actions_kb(tip.get("id")))
             return
     await message.answer(
         "Напиши, в чём проблема, или выбери тему. Я отвечу по‑маминому: коротко и без шейминга.",
         reply_markup=ask_menu_keyboard(),
     )
+
+
+def _tip_to_text(tip: dict) -> str:
+    lines = [f"{tip.get('title','Совет')}:"] + [f"• {b}" for b in tip.get("body", [])]
+    return "\n".join(lines)
+
+
+def _tip_actions_kb(tip_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🧠 Ещё совет", callback_data=f"ask:more:{tip_id}"),
+                InlineKeyboardButton(text="🔔 Напомнить", callback_data=f"ask:reminder:{tip_id}"),
+            ]
+        ]
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("ask:reminder:"))
+async def ask_make_reminder(callback: types.CallbackQuery, db) -> None:
+    _, _, tip_id = callback.data.split(":")
+    tip = get_tip(tip_id)
+    user = await repo.get_user_by_telegram_id(db, callback.from_user.id)
+    if not user:
+        await callback.answer("Нужно пройти /start", show_alert=True)
+        return
+    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    # ставим напоминание на завтра утром
+    reminder_time = "10:00"
+    last_sent = today  # чтобы первое ушло завтра
+    await repo.create_custom_reminder(
+        db,
+        user_id=user["id"],
+        title=tip.get("title", "Совет"),
+        reminder_time=reminder_time,
+        frequency_days=7,
+    )
+    await repo.add_points(db, user["id"], 1, local_date=today)
+    await callback.message.answer(
+        tone_ack("soft", f"Сделала напоминание: {tip.get('title','Совет')} в {reminder_time} раз в 7 дней."),
+        reply_markup=main_menu_keyboard(),
+    )
+    await callback.answer("Создала напоминание")
+
+
+async def handle_question(message: types.Message, question: str) -> None:
+    tip = find_tip_by_tag(question) or EXTRA_TIPS.get("laundry_symbols") if "знач" in question.lower() else None
+    if not tip:
+        # дополнительные словари
+        for key in ("laundry_drawer", "low_energy"):
+            if key in question.lower():
+                tip = EXTRA_TIPS[key]
+                break
+    if not tip:
+        for tag, manual_tip in EXTRA_TIPS.items():
+            if tag in question.lower():
+                tip = manual_tip
+                break
+    if not tip and "сил" in question.lower():
+        tip = EXTRA_TIPS["low_energy"]
+    if tip:
+        lines = [f"{tip.get('title','Совет')}:"]
+        lines += [f"• {b}" for b in tip.get("body", [])]
+        await message.answer("\n".join(lines), reply_markup=ask_menu_keyboard())
+    else:
+        await message.answer(
+            "Поняла вопрос, пока нет точной карточки. Давай выберем тему, чтобы подсказать быстрее:",
+            reply_markup=ask_menu_keyboard(),
+        )
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("ask:start"))
@@ -89,19 +223,23 @@ async def ask_start(callback: types.CallbackQuery, state: FSMContext) -> None:
     elif kind == "laundry":
         await state.set_state(AskMomLaundry.item)
         await callback.message.answer(
-            "Что стираем?",
+            "Что стираем? Если нужны подсказки по значкам/лотку стиралки — жми «Символы» ниже.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="Тёмные повседневные", callback_data="ask:laundry:item:dark")],
                     [InlineKeyboardButton(text="Светлые/белые", callback_data="ask:laundry:item:light")],
                     [InlineKeyboardButton(text="Постельное", callback_data="ask:laundry:item:bed")],
                     [InlineKeyboardButton(text="Полотенца", callback_data="ask:laundry:item:towel")],
+                    [InlineKeyboardButton(text="🧾 Символы/лоток", callback_data="ask:laundry:help")],
                 ]
             ),
         )
     elif kind == "cleaning":
         await state.clear()
         await send_tip(callback.message, "уборка")
+        extra = EXTRA_TIPS.get("clean_shortcuts")
+        if extra:
+            await callback.message.answer(_tip_to_text(extra), reply_markup=main_menu_keyboard())
     elif kind == "cook":
         await start_cook_flow(callback.message, state)
     elif kind == "odor":
@@ -162,6 +300,15 @@ async def ask_odor(callback: types.CallbackQuery) -> None:
         )
     await callback.message.answer(text, reply_markup=main_menu_keyboard())
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data == "ask:laundry:help")
+async def ask_laundry_help(callback: types.CallbackQuery) -> None:
+    for key in ("laundry_symbols", "laundry_drawer", "laundry_programs"):
+        tip = EXTRA_TIPS.get(key)
+        if tip:
+            await callback.message.answer(_tip_to_text(tip), reply_markup=main_menu_keyboard())
+    await callback.answer("Подсказки по стиралке")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("cookprof:"))

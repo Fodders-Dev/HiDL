@@ -8,6 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils import texts
 from utils.time import is_valid_timezone, parse_hhmm
 from utils.user import ensure_user
 
@@ -178,7 +179,9 @@ async def settings_timezone(message: types.Message, state: FSMContext, db) -> No
 async def settings_wake(message: types.Message, state: FSMContext, db) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
-        await message.answer("Не распознал время. Формат HH:MM, например 07:30.")
+        await message.answer(
+            texts.error("не распознала время. Формат HH:MM, например 07:30."),
+        )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await repo.update_user_wake(db, user["id"], message.text.strip())
@@ -193,7 +196,9 @@ async def settings_wake(message: types.Message, state: FSMContext, db) -> None:
 async def settings_sleep(message: types.Message, state: FSMContext, db) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
-        await message.answer("Не распознал время. Формат HH:MM, например 23:30.")
+        await message.answer(
+            texts.error("не распознала время. Формат HH:MM, например 23:30."),
+        )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await repo.update_user_sleep(db, user["id"], message.text.strip())
@@ -220,7 +225,9 @@ async def settings_goals(message: types.Message, state: FSMContext, db) -> None:
 async def settings_routine_time(message: types.Message, state: FSMContext, db) -> None:
     hhmm = message.text.strip()
     if not parse_hhmm(hhmm):
-        await message.answer("Не распознал время. Формат HH:MM, например 07:30.")
+        await message.answer(
+            texts.error("не распознала время. Формат HH:MM, например 07:30."),
+        )
         return
     data = await state.get_data()
     routine_key = data.get("routine_key")

@@ -7,6 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils import texts
 from utils.user import ensure_user
 
 router = Router()
@@ -124,7 +125,9 @@ async def save_weight(message: types.Message, state: FSMContext, db) -> None:
         if val <= 0:
             raise ValueError
     except Exception:
-        await message.answer("Не понял число. Пример: 72.3")
+        await message.answer(
+            texts.error("вес должен быть числом. Пример: 72.3"),
+        )
         return
     user_row = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     user = dict(user_row)
@@ -158,7 +161,9 @@ async def set_height(message: types.Message, state: FSMContext, db) -> None:
         if h < 100 or h > 250:
             raise ValueError
     except Exception:
-        await message.answer("Рост должен быть числом, например 175.")
+        await message.answer(
+            texts.error("рост должен быть числом, например 175."),
+        )
         return
     await state.update_data(height=h)
     kb = types.InlineKeyboardMarkup(
@@ -188,7 +193,9 @@ async def set_target_weight(message: types.Message, state: FSMContext, db) -> No
     try:
         target = float(message.text.strip().replace(",", "."))
     except Exception:
-        await message.answer("Целевой вес должен быть числом.")
+        await message.answer(
+            texts.error("целевой вес должен быть числом."),
+        )
         return
     data = await state.get_data()
     h = data.get("height")
