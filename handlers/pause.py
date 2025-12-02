@@ -7,6 +7,7 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.time import local_date_str, local_date_plus_days
 from utils import texts
+from utils.affirmations import random_affirmation_text
 from utils.user import ensure_user
 
 router = Router()
@@ -39,6 +40,13 @@ async def pause(message: types.Message, db) -> None:
         f"{texts.GENTLE_ON}\nПауза до {pause_until}. Вернуть раньше — кнопка «Щадящий режим».",
         reply_markup=main_menu_keyboard(),
     )
+    # Мягкая поддержка при паузе
+    aff = random_affirmation_text()
+    if aff:
+        await message.answer(
+            f"И на паузу возьмём такую мысль:\n\n<i>{aff}</i>",
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 @router.message(Command("resume"))

@@ -352,15 +352,16 @@ def _clean_energy_keyboard() -> InlineKeyboardMarkup:
 
 
 def _zone_keyboard() -> InlineKeyboardMarkup:
+    """Выбор типа уборки/зоны для сценария «Уборка сейчас»."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Квартира в целом", callback_data="clean:zone:flat")],
             [
-                InlineKeyboardButton(text="Кухня", callback_data="clean:zone:kitchen"),
-                InlineKeyboardButton(text="Санузел", callback_data="clean:zone:bathroom"),
+                InlineKeyboardButton(text="🛁 Только ванна/туалет", callback_data="clean:zone:bathroom"),
+                InlineKeyboardButton(text="🍳 Только кухня", callback_data="clean:zone:kitchen"),
             ],
             [
-                InlineKeyboardButton(text="Комната/зал", callback_data="clean:zone:room"),
-                InlineKeyboardButton(text="Коридор/прихожая", callback_data="clean:zone:hallway"),
+                InlineKeyboardButton(text="🧹 Только полы", callback_data="clean:zone:floors"),
             ],
         ]
     )
@@ -388,6 +389,19 @@ async def start_clean_now(callback: types.CallbackQuery, db, state: FSMContext) 
         await callback.answer("Продолжаем там, где остановились.")
         return
     await state.clear()
+    # лёгкое предложение проветрить, без очков и обязательности
+    air_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Открыла(открыл)", callback_data="clean:air:ok"),
+                InlineKeyboardButton(text="Пропустить", callback_data="clean:air:skip"),
+            ]
+        ]
+    )
+    await callback.message.answer(
+        "Пока начнём убираться, можно открыть окно/форточку на 5–10 минут — воздух сам сделает часть работы.",
+        reply_markup=air_kb,
+    )
     await state.set_state(CleanNowState.choose_type)
     await callback.message.answer("Что делаем по дому?", reply_markup=_clean_type_keyboard())
     await callback.message.answer(
@@ -409,12 +423,12 @@ def _surface_steps(energy: str) -> List[dict]:
 
 
 def _base_prep_steps(zone: str) -> List[dict]:
-    """Быстрые подготовительные шаги — замачивание/проветривание/мусор."""
+    """Быстрые подготовительные шаги — замачивание и «фоновые» процессы."""
     common = [
-        {"text": "Открой окно на 5 минут, проветри", "points": 1},
         {"text": "Собери явный мусор в пакет, вынеси если полон", "points": 2},
         {"text": "Собери посуду в раковину/ПММ и замочи", "points": 2},
         {"text": "Собери одежду: грязное в корзину, остальное в одну стопку", "points": 1},
+        {"text": "Если есть стиралка с бельём — запусти стирку при подходящем режиме", "points": 2},
     ]
     soak = []
     if zone == "bathroom":
@@ -449,6 +463,11 @@ def _zone_steps(zone: str, energy: str) -> List[dict]:
             {"text": "Протереть зеркало/полку в прихожей", "points": 1},
             {"text": "Быстро пройтись пылесосом/шваброй у входа", "points": 3},
         ],
+        "floors": [
+            {"text": "Собрать крупный мусор и крошки с пола", "points": 2},
+            {"text": "Пройтись пылесосом/веником по основным проходам", "points": 3},
+            {"text": "Протереть влажной тряпкой самые грязные участки", "points": 3},
+        ],
     }
     steps = base.get(zone, base["room"])
     target = 3 if energy == "low" else (4 if energy == "mid" else 5)
@@ -473,7 +492,9 @@ async def _build_steps(db, user_id: int, energy: str, clean_type: str, today: st
         await repo.list_regular_tasks(db, user_id, local_date=today, due_in_days=7, include_inactive=False)
     )
     steps: List[dict] = []
-    steps.extend(_base_prep_steps(zone))
+    # параллельные процессы (замачивание/стирка) только для обычной/глубокой уборки
+    if clean_type != "surface":
+        steps.extend(_base_prep_steps(zone))
     if clean_type == "surface":
         steps.extend(_surface_steps(energy))
     elif clean_type == "normal":
@@ -519,7 +540,23 @@ def _finish_touches(zone: str) -> str:
     ]
     if zone == "bedroom":
         common.append("Если меняла постельное — отметь, что готово, +очки.")
+    if zone == "kitchen":
+        common.append("Если духовка давно не чистилась — можно заглянуть внутрь и решить, не пора ли её помыть.")
     return "Финишные штрихи:\n" + "\n".join(f"• {t}" for t in common)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("clean:air:"))
+async def clean_air(callback: types.CallbackQuery) -> None:
+    """Ответ на предложение проветрить — без очков и дополнительной логики."""
+    action = callback.data.split(":")[2]
+    if action == "ok":
+        await callback.answer("Отлично, пусть свежий воздух помогает.")
+    else:
+        await callback.answer("Хорошо, тогда двигаемся без окна.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("clean:type:"))

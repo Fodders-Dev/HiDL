@@ -57,6 +57,20 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             FOREIGN KEY (routine_id) REFERENCES routines(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS routine_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            routine_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            order_index INTEGER DEFAULT 0,
+            points INTEGER DEFAULT 1,
+            is_active INTEGER DEFAULT 1,
+            trigger_after_step_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS user_routines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -201,6 +215,60 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS day_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan_date TEXT NOT NULL,
+            morning_sent TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(user_id, plan_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS day_plan_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL,
+            is_important INTEGER DEFAULT 0,
+            done INTEGER DEFAULT 0,
+            synced_to_today INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (plan_id) REFERENCES day_plans(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS meds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            dose_text TEXT DEFAULT '',
+            schedule_type TEXT NOT NULL,
+            times TEXT NOT NULL,
+            days_of_week TEXT,
+            notes TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS med_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            med_id INTEGER NOT NULL,
+            taken_at TEXT,
+            plan_date TEXT NOT NULL,
+            planned_time TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (med_id) REFERENCES meds(id) ON DELETE CASCADE
+        );
         """
     )
     await ensure_columns(conn)
@@ -258,6 +326,41 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 weight REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+
+    # продукты на кухне
+    pantry_info = await conn.execute_fetchall("PRAGMA table_info(pantry_items);")
+    if not pantry_info:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pantry_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                amount REAL DEFAULT 0,
+                unit TEXT NOT NULL DEFAULT 'шт',
+                expires_at TEXT,
+                category TEXT NOT NULL DEFAULT 'прочее',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+
+    # фото чеков под будущий OCR
+    receipt_info = await conn.execute_fetchall("PRAGMA table_info(receipt_photos);")
+    if not receipt_info:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS receipt_photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );

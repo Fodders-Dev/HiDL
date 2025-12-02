@@ -7,6 +7,7 @@ from config import get_settings
 from db.database import connect, init_db
 from handlers import (
     ask_mom,
+    affirmations,
     custom_reminders,
     donate,
     knowledge,
@@ -14,8 +15,11 @@ from handlers import (
     finance,
     guides,
     home_tasks,
+    meds,
     movement,
     routines,
+    day_plan,
+    pantry,
     settings as settings_handler,
     start,
     stats,
@@ -23,6 +27,7 @@ from handlers import (
     wellness,
     zones,
     routine_items,
+    routine_steps,
     talk,
 )
 from middlewares.db import DbSessionMiddleware
@@ -49,18 +54,23 @@ async def main() -> None:
     dp.include_router(knowledge.router)
     dp.include_router(routines.router)
     dp.include_router(settings_handler.router)
+    dp.include_router(affirmations.router)
+    dp.include_router(day_plan.router)
     dp.include_router(custom_reminders.router)
     dp.include_router(ask_mom.router)
     dp.include_router(finance.router)
     dp.include_router(guides.router)
     dp.include_router(home_tasks.router)
     dp.include_router(movement.router)
+    dp.include_router(meds.router)
+    dp.include_router(pantry.router)
     dp.include_router(donate.router)
     dp.include_router(stats.router)
     dp.include_router(natural.router)
     dp.include_router(wellness.router)
     dp.include_router(zones.router)
     dp.include_router(routine_items.router)
+    dp.include_router(routine_steps.router)
     dp.include_router(talk.router)
 
     scheduler = ReminderScheduler(bot, conn)

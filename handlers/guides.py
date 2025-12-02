@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import Router, types
 from aiogram.filters import Command
 
@@ -11,9 +13,15 @@ from research_data import (
     MEAL_PLANS,
     SHOPLISTS,
     WALK_QUESTS,
+    COOK_RECIPES,
 )
 
+from db import repositories as repo
+from utils.rows import rows_to_dicts
+from utils.user import ensure_user
+
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("page:"))
@@ -117,12 +125,287 @@ async def adhd_mode(message: types.Message) -> None:
     )
 
 
+def _cook_recipes_map():
+    return {r["key"]: r for r in COOK_RECIPES}
+
+
+def _scale_ingredients(recipe: dict, servings: int) -> list[dict]:
+    base = recipe.get("base_servings", 1) or 1
+    factor = max(1, servings) / base
+    scaled = []
+    for ing in recipe.get("ingredients", []):
+        scaled.append(
+            {
+                "tag": ing.get("tag"),
+                "label": ing.get("label"),
+                "amount": round(ing.get("amount", 0) * factor),
+                "unit": ing.get("unit", "g"),
+            }
+        )
+    return scaled
+
+
+def _pantry_index(pantry_rows: list[dict]) -> dict:
+    index: dict[str, dict] = {}
+    for row in pantry_rows:
+        name = (row.get("name") or "").lower()
+        if not name:
+            continue
+        index[name] = row
+    return index
+
+
+def _to_base(amount: float, unit: str) -> tuple[float, str]:
+    u = (unit or "").lower()
+    if u in {"kg", "кг"}:
+        return amount * 1000, "g"
+    if u in {"g", "гр"}:
+        return amount, "g"
+    if u in {"l", "л"}:
+        return amount * 1000, "ml"
+    if u in {"ml", "мл"}:
+        return amount, "ml"
+    if u in {"шт"}:
+        return amount, "шт"
+    return amount, u or ""
+
+
+def _check_pantry_for_recipe(
+    scaled_ingredients: list[dict], pantry_items: list[dict]
+) -> tuple[list[str], list[str], list[tuple[str, float]]]:
+    """Вернуть списки (хватает, мало, не хватает)."""
+    index = _pantry_index(pantry_items)
+    ok: list[str] = []
+    low: list[tuple[str, float]] = []
+    missing: list[str] = []
+    for ing in scaled_ingredients:
+        tag = (ing.get("tag") or "").lower()
+        label = ing.get("label") or tag or "ингредиент"
+        needed_amt, needed_unit = _to_base(float(ing.get("amount", 0)), ing.get("unit", "g"))
+        pantry_row = None
+        for name, row in index.items():
+            if tag and tag in name:
+                pantry_row = row
+                break
+        if not pantry_row or needed_amt <= 0:
+            missing.append(label)
+            continue
+        have_amt, have_unit = _to_base(float(pantry_row.get("amount", 0)), pantry_row.get("unit", "шт"))
+        if have_unit != needed_unit or needed_amt == 0:
+            ok.append(label)
+            continue
+        leftover = have_amt - needed_amt
+        if leftover < 0:
+            missing.append(label)
+        elif leftover <= (100 if needed_unit in {"g", "ml"} else 1):
+            low.append((label, max(0.0, leftover)))
+        else:
+            ok.append(label)
+    return ok, missing, low
+
+
+async def _send_recipe_list(message: types.Message, db) -> None:
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    pantry_rows = rows_to_dicts(await repo.list_pantry_items(db, user["id"]))
+    lines = ["Быстрые блюда ≤30 минут. Выбери, что хочется приготовить:"]
+    kb_rows = []
+    for r in COOK_RECIPES:
+        lines.append(f"• {r['title']} ({r['time']}) — {r['short_desc']}")
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=r["title"], callback_data=f"recipe:card:{r['key']}:1"
+                )
+            ]
+        )
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
 @router.message(Command("recipes_fast"))
-async def recipes_fast(message: types.Message) -> None:
-    blocks = []
-    for r in RECIPES_FAST:
-        blocks.append(f"{r['name']} ({r['time']})\n{r['ingredients']}\n{r['notes']}")
-    await message.answer("Быстрые блюда ≤20 минут:\n\n" + "\n\n".join(blocks), reply_markup=main_menu_keyboard())
+async def recipes_fast(message: types.Message, db) -> None:
+    await _send_recipe_list(message, db)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("recipe:card:"))
+async def recipe_card(callback: types.CallbackQuery, db) -> None:
+    _, _, key, servings_str = callback.data.split(":")
+    servings = int(servings_str)
+    recipe = _cook_recipes_map().get(key)
+    if not recipe:
+        await callback.answer("Рецепт не нашла.", show_alert=True)
+        return
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    pantry_rows = rows_to_dicts(await repo.list_pantry_items(db, user["id"]))
+    scaled = _scale_ingredients(recipe, servings)
+    ok, missing, low = _check_pantry_for_recipe(scaled, pantry_rows)
+    lines = [
+        f"{recipe['title']} ({recipe['time']})",
+        recipe["short_desc"],
+        "",
+        f"На {servings} порцию(и) нужно:",
+    ]
+    for ing in scaled:
+        lines.append(f"• {ing['label']} — {ing['amount']} {ing['unit']}")
+    if ok or missing or low:
+        lines.append("")
+        lines.append("По запасам дома:")
+        if ok:
+            lines.append("✔ Уже есть: " + ", ".join(ok))
+        if low:
+            show = ", ".join(f"{name} (останется ~{leftover:.0f})" for name, leftover in low)
+            lines.append("⚠ Почти кончатся: " + show)
+        if missing:
+            lines.append("✖ Не хватает: " + ", ".join(missing))
+    kb_rows = [
+        [
+            types.InlineKeyboardButton(
+                text="Готовим", callback_data=f"recipe:steps:{key}:{servings}"
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="Изменить порции", callback_data=f"recipe:serve:{key}:{servings}"
+            )
+        ],
+    ]
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await callback.message.answer("\n".join(lines), reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("recipe:serve:"))
+async def recipe_change_servings(callback: types.CallbackQuery) -> None:
+    _, _, key, current_str = callback.data.split(":")
+    recipe = _cook_recipes_map().get(key)
+    if not recipe:
+        await callback.answer()
+        return
+    kb_rows = []
+    for s in (1, 2, 3, 4):
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=f"{s} порц.",
+                    callback_data=f"recipe:card:{key}:{s}",
+                )
+            ]
+        )
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await callback.message.answer(
+        "На сколько порций готовим? Тебе не обязательно всё съедать сразу — можно убрать часть в контейнер.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("recipe:steps:"))
+async def recipe_steps(callback: types.CallbackQuery) -> None:
+    _, _, key, servings_str = callback.data.split(":")
+    servings = int(servings_str)
+    recipe = _cook_recipes_map().get(key)
+    if not recipe:
+        await callback.answer("Рецепт не нашла.", show_alert=True)
+        return
+    steps = recipe.get("steps", [])
+    lines = [f"Готовим: {recipe['title']} (на {servings} порц.)"]
+    for idx, step in enumerate(steps, start=1):
+        lines.append(f"{idx}. {step}")
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="Я приготовил(а)", callback_data=f"recipe:cooked:{key}:{servings}"
+                )
+            ]
+        ]
+    )
+    await callback.message.answer("\n".join(lines), reply_markup=kb)
+    await callback.answer()
+
+
+def _apply_recipe_to_pantry(recipe: dict, servings: int, pantry_items: list[dict]) -> tuple[list[str], list[str]]:
+    """Вычесть продукты из pantry по приготовленному рецепту."""
+    base = recipe.get("base_servings", 1) or 1
+    factor = max(1, servings) / base
+    index = _pantry_index(pantry_items)
+    finished: list[str] = []
+    low_left: list[str] = []
+    for ing in recipe.get("ingredients", []):
+        tag = (ing.get("tag") or "").lower()
+        label = ing.get("label") or tag or "ингредиент"
+        needed_amt, needed_unit = _to_base(ing.get("amount", 0) * factor, ing.get("unit", "g"))
+        pantry_row = None
+        for name, row in index.items():
+            if tag and tag in name:
+                pantry_row = row
+                break
+        if not pantry_row:
+            continue
+        have_amt, have_unit = _to_base(pantry_row.get("amount", 0), pantry_row.get("unit", "шт"))
+        if have_unit != needed_unit or needed_amt <= 0:
+            continue
+        leftover = have_amt - needed_amt
+        if leftover <= 0:
+            finished.append(label)
+            new_amount_base = 0
+        else:
+            new_amount_base = leftover
+            if leftover <= (100 if needed_unit in {"g", "ml"} else 1):
+                low_left.append(label)
+        # конвертируем обратно в единицы pantry
+        unit = pantry_row.get("unit", "шт")
+        if unit in {"kg", "кг"} and needed_unit == "g":
+            new_amount = new_amount_base / 1000
+        elif unit in {"g", "гр"} and needed_unit == "g":
+            new_amount = new_amount_base
+        elif unit in {"l", "л"} and needed_unit == "ml":
+            new_amount = new_amount_base / 1000
+        elif unit in {"ml", "мл"} and needed_unit == "ml":
+            new_amount = new_amount_base
+        elif unit in {"шт"} and needed_unit == "шт":
+            new_amount = new_amount_base
+        else:
+            new_amount = pantry_row.get("amount", 0)
+        pantry_row["amount"] = max(0, float(new_amount))
+    return finished, low_left
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("recipe:cooked:"))
+async def recipe_cooked(callback: types.CallbackQuery, db) -> None:
+    _, _, key, servings_str = callback.data.split(":")
+    servings = int(servings_str)
+    recipe = _cook_recipes_map().get(key)
+    if not recipe:
+        await callback.answer("Рецепт не нашла.", show_alert=True)
+        return
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    pantry_rows_raw = await repo.list_pantry_items(db, user["id"])
+    pantry_items = rows_to_dicts(pantry_rows_raw)
+    finished, low_left = _apply_recipe_to_pantry(recipe, servings, pantry_items)
+    # обновить БД
+    for item in pantry_items:
+        await repo.update_pantry_item(db, user["id"], item["id"], amount=item.get("amount"), expires_at=None)
+    lines = ["Что изменилось в запасах после готовки:"]
+    if not finished and not low_left:
+        lines.append("• Я не увидела изменений по продуктам, но блюдо всё равно засчитываем.")
+    if finished:
+        lines.append("• Закончились: " + ", ".join(finished))
+    if low_left:
+        lines.append("• Почти закончились: " + ", ".join(low_left))
+        lines.append("Если хочешь, можешь добавить их в список покупок через финансы или свои напоминания.")
+    await callback.message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
+    await callback.answer("Приятного аппетита")
+    logger.info(
+        "recipe.cooked",
+        extra={
+            "user_id": user["id"],
+            "recipe_key": key,
+            "servings": servings,
+            "finished": finished,
+            "low_left": low_left,
+        },
+    )
 
 
 @router.message(Command("shoplist"))

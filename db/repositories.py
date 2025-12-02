@@ -121,6 +121,440 @@ async def update_user_goals(
     )
     await conn.commit()
 
+
+# --- Day plans (evening / morning planning) ---
+
+
+async def get_day_plan(
+    conn: aiosqlite.Connection, user_id: int, plan_date: str
+) -> Optional[aiosqlite.Row]:
+    cursor = await conn.execute(
+        "SELECT * FROM day_plans WHERE user_id = ? AND plan_date = ?",
+        (user_id, plan_date),
+    )
+    return await cursor.fetchone()
+
+
+async def upsert_day_plan(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    plan_date: str,
+    items: List[Dict[str, Any]],
+) -> int:
+    """
+    Создать или обновить план дня и его пункты.
+
+    items: список dict с ключами title, category, is_important (bool).
+    """
+    now = utc_now_str()
+    cursor = await conn.execute(
+        "SELECT id FROM day_plans WHERE user_id = ? AND plan_date = ?",
+        (user_id, plan_date),
+    )
+    row = await cursor.fetchone()
+    if row:
+        plan_id = row["id"]
+        await conn.execute(
+            "UPDATE day_plans SET updated_at = ? WHERE id = ?",
+            (now, plan_id),
+        )
+        await conn.execute("DELETE FROM day_plan_items WHERE plan_id = ?", (plan_id,))
+    else:
+        cursor = await conn.execute(
+            """
+            INSERT INTO day_plans (user_id, plan_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, plan_date, now, now),
+        )
+        plan_id = cursor.lastrowid
+    for item in items:
+        await conn.execute(
+            """
+            INSERT INTO day_plan_items
+            (plan_id, user_id, title, category, is_important, done, synced_to_today, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+            """,
+            (
+                plan_id,
+                user_id,
+                item.get("title", "").strip(),
+                item.get("category", "misc"),
+                1 if item.get("is_important") else 0,
+                now,
+                now,
+            ),
+        )
+    await conn.commit()
+    return plan_id
+
+
+async def list_day_plan_items(
+    conn: aiosqlite.Connection, user_id: int, plan_date: str
+) -> List[aiosqlite.Row]:
+    cursor = await conn.execute(
+        """
+        SELECT dpi.*
+        FROM day_plans dp
+        JOIN day_plan_items dpi ON dpi.plan_id = dp.id
+        WHERE dp.user_id = ? AND dp.plan_date = ?
+        ORDER BY dpi.is_important DESC, dpi.id
+        """,
+        (user_id, plan_date),
+    )
+    return await cursor.fetchall()
+
+
+async def mark_day_plan_item_done(
+    conn: aiosqlite.Connection, item_id: int, done: bool = True
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE day_plan_items SET done = ?, updated_at = ? WHERE id = ?",
+        (1 if done else 0, now, item_id),
+    )
+    await conn.commit()
+
+
+async def mark_day_plan_items_synced(
+    conn: aiosqlite.Connection, item_ids: List[int]
+) -> None:
+    if not item_ids:
+        return
+    now = utc_now_str()
+    placeholders = ",".join("?" for _ in item_ids)
+    params: Tuple[Any, ...] = tuple(item_ids)
+    await conn.execute(
+        f"UPDATE day_plan_items SET synced_to_today = 1, updated_at = ? WHERE id IN ({placeholders})",
+        (now, *params),
+    )
+    await conn.commit()
+
+
+async def mark_day_plan_morning_sent(
+    conn: aiosqlite.Connection, plan_id: int, date_str: str
+) -> None:
+    """Пометить, что утренний пинг по плану был отправлен."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE day_plans SET morning_sent = ?, updated_at = ? WHERE id = ?",
+        (date_str, now, plan_id),
+    )
+    await conn.commit()
+
+
+async def add_day_plan_item(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    plan_date: str,
+    title: str,
+    category: str = "misc",
+    is_important: bool = False,
+) -> None:
+    """Добавить пункт в план дня, создавая план при необходимости."""
+    now = utc_now_str()
+    plan = await get_day_plan(conn, user_id, plan_date)
+    if plan:
+        plan_id = plan["id"]
+        await conn.execute(
+            "UPDATE day_plans SET updated_at = ? WHERE id = ?",
+            (now, plan_id),
+        )
+    else:
+        cursor = await conn.execute(
+            """
+            INSERT INTO day_plans (user_id, plan_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, plan_date, now, now),
+        )
+        plan_id = cursor.lastrowid
+    await conn.execute(
+        """
+        INSERT INTO day_plan_items
+        (plan_id, user_id, title, category, is_important, done, synced_to_today, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+        """,
+        (
+            plan_id,
+            user_id,
+            title.strip(),
+            category,
+            1 if is_important else 0,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+
+
+async def delete_day_plan_item(
+    conn: aiosqlite.Connection, user_id: int, item_id: int
+) -> None:
+    """Удалить пункт плана дня пользователя."""
+    await conn.execute(
+        "DELETE FROM day_plan_items WHERE id = ? AND user_id = ?",
+        (item_id, user_id),
+    )
+    await conn.commit()
+
+
+# --- Продукты на кухне (pantry) ---
+
+
+async def create_pantry_item(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    name: str,
+    amount: float,
+    unit: str,
+    expires_at: Optional[str],
+    category: str,
+) -> int:
+    """Создать запись о продукте на кухне."""
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO pantry_items (user_id, name, amount, unit, expires_at, category, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, name.strip(), float(amount or 0), unit.strip(), expires_at, category.strip(), now, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def list_pantry_items(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
+    """Получить все продукты пользователя, отсортированные по категории и названию."""
+    cursor = await conn.execute(
+        """
+        SELECT * FROM pantry_items
+        WHERE user_id = ?
+        ORDER BY category, name
+        """,
+        (user_id,),
+    )
+    return await cursor.fetchall()
+
+
+async def update_pantry_item(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    item_id: int,
+    amount: Optional[float] = None,
+    expires_at: Optional[str] = None,
+) -> None:
+    """Обновить количество и/или срок годности продукта."""
+    fields: List[str] = []
+    params: List[Any] = []
+    if amount is not None:
+        fields.append("amount = ?")
+        params.append(float(amount))
+    if expires_at is not None:
+        fields.append("expires_at = ?")
+        params.append(expires_at)
+    if not fields:
+        return
+    now = utc_now_str()
+    fields.append("updated_at = ?")
+    params.append(now)
+    params.extend([user_id, item_id])
+    sql = f"UPDATE pantry_items SET {', '.join(fields)} WHERE user_id = ? AND id = ?"
+    await conn.execute(sql, tuple(params))
+    await conn.commit()
+
+
+async def delete_pantry_item(
+    conn: aiosqlite.Connection, user_id: int, item_id: int
+) -> None:
+    """Удалить продукт из кладовки."""
+    await conn.execute(
+        "DELETE FROM pantry_items WHERE user_id = ? AND id = ?",
+        (user_id, item_id),
+    )
+    await conn.commit()
+
+
+async def pantry_expiring(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+    window_days: int = 5,
+) -> Tuple[List[aiosqlite.Row], List[aiosqlite.Row]]:
+    """
+    Вернуть продукты, у которых скоро истекает срок, и уже просроченные.
+
+    :returns: (soon, expired)
+    """
+    cursor = await conn.execute(
+        """
+        SELECT * FROM pantry_items
+        WHERE user_id = ? AND expires_at IS NOT NULL
+        """,
+        (user_id,),
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return [], []
+    today = datetime.date.fromisoformat(local_date)
+    soon: List[aiosqlite.Row] = []
+    expired: List[aiosqlite.Row] = []
+    for row in rows:
+        try:
+            exp_dt = datetime.date.fromisoformat(row["expires_at"])
+        except Exception:
+            continue
+        delta = (exp_dt - today).days
+        if delta < 0:
+            expired.append(row)
+        elif delta <= window_days:
+            soon.append(row)
+    return soon, expired
+
+
+async def insert_receipt_photo(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    file_id: str,
+) -> int:
+    """Сохранить фото чека для будущего распознавания."""
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO receipt_photos (user_id, file_id, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, file_id, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+# --- Meds / vitamins ---
+
+
+async def create_med(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    name: str,
+    dose_text: str,
+    schedule_type: str,
+    times: str,
+    days_of_week: str | None,
+    notes: str = "",
+) -> int:
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO meds (user_id, name, dose_text, schedule_type, times, days_of_week, notes, active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        """,
+        (user_id, name.strip(), dose_text.strip(), schedule_type, times, days_of_week, notes.strip(), now, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def list_meds(conn: aiosqlite.Connection, user_id: int, active_only: bool = True) -> List[aiosqlite.Row]:
+    if active_only:
+        cursor = await conn.execute(
+            "SELECT * FROM meds WHERE user_id = ? AND active = 1 ORDER BY id",
+            (user_id,),
+        )
+    else:
+        cursor = await conn.execute(
+            "SELECT * FROM meds WHERE user_id = ? ORDER BY id",
+            (user_id,),
+        )
+    return await cursor.fetchall()
+
+
+async def get_med(conn: aiosqlite.Connection, med_id: int) -> Optional[aiosqlite.Row]:
+    cursor = await conn.execute("SELECT * FROM meds WHERE id = ?", (med_id,))
+    return await cursor.fetchone()
+
+
+async def set_med_active(conn: aiosqlite.Connection, med_id: int, active: bool) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE meds SET active = ?, updated_at = ? WHERE id = ?",
+        (1 if active else 0, now, med_id),
+    )
+    await conn.commit()
+
+
+async def insert_med_log(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    med_id: int,
+    plan_date: str,
+    planned_time: str,
+) -> int:
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO med_logs (user_id, med_id, taken_at, plan_date, planned_time, created_at, updated_at)
+        VALUES (?, ?, NULL, ?, ?, ?, ?)
+        """,
+        (user_id, med_id, plan_date, planned_time, now, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def get_med_log_by_key(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    med_id: int,
+    plan_date: str,
+    planned_time: str,
+) -> Optional[aiosqlite.Row]:
+    cursor = await conn.execute(
+        """
+        SELECT * FROM med_logs
+        WHERE user_id = ? AND med_id = ? AND plan_date = ? AND planned_time = ?
+        """,
+        (user_id, med_id, plan_date, planned_time),
+    )
+    return await cursor.fetchone()
+
+
+async def get_med_log(conn: aiosqlite.Connection, log_id: int) -> Optional[aiosqlite.Row]:
+    cursor = await conn.execute("SELECT * FROM med_logs WHERE id = ?", (log_id,))
+    return await cursor.fetchone()
+
+
+async def set_med_taken(conn: aiosqlite.Connection, log_id: int, taken_at: str | None = None) -> None:
+    now = utc_now_str()
+    taken = taken_at or now
+    await conn.execute(
+        "UPDATE med_logs SET taken_at = ?, updated_at = ? WHERE id = ?",
+        (taken, now, log_id),
+    )
+    await conn.commit()
+
+
+async def meds_stats_for_date(
+    conn: aiosqlite.Connection, user_id: int, plan_date: str
+) -> tuple[int, int]:
+    cursor = await conn.execute(
+        """
+        SELECT
+          COUNT(*) as total,
+          SUM(CASE WHEN taken_at IS NOT NULL THEN 1 ELSE 0 END) as taken
+        FROM med_logs
+        WHERE user_id = ? AND plan_date = ?
+        """,
+        (user_id, plan_date),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return 0, 0
+    total = row["total"] or 0
+    taken = row["taken"] or 0
+    return total, taken
+
+
 async def update_user_body(
     conn: aiosqlite.Connection,
     user_id: int,
@@ -228,6 +662,158 @@ async def get_routine_items(
         (routine_id,),
     )
     return await cursor.fetchall()
+
+
+# --- routine_steps: пользовательские шаги рутин ---
+
+
+async def ensure_routine_steps(conn: aiosqlite.Connection, user_id: int) -> None:
+    """Создать пользовательские шаги рутины из шаблонов, если их ещё нет."""
+    cursor = await conn.execute(
+        "SELECT COUNT(*) as cnt FROM routine_steps WHERE user_id = ?", (user_id,)
+    )
+    row = await cursor.fetchone()
+    if row and row["cnt"] > 0:
+        return
+    routines = await list_routines(conn)
+    now = utc_now_str()
+    for routine in routines:
+        routine_type = routine["routine_key"]
+        items = await get_routine_items(conn, routine["id"])
+        order = 1
+        for item in items:
+            title = item["title"]
+            await conn.execute(
+                """
+                INSERT INTO routine_steps
+                (user_id, routine_type, title, order_index, points, is_active, trigger_after_step_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, 1, NULL, ?, ?)
+                """,
+                (user_id, routine_type, title, order, now, now),
+            )
+            order += 1
+    await conn.commit()
+
+
+async def list_routine_steps_for_routine(
+    conn: aiosqlite.Connection, user_id: int, routine_id: int, include_inactive: bool = False
+) -> List[aiosqlite.Row]:
+    """Вернуть шаги рутины для пользователя (с учётом активности и порядка)."""
+    await ensure_routine_steps(conn, user_id)
+    routine = await get_routine_by_id(conn, routine_id)
+    if not routine:
+        return []
+    routine_type = routine["routine_key"]
+    if include_inactive:
+        cursor = await conn.execute(
+            """
+            SELECT * FROM routine_steps
+            WHERE user_id = ? AND routine_type = ?
+            ORDER BY order_index, id
+            """,
+            (user_id, routine_type),
+        )
+    else:
+        cursor = await conn.execute(
+            """
+            SELECT * FROM routine_steps
+            WHERE user_id = ? AND routine_type = ? AND is_active = 1
+            ORDER BY order_index, id
+            """,
+            (user_id, routine_type),
+        )
+    return await cursor.fetchall()
+
+
+async def toggle_routine_step(
+    conn: aiosqlite.Connection, user_id: int, step_id: int
+) -> None:
+    """Включить/выключить шаг рутины."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE routine_steps
+        SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END,
+            updated_at = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (now, step_id, user_id),
+    )
+    await conn.commit()
+
+
+async def update_routine_step_title(
+    conn: aiosqlite.Connection, user_id: int, step_id: int, title: str
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE routine_steps SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        (title.strip(), now, step_id, user_id),
+    )
+    await conn.commit()
+
+
+async def add_routine_step(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    routine_type: str,
+    title: str,
+    after_step_id: Optional[int] = None,
+    points: int = 1,
+) -> int:
+    """Добавить шаг в конец рутины или после указанного шага."""
+    await ensure_routine_steps(conn, user_id)
+    cursor = await conn.execute(
+        "SELECT MAX(order_index) as mx FROM routine_steps WHERE user_id = ? AND routine_type = ?",
+        (user_id, routine_type),
+    )
+    row = await cursor.fetchone()
+    order_index = (row["mx"] or 0) + 1
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO routine_steps
+        (user_id, routine_type, title, order_index, points, is_active, trigger_after_step_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+        """,
+        (user_id, routine_type, title.strip(), order_index, points, after_step_id, now, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def set_routine_step_trigger(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    step_id: int,
+    trigger_after_step_id: Optional[int],
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE routine_steps
+        SET trigger_after_step_id = ?, updated_at = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (trigger_after_step_id, now, step_id, user_id),
+    )
+    await conn.commit()
+
+
+async def get_routine_by_step(
+    conn: aiosqlite.Connection, user_id: int, step_id: int
+) -> Optional[Dict[str, Any]]:
+    cursor = await conn.execute(
+        """
+        SELECT rs.*, r.id as routine_id
+        FROM routine_steps rs
+        JOIN routines r ON r.routine_key = rs.routine_type
+        WHERE rs.user_id = ? AND rs.id = ?
+        """,
+        (user_id, step_id),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
 
 
 async def ensure_user_routines(conn: aiosqlite.Connection, user_id: int) -> None:

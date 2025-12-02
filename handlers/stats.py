@@ -11,6 +11,7 @@ from utils.tone import tone_message
 from utils.time import format_date_display
 from utils.user import ensure_user
 from utils.texts import gentle_streak
+from utils.affirmations import random_affirmation_text
 
 router = Router()
 
@@ -120,6 +121,14 @@ async def stats(message: types.Message, db) -> None:
         tone = "soft"
     elif points7 > 40:
         tone = "pushy"
+    # Иногда добавляем аффирмацию поддержки
+    extra = None
+    if points7 < 10 or routine_streak <= 1:
+        extra = random_affirmation_text("self_worth")
+    elif routine_streak >= 7:
+        extra = random_affirmation_text("motivation")
+    if extra:
+        text += f"\n\n<i>{extra}</i>"
     await message.answer(tone_message(tone, text), reply_markup=main_menu_keyboard())
 
 

@@ -1,4 +1,5 @@
 import datetime
+from typing import List
 
 from aiogram import Router, types
 
@@ -74,7 +75,7 @@ async def routine_item_toggle(callback: types.CallbackQuery, db) -> None:
         added = True
         await repo.add_points(db, user["id"], 1, local_date=local_date)
     await repo.update_task_note(db, user["id"], routine_id, local_date, ",".join(str(i) for i in sorted(done)))
-    items_rows = await repo.get_routine_items(db, routine_id)
+    items_rows = await repo.list_routine_steps_for_routine(db, user["id"], routine_id, include_inactive=True)
     items = [dict(i) for i in items_rows]
     routine_row = await repo.get_user_routine(db, user["id"], routine_id)
     routine = dict(routine_row) if routine_row else {}
@@ -113,7 +114,7 @@ async def routine_finish(callback: types.CallbackQuery, db) -> None:
                 done.add(int(part))
             except Exception:
                 continue
-    items = [dict(i) for i in await repo.get_routine_items(db, routine_id)]
+    items = [dict(i) for i in await repo.list_routine_steps_for_routine(db, user["id"], routine_id, include_inactive=True)]
     # начислить очки за отмеченные пункты
     points = len(done)
     if points > 0:

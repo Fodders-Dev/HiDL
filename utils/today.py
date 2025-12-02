@@ -9,6 +9,7 @@ from utils.time import local_date_str, format_date_display
 from utils.formatting import format_money
 from utils.rows import row_to_dict
 from utils.texts import gentle_streak
+from utils.rows import rows_to_dicts
 
 
 async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
@@ -124,6 +125,20 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
                 f"• {row.get('title')} — до {format_date_display(row.get('due_date'))} (~{format_money(row.get('amount',0))} ₽)"
             )
 
+    # day plan (важные/дополнительные дела)
+    plan_items = rows_to_dicts(await repo.list_day_plan_items(db, user["id"], local_date))
+    important_plan = [p for p in plan_items if p.get("is_important")]
+    extra_plan = [p for p in plan_items if not p.get("is_important")]
+    plan_done = [p for p in plan_items if p.get("done")]
+
+    # продукты с подходящими сроками годности
+    soon_pantry, expired_pantry = await repo.pantry_expiring(db, user["id"], local_date, window_days=5)
+    soon_pantry_d = [row_to_dict(r) for r in soon_pantry]
+    expired_pantry_d = [row_to_dict(r) for r in expired_pantry]
+
+    # meds stats
+    meds_total, meds_taken = await repo.meds_stats_for_date(db, user["id"], local_date)
+
     # summary block
     points7 = await repo.points_window(db, user["id"], days=7)
     points_today = await repo.points_today(db, user["id"], local_date)
@@ -150,6 +165,26 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         summary_lines.append(finance_line)
     if home_summary:
         summary_lines.append(home_summary)
+    if plan_items:
+        summary_lines.append(
+            f"🎯 План на день: выполнено {len(plan_done)}/{len(plan_items)} дел "
+            f"(важных {len(important_plan)}, доп. {len(extra_plan)})."
+        )
+    if soon_pantry_d or expired_pantry_d:
+        names = [p.get("name") for p in soon_pantry_d[:2] + expired_pantry_d[:2] if p.get("name")]
+        listed = ", ".join(names)
+        total_pantry = len(soon_pantry_d) + len(expired_pantry_d)
+        extra_note = ""
+        if total_pantry > len(names):
+            extra_note = f" и ещё {total_pantry - len(names)}"
+        summary_lines.append(
+            f"🧊 Продукты: у {len(soon_pantry_d)} вещей скоро срок, "
+            f"у {len(expired_pantry_d)} уже истёк — {listed}{extra_note}."
+        )
+    if meds_total:
+        summary_lines.append(
+            f"💊 Таблетки: сегодня {meds_total} напоминаний, уже отмечено {meds_taken}/{meds_total}."
+        )
     blocks = [f"{pause_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
     if routine_lines:
         blocks.append("<b>🌞 Рутины:</b>\n" + "\n".join(routine_lines))
@@ -159,12 +194,37 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         blocks.append("<b>🔁 Регулярка по дому:</b>\n" + "\n".join(regular_lines))
     if bills_lines:
         blocks.append("<b>📅 Счета в ближайшие дни:</b>\n" + "\n".join(bills_lines))
+    if plan_items:
+        plan_lines = ["<b>🎯 План на день — детали:</b>"]
+        for item in plan_items:
+            icon = "✅" if item.get("done") else "⬜️"
+            kind = " (важное)" if item.get("is_important") else ""
+            plan_lines.append(f"{icon} {item.get('title')}{kind}")
+        blocks.append("\n".join(plan_lines))
 
     kb_buttons = []
     kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
     kb_buttons.append([types.InlineKeyboardButton(text="📅 План по дому", callback_data="home:week")])
     kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
     kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
+    if soon_pantry_d or expired_pantry_d:
+        kb_buttons.append(
+            [types.InlineKeyboardButton(text="Продукты", callback_data="pantry:expiring")]
+        )
+    # быстрые кнопки для плана дня (ограничим тремя пунктами)
+    if plan_items:
+        for item in plan_items[:3]:
+            if item.get("done"):
+                continue
+            title = (item.get("title") or "")[:24]
+            kb_buttons.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=f"🎯 {title}",
+                        callback_data=f"dplan:done:{item.get('id')}",
+                    )
+                ]
+            )
     inline_kb = types.InlineKeyboardMarkup(inline_keyboard=kb_buttons)
 
     return "\n\n".join(blocks), inline_kb

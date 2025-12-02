@@ -27,6 +27,8 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_care, "cron", hour=9, minute=15, id="care_tick")
         self.scheduler.add_job(self._tick_weight_prompt, "cron", hour=8, minute=30, id="weight_prompt")
         self.scheduler.add_job(self._weekly_home_plan, "cron", day_of_week="sun", hour=10, minute=0, id="home_plan_weekly")
+        self.scheduler.add_job(self._tick_day_plan, "interval", minutes=5, id="day_plan_morning")
+        self.scheduler.add_job(self._tick_meds, "interval", seconds=60, id="meds_tick")
         self.scheduler.start()
 
     async def _tick(self) -> None:
@@ -59,6 +61,118 @@ class ReminderScheduler:
                     note="",
                 )
             await self._tick_custom(user, now_utc, local_date)
+
+    async def _tick_day_plan(self) -> None:
+        """Утренний пинг по плану дня: один раз около времени подъёма."""
+        now_utc = datetime.datetime.utcnow()
+        users = await repo.list_users(self.conn)
+        for user_row in users:
+            user = dict(user_row)
+            local_date = local_date_str(now_utc, user["timezone"])
+            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            plan = await repo.get_day_plan(self.conn, user["id"], local_date)
+            if not plan:
+                continue
+            plan = dict(plan)
+            if plan.get("morning_sent") == local_date:
+                continue
+            wake_time = user.get("wake_up_time") or "08:00"
+            if not should_trigger(now_utc, user["timezone"], wake_time, window_minutes=15):
+                continue
+            items_rows = await repo.list_day_plan_items(self.conn, user["id"], local_date)
+            items = [dict(r) for r in items_rows]
+            if not items:
+                continue
+            important = [i for i in items if i.get("is_important")]
+            extra = [i for i in items if not i.get("is_important")]
+            lines = ["Доброе утро. Вчера ты запланировал(а) на сегодня:"]
+            for it in important:
+                lines.append(f"• {it['title']}")
+            for it in extra:
+                lines.append(f"• {it['title']}")
+            lines.append("Что-то убрать или добавить?")
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="Всё ок", callback_data="dplan:ok"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="Удалить пункт", callback_data="dplan:delmenu"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="Добавить дело", callback_data="dplan:add"),
+                    ],
+                ]
+            )
+            await self.bot.send_message(chat_id=user["telegram_id"], text="\n".join(lines), reply_markup=kb)
+            await repo.mark_day_plan_morning_sent(self.conn, plan["id"], local_date)
+
+    async def _tick_meds(self) -> None:
+        """Пинг по витаминам/таблеткам на основе meds/med_logs."""
+        now_utc = datetime.datetime.utcnow()
+        users = await repo.list_users(self.conn)
+        for user_row in users:
+            user = dict(user_row)
+            local_date = local_date_str(now_utc, user["timezone"])
+            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            meds = await repo.list_meds(self.conn, user["id"], active_only=True)
+            if not meds:
+                continue
+            wellness_row = await repo.get_wellness(self.conn, user["id"])
+            tone = "neutral"
+            if wellness_row:
+                w = dict(wellness_row)
+                tone = w.get("tone", "neutral")
+            for med_row in meds:
+                med = dict(med_row)
+                times_raw = med.get("times", "")
+                if not times_raw:
+                    continue
+                for t in times_raw.split(","):
+                    t = t.strip()
+                    if not t:
+                        continue
+                    existing = await repo.get_med_log_by_key(
+                        self.conn, user["id"], med["id"], local_date, t
+                    )
+                    if existing:
+                        # уже есть лог (ожидание или отмечено) — не шлём заново
+                        continue
+                    if not should_trigger(now_utc, user["timezone"], t, window_minutes=2):
+                        continue
+                    text = (
+                        f"💊 Пора «{med['name']}»: {med['dose_text'] or 'принять дозу'}.\n"
+                        "Ты уже принял(а)?"
+                    )
+                    if tone == "soft":
+                        text += "\nЕсли сейчас не до этого — можно перенести на позже."
+                    keyboard = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="Принял(а)",
+                                    callback_data="",  # будет подставлен после вставки лога
+                                ),
+                                InlineKeyboardButton(
+                                    text="Позже",
+                                    callback_data="",
+                                ),
+                            ]
+                        ]
+                    )
+                    # сначала создаём лог, чтобы знать id
+                    log_id = await repo.insert_med_log(
+                        self.conn, user["id"], med["id"], local_date, t
+                    )
+                    keyboard.inline_keyboard[0][0].callback_data = f"medtake:{log_id}"
+                    keyboard.inline_keyboard[0][1].callback_data = f"medskip:{log_id}"
+                    await self.bot.send_message(
+                        chat_id=user["telegram_id"],
+                        text=text,
+                        reply_markup=keyboard,
+                    )
 
     async def _tick_custom(
         self, user: dict, now_utc: datetime.datetime, local_date: str
@@ -101,7 +215,7 @@ class ReminderScheduler:
     async def _send_routine(
         self, user: dict, routine: dict, local_date: str
     ) -> Optional[None]:
-        items = await repo.get_routine_items(self.conn, routine["routine_id"])
+        items = await repo.list_routine_steps_for_routine(self.conn, user["id"], routine["routine_id"])
         task = await repo.get_user_task(self.conn, user["id"], routine["routine_id"], local_date)
         done = set()
         if task and task["note"]:
@@ -111,7 +225,14 @@ class ReminderScheduler:
                 except Exception:
                     continue
         lines = []
-        for idx, item in enumerate(items):
+        items_list = [dict(i) for i in items]
+        id_index = {row["id"]: idx for idx, row in enumerate(items_list)}
+        for idx, item in enumerate(items_list):
+            trigger_id = item.get("trigger_after_step_id")
+            if trigger_id:
+                parent_idx = id_index.get(trigger_id)
+                if parent_idx is not None and parent_idx not in done:
+                    continue
             if idx in done:
                 lines.append(f"• <s>{item['title']}</s>")
             else:
@@ -137,7 +258,7 @@ class ReminderScheduler:
                 ),
             ]
         ]
-        for idx, item in enumerate(items):
+        for idx, item in enumerate(items_list):
             mark = "☑️" if idx in done else "⬜️"
             rows.append(
                 [

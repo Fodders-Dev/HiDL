@@ -118,15 +118,15 @@ async def food_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
     if action == "plate":
         await guides.plate(callback.message, db)
     elif action == "recipes":
-        await guides.recipes_fast(callback.message)
+        await guides.recipes_fast(callback.message, db)
     elif action == "meal_plan":
         await guides.meal_plan(callback.message)
     elif action == "shoplist":
         await guides.shoplist(callback.message)
     elif action == "pantry":
-        from handlers import ask_mom
+        from handlers import pantry
 
-        await ask_mom.start_cook_flow(callback.message, state)
+        await pantry.pantry_command(callback.message, db)
     await callback.answer()
 
 
