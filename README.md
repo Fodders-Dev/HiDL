@@ -55,6 +55,21 @@ python -m tests.smoke
   - Тон/тексты: `utils/texts.py`, `utils/tone.py`; напоминания: `handlers/custom_reminders.py`.
 - При добавлении фич обновляй `/help` и спринт-план. Проверяй `git status` на отсутствие секретов.
 
+### Терминальный симулятор HiDL
+
+Для быстрой проверки UX без Telegram есть простой терминальный симулятор:
+
+- интерактивный режим:
+  ```bash
+  python -m tools.simulate_ui interactive
+  ```
+- прогон сценария с логом в файл:
+  ```bash
+  python -m tools.simulate_ui scenario new_user_onboarding > tmp/new_user_onboarding.txt
+  ```
+
+Сценарии описаны в `tools/sim_scenarios.py`. Симулятор использует отдельную БД `hidl_simulator.db`, поэтому не трогает реальные данные.
+
 ## Безопасность
 - Не коммить токены и .env — в `.gitignore` уже добавлено.
 - Используй `.env.example` как шаблон.

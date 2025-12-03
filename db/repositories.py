@@ -122,6 +122,58 @@ async def update_user_goals(
     await conn.commit()
 
 
+# --- Households / общий дом ---
+
+
+async def get_or_create_household(conn: aiosqlite.Connection, user_id: int) -> int:
+    """
+    Вернуть household_id пользователя, при необходимости создав личный дом.
+
+    По умолчанию у каждого пользователя есть свой «личный дом». Если позже
+    он создаст общий дом через настройки, household_id можно будет поменять.
+    """
+    cursor = await conn.execute(
+        "SELECT household_id, name FROM users WHERE id = ?", (user_id,)
+    )
+    row = await cursor.fetchone()
+    if row and row["household_id"]:
+        return int(row["household_id"])
+    name = row["name"] if row else ""
+    now = utc_now_str()
+    invite_code = f"H{user_id}"
+    cur = await conn.execute(
+        "INSERT INTO households (name, invite_code, created_at) VALUES (?, ?, ?)",
+        (name or "Дом", invite_code, now),
+    )
+    household_id = cur.lastrowid
+    await conn.execute(
+        "UPDATE users SET household_id = ? WHERE id = ?",
+        (household_id, user_id),
+    )
+    await conn.commit()
+    return household_id
+
+
+async def get_household_by_code(
+    conn: aiosqlite.Connection, invite_code: str
+) -> Optional[aiosqlite.Row]:
+    cursor = await conn.execute(
+        "SELECT * FROM households WHERE invite_code = ?", (invite_code.strip(),)
+    )
+    return await cursor.fetchone()
+
+
+async def set_user_household(
+    conn: aiosqlite.Connection, user_id: int, household_id: int
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET household_id = ?, updated_at = ? WHERE id = ?",
+        (household_id, now, user_id),
+    )
+    await conn.commit()
+
+
 # --- Day plans (evening / morning planning) ---
 
 
@@ -310,15 +362,18 @@ async def create_pantry_item(
     unit: str,
     expires_at: Optional[str],
     category: str,
+    low_threshold: Optional[float] = None,
 ) -> int:
     """Создать запись о продукте на кухне."""
     now = utc_now_str()
+    household_id = await get_or_create_household(conn, user_id)
+    low_value = float(low_threshold) if low_threshold is not None else None
     cursor = await conn.execute(
         """
-        INSERT INTO pantry_items (user_id, name, amount, unit, expires_at, category, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO pantry_items (user_id, household_id, name, amount, unit, expires_at, category, low_threshold, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         """,
-        (user_id, name.strip(), float(amount or 0), unit.strip(), expires_at, category.strip(), now, now),
+        (user_id, household_id, name.strip(), float(amount or 0), unit.strip(), expires_at, category.strip(), low_value, now, now),
     )
     await conn.commit()
     return cursor.lastrowid
@@ -326,13 +381,14 @@ async def create_pantry_item(
 
 async def list_pantry_items(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
     """Получить все продукты пользователя, отсортированные по категории и названию."""
+    household_id = await get_or_create_household(conn, user_id)
     cursor = await conn.execute(
         """
         SELECT * FROM pantry_items
-        WHERE user_id = ?
+        WHERE household_id = ? AND (is_active IS NULL OR is_active = 1)
         ORDER BY category, name
         """,
-        (user_id,),
+        (household_id,),
     )
     return await cursor.fetchall()
 
@@ -343,8 +399,10 @@ async def update_pantry_item(
     item_id: int,
     amount: Optional[float] = None,
     expires_at: Optional[str] = None,
+    low_threshold: Optional[float] = None,
+    is_active: Optional[bool] = None,
 ) -> None:
-    """Обновить количество и/или срок годности продукта."""
+    """Обновить количество, срок годности и дополнительные поля продукта."""
     fields: List[str] = []
     params: List[Any] = []
     if amount is not None:
@@ -353,13 +411,20 @@ async def update_pantry_item(
     if expires_at is not None:
         fields.append("expires_at = ?")
         params.append(expires_at)
+    if low_threshold is not None:
+        fields.append("low_threshold = ?")
+        params.append(float(low_threshold))
+    if is_active is not None:
+        fields.append("is_active = ?")
+        params.append(1 if is_active else 0)
     if not fields:
         return
     now = utc_now_str()
+    household_id = await get_or_create_household(conn, user_id)
     fields.append("updated_at = ?")
     params.append(now)
-    params.extend([user_id, item_id])
-    sql = f"UPDATE pantry_items SET {', '.join(fields)} WHERE user_id = ? AND id = ?"
+    params.extend([household_id, item_id])
+    sql = f"UPDATE pantry_items SET {', '.join(fields)} WHERE household_id = ? AND id = ?"
     await conn.execute(sql, tuple(params))
     await conn.commit()
 
@@ -367,10 +432,12 @@ async def update_pantry_item(
 async def delete_pantry_item(
     conn: aiosqlite.Connection, user_id: int, item_id: int
 ) -> None:
-    """Удалить продукт из кладовки."""
+    """Мягко удалить продукт из кладовки (отметить как неактивный)."""
+    now = utc_now_str()
+    household_id = await get_or_create_household(conn, user_id)
     await conn.execute(
-        "DELETE FROM pantry_items WHERE user_id = ? AND id = ?",
-        (user_id, item_id),
+        "UPDATE pantry_items SET is_active = 0, updated_at = ? WHERE household_id = ? AND id = ?",
+        (now, household_id, item_id),
     )
     await conn.commit()
 
@@ -386,12 +453,13 @@ async def pantry_expiring(
 
     :returns: (soon, expired)
     """
+    household_id = await get_or_create_household(conn, user_id)
     cursor = await conn.execute(
         """
         SELECT * FROM pantry_items
-        WHERE user_id = ? AND expires_at IS NOT NULL
+        WHERE household_id = ? AND expires_at IS NOT NULL AND (is_active IS NULL OR is_active = 1)
         """,
-        (user_id,),
+        (household_id,),
     )
     rows = await cursor.fetchall()
     if not rows:
@@ -410,6 +478,69 @@ async def pantry_expiring(
         elif delta <= window_days:
             soon.append(row)
     return soon, expired
+
+
+# --- Бытовая химия и расходники (supplies) ---
+
+
+async def ensure_supplies(conn: aiosqlite.Connection, user_id: int) -> None:
+    """
+    Создать базовый список бытовой химии для пользователя, если его ещё нет.
+
+    Это аналог ensure_regular_tasks, но для расходников.
+    """
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS cnt FROM supplies WHERE user_id = ?", (user_id,)
+    )
+    row = await cursor.fetchone()
+    if row and row["cnt"] > 0:
+        return
+    now = utc_now_str()
+    defaults = [
+        ("Мусорные пакеты", "расходники"),
+        ("Средство для посуды", "бытовая химия"),
+        ("Средство для пола", "бытовая химия"),
+        ("Средство для унитаза", "бытовая химия"),
+        ("Губки/тряпки", "расходники"),
+    ]
+    for name, category in defaults:
+        await conn.execute(
+            """
+            INSERT INTO supplies (user_id, name, category, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'full', ?, ?)
+            """,
+            (user_id, name, category, now, now),
+        )
+    await conn.commit()
+
+
+async def list_supplies(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
+    """Вернуть все записи по бытовой химии и расходникам пользователя."""
+    cursor = await conn.execute(
+        """
+        SELECT * FROM supplies
+        WHERE user_id = ?
+        ORDER BY name
+        """,
+        (user_id,),
+    )
+    return await cursor.fetchall()
+
+
+async def update_supply_status(
+    conn: aiosqlite.Connection, user_id: int, supply_id: int, status: str
+) -> None:
+    """Обновить статус конкретного расходника (full/low/empty)."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE supplies
+        SET status = ?, updated_at = ?
+        WHERE user_id = ? AND id = ?
+        """,
+        (status, now, user_id, supply_id),
+    )
+    await conn.commit()
 
 
 async def insert_receipt_photo(
@@ -479,6 +610,21 @@ async def set_med_active(conn: aiosqlite.Connection, med_id: int, active: bool) 
     await conn.execute(
         "UPDATE meds SET active = ?, updated_at = ? WHERE id = ?",
         (1 if active else 0, now, med_id),
+    )
+    await conn.commit()
+
+
+async def update_med_times(
+    conn: aiosqlite.Connection,
+    med_id: int,
+    schedule_type: str,
+    times: str,
+) -> None:
+    """Обновить тип расписания и часы приёма для курса витаминов/лекарств."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE meds SET schedule_type = ?, times = ?, updated_at = ? WHERE id = ?",
+        (schedule_type, times, now, med_id),
     )
     await conn.commit()
 
@@ -553,6 +699,26 @@ async def meds_stats_for_date(
     total = row["total"] or 0
     taken = row["taken"] or 0
     return total, taken
+
+
+async def list_med_logs_for_date(
+    conn: aiosqlite.Connection, user_id: int, plan_date: str
+) -> List[aiosqlite.Row]:
+    """
+    Вернуть все напоминания по таблеткам/витаминам на выбранную дату
+    вместе с названиями курсов.
+    """
+    cursor = await conn.execute(
+        """
+        SELECT l.*, m.name, m.dose_text
+        FROM med_logs l
+        JOIN meds m ON m.id = l.med_id
+        WHERE l.user_id = ? AND l.plan_date = ?
+        ORDER BY l.planned_time
+        """,
+        (user_id, plan_date),
+    )
+    return await cursor.fetchall()
 
 
 async def update_user_body(
@@ -1314,6 +1480,8 @@ async def upsert_wellness(
     water_times: Optional[str] = None,
     meal_times: Optional[str] = None,
     meal_profile: Optional[str] = None,
+    expiring_window_days: Optional[int] = None,
+    affirm_mode: Optional[str] = None,
 ) -> None:
     now = utc_now_str()
     existing = await get_wellness(conn, user_id)
@@ -1329,19 +1497,25 @@ async def upsert_wellness(
         wtimes = water_times if water_times is not None else existing.get("water_times", "11:00,16:00")
         mtimes = meal_times if meal_times is not None else existing.get("meal_times", "13:00,19:00")
         mprof = meal_profile if meal_profile is not None else existing.get("meal_profile", "omnivore")
+        exp_days = (
+            expiring_window_days
+            if expiring_window_days is not None
+            else existing.get("expiring_window_days", 3)
+        )
+        affirm_val = affirm_mode if affirm_mode is not None else existing.get("affirm_mode", "off")
         await conn.execute(
             """
             UPDATE wellness_settings
-            SET water_enabled = ?, meal_enabled = ?, focus_mode = ?, water_last_key = ?, meal_last_key = ?, focus_work = ?, focus_rest = ?, tone = ?, water_times = ?, meal_times = ?, meal_profile = ?, updated_at = ?
+            SET water_enabled = ?, meal_enabled = ?, focus_mode = ?, water_last_key = ?, meal_last_key = ?, focus_work = ?, focus_rest = ?, tone = ?, water_times = ?, meal_times = ?, meal_profile = ?, expiring_window_days = ?, affirm_mode = ?, updated_at = ?
             WHERE user_id = ?
             """,
-            (water, meal, focus, wkey, mkey, work, rest, tone_val, wtimes, mtimes, mprof, now, user_id),
+            (water, meal, focus, wkey, mkey, work, rest, tone_val, wtimes, mtimes, mprof, exp_days, affirm_val, now, user_id),
         )
     else:
         await conn.execute(
             """
-            INSERT INTO wellness_settings (user_id, water_enabled, meal_enabled, focus_mode, water_last_key, meal_last_key, focus_work, focus_rest, tone, water_times, meal_times, meal_profile, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO wellness_settings (user_id, water_enabled, meal_enabled, focus_mode, water_last_key, meal_last_key, focus_work, focus_rest, tone, water_times, meal_times, meal_profile, expiring_window_days, affirm_mode, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -1356,6 +1530,8 @@ async def upsert_wellness(
                 water_times or "11:00,16:00",
                 meal_times or "13:00,19:00",
                 meal_profile or "omnivore",
+                expiring_window_days if expiring_window_days is not None else 3,
+                affirm_mode or "off",
                 now,
                 now,
             ),

@@ -21,6 +21,8 @@ class SettingsState(StatesGroup):
     sleep = State()
     goals = State()
     routine_time = State()
+    expiry = State()
+    household_join = State()
 
 
 def settings_keyboard() -> InlineKeyboardMarkup:
@@ -31,6 +33,8 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Отбой", callback_data="settings:sleep")],
             [InlineKeyboardButton(text="Цель/приоритет", callback_data="settings:goals")],
             [InlineKeyboardButton(text="Профиль питания", callback_data="settings:mealprof")],
+            [InlineKeyboardButton(text="Аффирмации", callback_data="settings:affirm")],
+            [InlineKeyboardButton(text="Срок «скоро истечёт»", callback_data="settings:expiry")],
             [InlineKeyboardButton(text="ADHD-режим", callback_data="settings:adhd")],
             [
                 InlineKeyboardButton(
@@ -47,6 +51,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
                     text="Время: вечер", callback_data="settings:rt:evening"
                 )
             ],
+            [InlineKeyboardButton(text="Общий дом", callback_data="settings:household")],
         ]
     )
 
@@ -89,6 +94,83 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
     elif action == "goals":
         await state.set_state(SettingsState.goals)
         await callback.message.answer("Коротко опиши приоритет или цель (одно сообщение).")
+    elif action == "household":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        from db import repositories as repo_mod
+
+        await callback.message.answer(
+            "Общий дом — это когда несколько человек делят одну кладовку и бытовую химию.\n\n"
+            "Можно создать дом и дать код партнёру, либо присоединиться по коду.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🏠 Создать общий дом",
+                            callback_data="settings:household_create",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🔗 Присоединиться по коду",
+                            callback_data="settings:household_join",
+                        )
+                    ],
+                ]
+            ),
+        )
+    elif action == "household_create":
+        from db import repositories as repo_mod
+
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        household_id = await repo_mod.get_or_create_household(db, user["id"])
+        # достанем код
+        cursor = await db.execute(
+            "SELECT invite_code FROM households WHERE id = ?", (household_id,)
+        )
+        row = await cursor.fetchone()
+        code = row["invite_code"] if row and row["invite_code"] else f"H{user['id']}"
+        await callback.message.answer(
+            "Создала общий дом. Передай партнёру этот код, чтобы он присоединился:\n"
+            f"`{code}`",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    elif action == "household_join":
+        await state.set_state(SettingsState.household_join)
+        await callback.message.answer(
+            "Пришли код дома, который дал тебе партнёр. Я попробую подключить тебя к тому же пространству.",
+        )
+    elif action == "affirm":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        wellness = await repo.get_wellness(db, user["id"])
+        current = (wellness or {}).get("affirm_mode", "off")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text=("✅ Выкл" if current == "off" else "Выкл"), callback_data="settings:affirm:set:off"),
+                    InlineKeyboardButton(text=("✅ Утром" if current == "morning" else "Утром"), callback_data="settings:affirm:set:morning"),
+                ],
+                [
+                    InlineKeyboardButton(text=("✅ Вечером" if current == "evening" else "Вечером"), callback_data="settings:affirm:set:evening"),
+                    InlineKeyboardButton(text=("✅ Утром и вечером" if current == "both" else "Утром и вечером"), callback_data="settings:affirm:set:both"),
+                ],
+            ]
+        )
+        await callback.message.answer(
+            "Могу иногда подкидывать короткую фразу поддержки.\n"
+            "Выбери, когда присылать аффирмации:",
+            reply_markup=kb,
+        )
+    elif action == "expiry":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        wellness = await repo.get_wellness(db, user["id"])
+        current_days = int((wellness or {}).get("expiring_window_days", 3))
+        await state.set_state(SettingsState.expiry)
+        await callback.message.answer(
+            "Через сколько дней до конца срока считать, что продукт «скоро испортится»?\n"
+            f"Сейчас: около {current_days} дн.\n"
+            "Введи целое число от 1 до 30, например 3 или 5.",
+        )
     elif action == "mealprof":
         if len(parts) >= 3 and parts[2] == "set":
             await callback.answer()
@@ -132,6 +214,27 @@ async def settings_meal_profile(callback: types.CallbackQuery, db) -> None:
     await repo.upsert_wellness(db, user["id"], meal_profile=profile)
     label = {"omnivore": "Обычный", "vegetarian": "Вегетарианец", "vegan": "Веган"}.get(profile, profile)
     await callback.message.answer(f"Профиль питания обновлён: {label}.", reply_markup=main_menu_keyboard())
+    await callback.answer("Сохранено")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("settings:affirm:set:"))
+async def settings_affirm_mode(callback: types.CallbackQuery, db) -> None:
+    _, _, _, mode = callback.data.split(":")
+    if mode not in {"off", "morning", "evening", "both"}:
+        await callback.answer()
+        return
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    await repo.upsert_wellness(db, user["id"], affirm_mode=mode)
+    labels = {
+        "off": "выключены",
+        "morning": "только утром",
+        "evening": "только вечером",
+        "both": "утром и вечером",
+    }
+    await callback.message.answer(
+        f"Аффирмации теперь {labels[mode]}. Если станет слишком много — всегда можно вернуть режим «выкл».",
+        reply_markup=main_menu_keyboard(),
+    )
     await callback.answer("Сохранено")
 
 
@@ -221,6 +324,27 @@ async def settings_goals(message: types.Message, state: FSMContext, db) -> None:
     )
 
 
+@router.message(SettingsState.expiry)
+async def settings_expiry(message: types.Message, state: FSMContext, db) -> None:
+    raw = message.text.strip()
+    try:
+        days = int(raw)
+        if days < 1 or days > 30:
+            raise ValueError
+    except Exception:
+        await message.answer(
+            texts.error("нужно целое число дней от 1 до 30, например 3 или 5."),
+        )
+        return
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    await repo.upsert_wellness(db, user["id"], expiring_window_days=days)
+    await state.clear()
+    await message.answer(
+        f"Хорошо, буду считать, что продукт «скоро испортится», если до конца срока осталось ≤ {days} дн.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 @router.message(SettingsState.routine_time)
 async def settings_routine_time(message: types.Message, state: FSMContext, db) -> None:
     hhmm = message.text.strip()
@@ -240,5 +364,32 @@ async def settings_routine_time(message: types.Message, state: FSMContext, db) -
     await state.clear()
     await message.answer(
         f"Время напоминания для {routine_key} обновлено: {hhmm}.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+@router.message(SettingsState.household_join)
+async def settings_household_join(message: types.Message, state: FSMContext, db) -> None:
+    code = (message.text or "").strip()
+    if not code:
+        await message.answer(
+            "Код пустой. Пришли, пожалуйста, код, который тебе дал партнёр (буквы и цифры)."
+        )
+        return
+    from db import repositories as repo_mod
+
+    household = await repo_mod.get_household_by_code(db, code)
+    if not household:
+        await message.answer(
+            "Я не нашла дом с таким кодом. Проверь, не перепутались ли буквы/цифры, или попроси партнёра показать код ещё раз.",
+            reply_markup=main_menu_keyboard(),
+        )
+        await state.clear()
+        return
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    await repo_mod.set_user_household(db, user["id"], household["id"])
+    await state.clear()
+    await message.answer(
+        "Подключила тебя к общему дому. Теперь кладовка продуктов и бытовая химия будут общими для вас.",
         reply_markup=main_menu_keyboard(),
     )

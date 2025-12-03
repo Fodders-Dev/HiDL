@@ -5,11 +5,12 @@ from aiogram import types
 
 from db import repositories as repo
 from utils.finance import payday_summary
-from utils.time import local_date_str, format_date_display
+from utils.time import local_date_str, format_date_display, format_time_local
 from utils.formatting import format_money
 from utils.rows import row_to_dict
 from utils.texts import gentle_streak
 from utils.rows import rows_to_dicts
+from utils.affirmations import random_affirmation_text
 
 
 async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
@@ -132,7 +133,9 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     plan_done = [p for p in plan_items if p.get("done")]
 
     # продукты с подходящими сроками годности
-    soon_pantry, expired_pantry = await repo.pantry_expiring(db, user["id"], local_date, window_days=5)
+    wellness = await repo.get_wellness(db, user["id"])
+    window_days = int((wellness or {}).get("expiring_window_days", 3))
+    soon_pantry, expired_pantry = await repo.pantry_expiring(db, user["id"], local_date, window_days=window_days)
     soon_pantry_d = [row_to_dict(r) for r in soon_pantry]
     expired_pantry_d = [row_to_dict(r) for r in expired_pantry]
 
@@ -148,9 +151,12 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     done_today = sum(r["cnt"] for r in stats_r if r["status"] == "done") + sum(r["cnt"] for r in stats_c if r["status"] == "done")
     total_today = sum(r["cnt"] for r in stats_r) + sum(r["cnt"] for r in stats_c)
     important_total = min(3, len(routine_lines) + len(custom_lines) + len(regular_lines)) if adhd else total_today
+    routine_done_cnt = sum(r["cnt"] for r in stats_r if r["status"] == "done")
+    routine_total_cnt = sum(r["cnt"] for r in stats_r)
     summary_lines = [
         f"🎯 Очки: сегодня {points_today}, за 7 дней {points7}, стрик {streak} дн.",
         f"✅ Прогресс: {done_today}/{important_total or total_today or 0} задач за сегодня",
+        f"🌞 Рутины: {routine_done_cnt}/{routine_total_cnt} пунктов за сегодня",
         gentle_streak(streak),
     ]
     finance_line = await payday_summary(db, user, local_date)
@@ -182,9 +188,46 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             f"у {len(expired_pantry_d)} уже истёк — {listed}{extra_note}."
         )
     if meds_total:
-        summary_lines.append(
+        # показываем только краткий итог и 1–2 ближайших приёма;
+        # детальный список можно открыть по кнопке «Таблетки».
+        meds_line = (
             f"💊 Таблетки: сегодня {meds_total} напоминаний, уже отмечено {meds_taken}/{meds_total}."
         )
+        try:
+            logs = await repo.list_med_logs_for_date(db, user["id"], local_date)
+        except Exception:
+            logs = []
+        upcoming = [dict(l) for l in logs if not l.get("taken_at")]
+        if not upcoming:
+            upcoming = [dict(l) for l in logs]
+        if upcoming:
+            nearest = upcoming[:2]
+            details_parts = []
+            for log in nearest:
+                t = (log.get("planned_time") or "")[:5]
+                name = log.get("name") or "курс"
+                details_parts.append(f"{t} — {name}")
+            meds_line += " Ближайшие: " + "; ".join(details_parts) + ". Остальное — в кнопке «Таблетки» ниже."
+        summary_lines.append(meds_line)
+    # мягкая мысль дня по настройкам аффирмаций
+    affirm_line = ""
+    affirm_mode = (wellness or {}).get("affirm_mode", "off")
+    if affirm_mode and affirm_mode != "off":
+        local_time = format_time_local(now_utc, user["timezone"])
+        try:
+            hour = int(local_time.split(":")[0])
+        except Exception:
+            hour = 12
+        show = False
+        if affirm_mode in {"morning", "both"} and hour < 12:
+            show = True
+        if affirm_mode in {"evening", "both"} and hour >= 18:
+            show = True
+        if show:
+            thought = random_affirmation_text()
+            if thought:
+                affirm_line = f"💬 Мысль дня: «{thought}»"
+                summary_lines.append(affirm_line)
     blocks = [f"{pause_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
     if routine_lines:
         blocks.append("<b>🌞 Рутины:</b>\n" + "\n".join(routine_lines))
@@ -207,6 +250,10 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     kb_buttons.append([types.InlineKeyboardButton(text="📅 План по дому", callback_data="home:week")])
     kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
     kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
+    if meds_total:
+        kb_buttons.append(
+            [types.InlineKeyboardButton(text="Таблетки", callback_data="meds:today")]
+        )
     if soon_pantry_d or expired_pantry_d:
         kb_buttons.append(
             [types.InlineKeyboardButton(text="Продукты", callback_data="pantry:expiring")]

@@ -127,6 +127,8 @@ async def food_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
         from handlers import pantry
 
         await pantry.pantry_command(callback.message, db)
+    elif action == "expiring_recipes":
+        await guides._suggest_from_expiring(callback.message, db)  # noqa: SLF001
     await callback.answer()
 
 
@@ -160,6 +162,10 @@ async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
         from handlers import home_tasks
 
         await home_tasks.show_all_tasks(callback.message, db)
+    elif action == "supplies":
+        from handlers import home_supplies
+
+        await home_supplies.supplies_menu(callback.message, db)
     elif action == "smell":
         from handlers import home_tasks
 
@@ -201,7 +207,11 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
         return
     action = parts[1]
     if action == "gentle":
-        await callback.message.answer("Щадящий режим включается/выключается здесь. Если был щадящий день — завтра сам отключится.", reply_markup=main_menu_keyboard())
+        from handlers import wellness
+
+        # используем тот же сценарий, что и по слову «щадящий» в чате:
+        # одно нажатие включает щадящий день, повторный — предложит /resume.
+        await wellness.gentle_button(callback.message, db)
     elif action == "tone":
         await callback.message.answer("Тон общения: выбери стиль в настройках ниже.", reply_markup=main_menu_keyboard())
     elif action == "wellness":

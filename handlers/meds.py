@@ -25,6 +25,7 @@ class MedState(StatesGroup):
     dose = State()
     schedule = State()
     times = State()
+    retime = State()
 
 
 def _meds_menu_keyboard(meds_rows) -> InlineKeyboardMarkup:
@@ -32,11 +33,15 @@ def _meds_menu_keyboard(meds_rows) -> InlineKeyboardMarkup:
     for m in meds_rows:
         row = dict(m)
         status = "✅" if row.get("active") else "❌"
+        note = row.get("notes") or ""
         rows.append(
             [
                 InlineKeyboardButton(
                     text=f"{status} {row.get('name')[:24]}",
                     callback_data=f"med:toggle:{row['id']}",
+                ),
+                InlineKeyboardButton(
+                    text="⚙️", callback_data=f"med:menu:{row['id']}"
                 )
             ]
         )
@@ -94,6 +99,30 @@ async def meds_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -
             await callback.message.edit_reply_markup(reply_markup=_meds_menu_keyboard(meds_rows))
         except Exception:
             pass
+        return
+    if action == "menu" and len(parts) > 2:
+        med_id = int(parts[2])
+        med = await repo.get_med(db, med_id)
+        if not med:
+            await callback.answer("Не нашла запись.", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⏸ Пауза на 7 дней", callback_data=f"med:pause7:{med_id}"),
+                    InlineKeyboardButton(text="⏹ Завершить курс", callback_data=f"med:finish:{med_id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="🕒 Поменять время", callback_data=f"med:retime:{med_id}"),
+                ],
+            ]
+        )
+        await callback.message.answer(
+            f"Что сделать с «{med['name']}»?\n"
+            "Я напоминаю, но не ставлю диагнозы и не заменяю назначения врача.",
+            reply_markup=kb,
+        )
+        await callback.answer()
         return
     await callback.answer()
 
@@ -262,6 +291,131 @@ async def med_take_or_skip(callback: types.CallbackQuery, db) -> None:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("med:pause7:"))
+async def med_pause(callback: types.CallbackQuery, db) -> None:
+    _, _, med_id_str = callback.data.split(":")
+    med_id = int(med_id_str)
+    med = await repo.get_med(db, med_id)
+    if not med:
+        await callback.answer("Не нашла запись.", show_alert=True)
+        return
+    # помечаем как неактивный, но оставляем в списке
+    await repo.set_med_active(db, med_id, False)
+    await callback.message.answer(
+        f"Поставила курс «{med['name']}» на паузу. Напоминания по нему временно не придут.\n"
+        "Если врач скажет продолжать — можно будет снова включить его в списке.",
+        reply_markup=main_menu_keyboard(),
+    )
+    await callback.answer("Пауза")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("med:finish:"))
+async def med_finish(callback: types.CallbackQuery, db) -> None:
+    _, _, med_id_str = callback.data.split(":")
+    med_id = int(med_id_str)
+    med = await repo.get_med(db, med_id)
+    if not med:
+        await callback.answer("Не нашла запись.", show_alert=True)
+        return
+    await repo.set_med_active(db, med_id, False)
+    await callback.message.answer(
+        f"Отметила, что курс «{med['name']}» завершён. "
+        "Если врач назначит повторно — можно будет завести новую запись.",
+        reply_markup=main_menu_keyboard(),
+    )
+    await callback.answer("Завершено")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("med:retime:"))
+async def med_retime_start(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+    _, _, med_id_str = callback.data.split(":")
+    med_id = int(med_id_str)
+    med = await repo.get_med(db, med_id)
+    if not med:
+        await callback.answer("Не нашла запись.", show_alert=True)
+        return
+    await state.update_data(retime_med_id=med_id)
+    await state.set_state(MedState.retime)
+    await callback.message.answer(
+        f"Сейчас для «{med['name']}» стоит время {med.get('times','') or 'не задано'}.\n"
+        "Введи новые часы через запятую в формате HH:MM, например: 09:00,21:00.\n"
+        "Если меняешь схему приёма — хорошо бы согласовать это с врачом.",
+        reply_markup=main_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(MedState.retime)
+async def med_retime_finish(message: types.Message, state: FSMContext, db) -> None:
+    data = await state.get_data()
+    med_id = data.get("retime_med_id")
+    if not med_id:
+        await state.clear()
+        await message.answer("Не получилось обновить время приёма, давай попробуем ещё раз через меню /meds.")
+        return
+    raw = (message.text or "").strip()
+    try:
+        times = _parse_times(raw)
+    except Exception:
+        await message.answer(
+            texts.error("время нужно в формате HH:MM, например 09:00 или 09:00,21:00."),
+        )
+        return
+    times_str = ",".join(times)
+    med = await repo.get_med(db, int(med_id))
+    if not med:
+        await state.clear()
+        await message.answer("Не нашла запись. Попробуй ещё раз через /meds.")
+        return
+    schedule_type = med.get("schedule_type") or "custom_times"
+    # лёгкая нормализация по количеству времён
+    if len(times) == 1:
+        schedule_type = "once_daily"
+    elif len(times) == 2:
+        schedule_type = "twice_daily"
+    else:
+        schedule_type = "custom_times"
+    await repo.update_med_times(db, int(med_id), schedule_type, times_str)
+    await state.clear()
+    await message.answer(
+        f"Обновила время для «{med['name']}»: теперь напоминания в {times_str}. "
+        "Помни, что я лишь помогаю не забыть, а не назначаю лечение.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data == "meds:today")
+async def meds_today(callback: types.CallbackQuery, db) -> None:
+    """Показать все напоминания по таблеткам на сегодня."""
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    logs = await repo.list_med_logs_for_date(db, user["id"], today)
+    if not logs:
+        await callback.message.answer(
+            "На сегодня у тебя нет активных напоминаний по таблеткам. "
+            "Если нужно — можно добавить курс через /meds.",
+            reply_markup=main_menu_keyboard(),
+        )
+        await callback.answer()
+        return
+    lines = [f"Таблетки и витамины на {today}:"]
+    for row in logs:
+        log = dict(row)
+        name = log.get("name") or "Курс"
+        dose = log.get("dose_text") or ""
+        time = log.get("planned_time") or ""
+        taken = bool(log.get("taken_at"))
+        mark = "✅" if taken else "⏳"
+        extra = " (отмечено)" if taken else ""
+        lines.append(f"{mark} {time} — {name} {dose}{extra}")
+    lines.append(
+        "\nЯ напоминаю о приёме, но не ставлю диагнозы и не заменяю назначения врача. "
+        "Если есть сомнения по курсу — лучше обсудить это с доктором."
+    )
+    await callback.message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
+    await callback.answer()
 
 
 @router.message(Command("vitamins_info"))

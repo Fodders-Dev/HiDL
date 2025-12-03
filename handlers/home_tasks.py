@@ -587,9 +587,29 @@ async def clean_choose_zone(callback: types.CallbackQuery, db, state: FSMContext
     energy = data.get("energy", "mid")
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    # посмотрим на бытовую химию, чтобы мягко предупредить, если чего-то нет
+    await repo.ensure_supplies(db, user["id"])
+    supplies = rows_to_dicts(await repo.list_supplies(db, user["id"]))
+    warnings: list[str] = []
+    if zone == "bathroom":
+        chem = next((s for s in supplies if (s.get("name") or "").lower().startswith("средство для унитаза")), None)
+        if chem and (chem.get("status") or "full") == "empty":
+            warnings.append(
+                "Вижу, что средство для унитаза у тебя помечено как закончившееся. "
+                "Можем сейчас просто ополоснуть и протереть, а полноценную чистку оставить после покупки."
+            )
+    if zone == "kitchen":
+        dish = next((s for s in supplies if (s.get("name") or "").lower().startswith("средство для посуды")), None)
+        if dish and (dish.get("status") or "full") == "empty":
+            warnings.append(
+                "Средство для посуды сейчас отмечено как «нет». Можно ограничиться тёплой водой "
+                "и добавить средство в список покупок, когда будет настроение."
+            )
     steps = await _build_steps(db, user["id"], energy, clean_type, today, zone)
     await state.update_data(steps=steps, energy=energy, today=today, zone=zone)
     text = _steps_text(steps)
+    if warnings:
+        text = "\n".join(warnings) + "\n\n" + text
     kb = _steps_keyboard(steps)
     await callback.message.answer(text, reply_markup=kb)
     await state.set_state(CleanNowState.process)

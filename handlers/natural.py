@@ -35,7 +35,8 @@ def _extract_time(text: str):
 
 @router.message(lambda m: m.text and not m.text.startswith("/"))
 async def natural_handler(message: types.Message, db) -> None:
-    text = message.text.lower()
+    text_original = message.text or ""
+    text = text_original.lower()
     # быстрые намерения: сделал/позже/пропусти
     intent = match_simple_intent(text)
     if intent:
@@ -133,6 +134,15 @@ async def natural_handler(message: types.Message, db) -> None:
         )
         if last_sent:
             await repo.set_custom_reminder_sent(db, rid, last_sent)
-        await message.answer(f"Я поставила напоминание «{title}» на {hhmm} (каждые {freq} д.).", reply_markup=main_menu_keyboard())
+        await message.answer(
+            f"Я поставила напоминание «{title}» на {hhmm} (каждые {freq} д.).",
+            reply_markup=main_menu_keyboard(),
+        )
         return
-    # просто текст без распознавания — не перехватываем, дадим другим хендлерам
+    # если не распознали запрос — мягко подсказать про основные разделы
+    await message.answer(
+        "Я читаю это как обычное сообщение и не очень поняла, что сделать.\n\n"
+        "Можешь спросить про еду, уборку, стирку, деньги или режим дня — или выбрать раздел кнопками снизу:\n"
+        "Сегодня • Еда • Дом • Движение • Напоминания.",
+        reply_markup=main_menu_keyboard(),
+    )

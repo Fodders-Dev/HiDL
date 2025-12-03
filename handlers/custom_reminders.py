@@ -281,7 +281,10 @@ async def add_reminder_frequency(message: types.Message, state: FSMContext, db) 
         if freq < 1:
             raise ValueError
     except Exception:
-        await message.answer("Введи целое число дней (минимум 1).")
+        await message.answer(
+            "Нужно целое число дней (минимум 1).\n"
+            "Например: 1 — каждый день, 7 — раз в неделю, 30 — раз в месяц.",
+        )
         return
     await _save_reminder_with_frequency(
         message,
@@ -595,8 +598,14 @@ async def delete_reminder(callback: types.CallbackQuery, db) -> None:
         await callback.answer(register_text(), show_alert=True)
         return
     await repo.delete_custom_reminder(db, user["id"], reminder_id)
-    await callback.answer("Удалено")
     reminders = await repo.list_custom_reminders(db, user["id"])
+    title = "Напоминание"
+    for r in reminders:
+        row = row_to_dict(r)
+        if row.get("id") == reminder_id:
+            title = row.get("title") or title
+            break
+    await callback.answer(f"Убрала напоминание «{title}».")
     if reminders:
         await callback.message.edit_reply_markup(reply_markup=list_keyboard(reminders))
     else:

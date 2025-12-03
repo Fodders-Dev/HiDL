@@ -223,7 +223,9 @@ async def ask_start(callback: types.CallbackQuery, state: FSMContext) -> None:
     elif kind == "laundry":
         await state.set_state(AskMomLaundry.item)
         await callback.message.answer(
-            "Что стираем? Если нужны подсказки по значкам/лотку стиралки — жми «Символы» ниже.",
+            "Разберёмся со стиркой, без паники.\n"
+            "Выбери, что примерно стираем, а я подскажу режим и как засыпать средство.\n"
+            "Если хочешь сначала понять значки на стиралке — жми «Символы/лоток».",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="Тёмные повседневные", callback_data="ask:laundry:item:dark")],

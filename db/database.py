@@ -42,6 +42,13 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS households (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            invite_code TEXT UNIQUE,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS routines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             routine_key TEXT UNIQUE NOT NULL,
@@ -144,6 +151,8 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             meal_times TEXT DEFAULT '13:00,19:00',
             tone TEXT DEFAULT 'neutral',
             meal_profile TEXT DEFAULT 'omnivore',
+            expiring_window_days INTEGER DEFAULT 3,
+            affirm_mode TEXT DEFAULT 'off',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -317,6 +326,10 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             await conn.execute("ALTER TABLE wellness_settings ADD COLUMN meal_times TEXT DEFAULT '13:00,19:00';")
         if "meal_profile" not in wellness_cols:
             await conn.execute("ALTER TABLE wellness_settings ADD COLUMN meal_profile TEXT DEFAULT 'omnivore';")
+        if "expiring_window_days" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN expiring_window_days INTEGER DEFAULT 3;")
+        if "affirm_mode" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN affirm_mode TEXT DEFAULT 'off';")
 
     weights_info = await conn.execute_fetchall("PRAGMA table_info(weights);")
     if not weights_info:
@@ -345,6 +358,37 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
                 unit TEXT NOT NULL DEFAULT 'шт',
                 expires_at TEXT,
                 category TEXT NOT NULL DEFAULT 'прочее',
+                low_threshold REAL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+    else:
+        pantry_cols = {row["name"] for row in pantry_info}
+        if "low_threshold" not in pantry_cols:
+            await conn.execute("ALTER TABLE pantry_items ADD COLUMN low_threshold REAL;")
+        if "is_active" not in pantry_cols:
+            await conn.execute("ALTER TABLE pantry_items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;")
+        if "household_id" not in pantry_cols:
+            await conn.execute("ALTER TABLE pantry_items ADD COLUMN household_id INTEGER;")
+            await conn.execute(
+                "UPDATE pantry_items SET household_id = user_id WHERE household_id IS NULL"
+            )
+
+    # бытовая химия и расходники (общий инвентарь по дому)
+    supplies_info = await conn.execute_fetchall("PRAGMA table_info(supplies);")
+    if not supplies_info:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS supplies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'full',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -387,6 +431,8 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         )
     users_info2 = await conn.execute_fetchall("PRAGMA table_info(users);")
     user_cols2 = {row["name"] for row in users_info2}
+    if "household_id" not in user_cols2:
+        await conn.execute("ALTER TABLE users ADD COLUMN household_id INTEGER;")
     if "points_total" not in user_cols2:
         await conn.execute("ALTER TABLE users ADD COLUMN points_total INTEGER DEFAULT 0;")
     if "points_month" not in user_cols2:

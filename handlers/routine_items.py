@@ -8,18 +8,58 @@ from keyboards.common import main_menu_keyboard
 from utils.tone import tone_ack
 
 
+def _visible_steps(items: list[dict], done: set[int]) -> list[tuple[int, dict]]:
+    """
+    Вернуть список (индекс, шаг) только для тех шагов, которые нужно показывать.
+
+    Шаг с trigger_after_step_id появляется только после того, как
+    родительский шаг отмечен выполненным.
+    """
+    index_by_id: dict[int, int] = {}
+    for idx, raw in enumerate(items):
+        try:
+            index_by_id[int(raw["id"])] = idx
+        except Exception:
+            continue
+    visible: list[tuple[int, dict]] = []
+    for idx, raw in enumerate(items):
+        it = dict(raw)
+        if not it.get("is_active", 1):
+            continue
+        parent_id = it.get("trigger_after_step_id")
+        if parent_id:
+            parent_idx = index_by_id.get(int(parent_id))
+            if parent_idx is None or parent_idx not in done:
+                continue
+        visible.append((idx, it))
+    return visible
+
+
 def _render_routine_text(title: str, reminder_time: str, items, done: set[int]) -> str:
     text_lines = []
-    for i, item in enumerate(items):
-        it = dict(item)
-        if i in done:
+    visible = _visible_steps(items, done)
+    has_pills = False
+    for idx, it in visible:
+        title_l = (it.get("title") or "").lower()
+        if "таблет" in title_l or "витамин" in title_l:
+            has_pills = True
+        if idx in done:
             text_lines.append(f"• <s>{it['title']}</s>")
         else:
             text_lines.append(f"• {it['title']}")
-    return f"🕒 {title} ({reminder_time})\n\n" + "\n".join(text_lines) + "\n\nОтметь статус:"
+    header = f"🕒 {title} ({reminder_time})\n\n" + "\n".join(text_lines)
+    footer = "\n\nОтметь статус:"
+    if has_pills:
+        footer += (
+            "\n\nНапоминание про таблетки — это только чтобы не забыть. "
+            "Если что-то меняешь в приёме или чувствуешь себя хуже обычного, лучше обсуди это с врачом."
+        )
+    return header + footer
 
 
-def _build_routine_keyboard(routine_id: int, local_date: str, items, done: set[int], status: str) -> types.InlineKeyboardMarkup:
+def _build_routine_keyboard(
+    routine_id: int, local_date: str, items, done: set[int], status: str
+) -> types.InlineKeyboardMarkup:
     kb_rows = [
         [
             types.InlineKeyboardButton(text="Сделал(а) ✔", callback_data=f"routine:{routine_id}:{local_date}:done"),
@@ -27,13 +67,13 @@ def _build_routine_keyboard(routine_id: int, local_date: str, items, done: set[i
             types.InlineKeyboardButton(text="Пропустить", callback_data=f"routine:{routine_id}:{local_date}:skip"),
         ]
     ]
-    for i, item in enumerate(items):
-        mark = "☑️" if i in done else "⬜️"
+    for idx, it in _visible_steps(items, done):
+        mark = "☑️" if idx in done else "⬜️"
         kb_rows.append(
             [
                 types.InlineKeyboardButton(
-                    text=f"{mark} {dict(item)['title'][:24]}",
-                    callback_data=f"ritem:{routine_id}:{local_date}:{i}",
+                    text=f"{mark} {it['title'][:24]}",
+                    callback_data=f"ritem:{routine_id}:{local_date}:{idx}",
                 )
             ]
         )
@@ -81,9 +121,11 @@ async def routine_item_toggle(callback: types.CallbackQuery, db) -> None:
     routine = dict(routine_row) if routine_row else {}
     reminder_time = routine.get("reminder_time") or routine.get("default_time") or ""
     title = routine.get("title", "Рутина")
-    # автозакрытие рутины, если все пункты отмечены
+    # автозакрытие рутины, если все видимые пункты отмечены
     new_status = prev_status
-    if len(done) == len(items) and prev_status != "done":
+    visible = _visible_steps(items, done)
+    visible_indices = {idx for idx, _ in visible}
+    if visible_indices and visible_indices.issubset(done) and prev_status != "done":
         await repo.upsert_user_task(db, user["id"], routine_id, local_date, status="done")
         new_status = "done"
     text = _render_routine_text(title, reminder_time, items, done)
@@ -93,8 +135,8 @@ async def routine_item_toggle(callback: types.CallbackQuery, db) -> None:
     except Exception:
         await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("Отметила." if added else "Сняла отметку.")
-    # если рутина закрыта — отправить краткое подтверждение и убрать клавиатуру
-    if len(done) == len(items):
+    # если все видимые шаги закрыты — отправить краткое подтверждение и убрать клавиатуру
+    if visible_indices and visible_indices.issubset(done):
         try:
             await callback.message.edit_text(f"🕒 {title} завершена ✔", reply_markup=None)
         except Exception:
@@ -114,9 +156,15 @@ async def routine_finish(callback: types.CallbackQuery, db) -> None:
                 done.add(int(part))
             except Exception:
                 continue
-    items = [dict(i) for i in await repo.list_routine_steps_for_routine(db, user["id"], routine_id, include_inactive=True)]
-    # начислить очки за отмеченные пункты
-    points = len(done)
+    items = [
+        dict(i)
+        for i in await repo.list_routine_steps_for_routine(
+            db, user["id"], routine_id, include_inactive=True
+        )
+    ]
+    visible = _visible_steps(items, done)
+    # начислить очки за отмеченные видимые пункты
+    points = len([idx for idx, _ in visible if idx in done])
     if points > 0:
         await repo.add_points(db, user["id"], points, local_date=local_date)
     await repo.upsert_user_task(db, user["id"], routine_id, local_date, status="done")

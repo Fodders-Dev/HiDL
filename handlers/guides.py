@@ -435,3 +435,73 @@ async def walk_quests(message: types.Message) -> None:
         line = f"{w['name']}: {w['time']}, {w.get('steps','')} {w.get('freq','')}\n{w['note']}"
         lines.append(line)
     await message.answer("Мини-квесты ходьбы:\n" + "\n\n".join(lines), reply_markup=main_menu_keyboard())
+
+
+async def _suggest_from_expiring(message: types.Message, db) -> None:
+    """
+    Подсказка: что можно приготовить из продуктов, у которых скоро истечёт срок.
+
+    Берём 1–3 ближайших по сроку продукта и пытаемся найти рецепты,
+    где они фигурируют в ингредиентах. Если не нашли — даём общие идеи.
+    """
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    now = datetime.datetime.utcnow()
+    from utils.time import local_date_str
+
+    local_date = local_date_str(now, user["timezone"])
+    wellness = await repo.get_wellness(db, user["id"])
+    window_days = int((wellness or {}).get("expiring_window_days", 3))
+    soon, expired = await repo.pantry_expiring(db, user["id"], local_date, window_days=window_days)
+    soon_d = rows_to_dicts(soon)
+    expired_d = rows_to_dicts(expired)
+    candidates = (soon_d + expired_d)[:3]
+    if not candidates:
+        await message.answer(
+            "Пока я не вижу продуктов с горящим сроком. Можно просто выбрать рецепт из «Быстрых блюд».",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    product_names = [c.get("name") for c in candidates if c.get("name")]
+    recipes_map = _cook_recipes_map()
+    matched: list[dict] = []
+    for r in recipes_map.values():
+        tags = [ing.get("tag", "").lower() for ing in r.get("ingredients", [])]
+        labels = [ing.get("label", "").lower() for ing in r.get("ingredients", [])]
+        for name in product_names:
+            name_l = (name or "").lower()
+            if any(name_l in t for t in tags + labels):
+                matched.append(r)
+                break
+        if len(matched) >= 2:
+            break
+
+    lines: list[str] = []
+    lines.append("Смотрю на продукты, у которых горят сроки.")
+    lines.append("")
+    lines.append("Скоро истечёт или уже истёк срок у:")
+    for c in candidates:
+        lines.append(f"• {c.get('name')} — до {c.get('expires_at')}")
+
+    if matched:
+        lines.append("")
+        lines.append("Можно приготовить, например:")
+        for r in matched:
+            lines.append(f"• {r['title']} ({r['time']}) — {r['short_desc']}")
+        lines.append("")
+        lines.append("Если хочешь, открой «Быстрые рецепты» и выбери один из них.")
+    else:
+        lines.append("")
+        lines.append(
+            "Прямо подходящих рецептов я не нашла, но можно использовать эти продукты "
+            "в простых блюдах: яйца — в омлете/яичнице, овощи — в гарнире или супе, "
+            "молочку — в завтраке."
+        )
+
+    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
+
+
+@router.message(Command("cook_from_expiring"))
+async def cook_from_expiring_command(message: types.Message, db) -> None:
+    """Команда: подсказать, что можно приготовить из продуктов с горящим сроком."""
+    await _suggest_from_expiring(message, db)

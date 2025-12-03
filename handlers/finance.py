@@ -123,11 +123,27 @@ async def _compose_spent_week(db, user) -> str:
     cats = await repo.list_budget_categories(db, user["id"])
     if cats:
         cat_lines = []
+        over: list[str] = []
+        within_any = False
         for c in cats:
             row = dict(c)
             spent_cat = await repo.category_expense_sum(db, user["id"], row["category"], days=30)
-            cat_lines.append(f"{row['category']}: {format_money(spent_cat)} / {format_money(row['limit_amount'])}")
-        text += "\nКатегории:\n" + "\n".join(cat_lines)
+            limit = float(row.get("limit_amount") or 0)
+            cat_lines.append(
+                f"{row['category']}: {format_money(spent_cat)} / {format_money(limit)}"
+            )
+            if limit > 0:
+                if spent_cat > limit * 1.05:
+                    over.append(row["category"])
+                elif spent_cat > 0:
+                    within_any = True
+        text += "\nКатегории (за ~месяц):\n" + "\n".join(cat_lines)
+        # короткая фраза‑резюме по лимитам
+        if over:
+            cats_over = ", ".join(over)
+            text += f"\nЗа последнее время траты чуть выше ориентиров в категориях: {cats_over}."
+        elif within_any:
+            text += "\nСейчас ты в целом вписываешься в лимиты по категориям."
     return text
 
 
@@ -233,7 +249,11 @@ async def money_menu_entry(message: types.Message, state: FSMContext, db) -> Non
         ]
     )
     await message.answer(
-        "Деньги:\n• Записать новую трату\n• Посмотреть отчёт за неделю\n• Настроить лимиты\n• Управлять счетами и оплатами",
+        "Деньги:\n"
+        "• Записать новую трату\n"
+        "• Посмотреть отчёт за неделю\n"
+        "• Настроить лимиты по категориям и общий месячный бюджет\n"
+        "• Управлять регулярными счетами и напоминаниями об оплате",
         reply_markup=kb,
     )
 

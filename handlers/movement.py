@@ -84,20 +84,28 @@ async def move_weight(callback: types.CallbackQuery, state: FSMContext, db) -> N
     height = user.get("height_cm") or 0
     goal = user.get("weight_goal") or "не задана"
     target = user.get("weight_target") or 0
-    lines = ["⚖ Вес и цели:"]
+    lines = ["⚖ Вес и цели (без оценок и стыда):"]
     if latest:
-        lines.append(f"Текущий: {latest:.1f} кг")
+        lines.append(f"Текущий вес: {latest:.1f} кг")
     if trend30:
         arrow = "⬇️" if trend30 < 0 else "⬆️"
         lines.append(f"Динамика за 30 дней: {arrow} {trend30:.1f} кг")
     if height:
         lines.append(f"Рост: {height:.0f} см")
     if goal != "не задана":
-        goal_line = f"Цель: {goal}"
+        human_goal = {
+            "loss": "чуть снизить вес",
+            "keep": "поддерживать текущий вес",
+            "gain": "немного набрать",
+        }.get(goal, goal)
+        goal_line = f"Цель: {human_goal}"
         if target:
-            goal_line += f" (целевой вес {target:.1f} кг)"
+            goal_line += f" (ориентир {target:.1f} кг, без жёстких рамок)"
         lines.append(goal_line)
-    lines.append("\nЧто делаем?")
+    lines.append(
+        "\nМожно вести заметки по весу, но главное — самочувствие.\n"
+        "В качестве целей подойдут и вещи без цифр: «гулять 3 раза в неделю», «просыпаться бодрее»."
+    )
     kb = types.InlineKeyboardMarkup(
         inline_keyboard=[
             [types.InlineKeyboardButton(text="➕ Записать вес", callback_data="weight:add")],
@@ -184,7 +192,12 @@ async def set_goal(callback: types.CallbackQuery, state: FSMContext) -> None:
     goal = callback.data.split(":")[1]
     await state.update_data(goal=goal)
     await state.set_state(WeightState.target)
-    await callback.message.answer("Какой целевой вес? (кг)", reply_markup=main_menu_keyboard())
+    await callback.message.answer(
+        "Если хочешь, можешь задать ориентир по весу (в кг).\n"
+        "Это не обязанность и не жёсткая норма — просто цифра, на которую удобно смотреть.\n"
+        "Например: 70 или 72.5.",
+        reply_markup=main_menu_keyboard(),
+    )
     await callback.answer()
 
 
@@ -203,8 +216,14 @@ async def set_target_weight(message: types.Message, state: FSMContext, db) -> No
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await repo.update_user_body(db, user["id"], height_cm=h, weight_goal=goal, weight_target=target)
     await state.clear()
+    goal_text = {
+        "loss": "чуть снизить вес",
+        "keep": "поддерживать текущий вес",
+        "gain": "немного набрать",
+    }.get(goal, "заботиться о самочувствии")
     await message.answer(
-        f"Сохранила: рост {h:.0f} см, цель {goal}, целевой вес {target:.1f} кг.",
+        f"Сохранила: рост {h:.0f} см, цель — {goal_text}, ориентир по весу {target:.1f} кг.\n"
+        "Это не строгий план, а мягкий ориентир, который можно менять по ощущениям.",
         reply_markup=main_menu_keyboard(),
     )
 

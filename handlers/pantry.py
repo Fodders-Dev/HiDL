@@ -12,6 +12,7 @@ from utils.rows import rows_to_dicts, row_to_dict
 from utils.time import local_date_str, format_date_display
 from utils.texts import error
 from utils.user import ensure_user
+from utils.pantry import format_quantity, is_low
 
 
 router = Router()
@@ -101,9 +102,9 @@ def _pantry_keyboard(items: list[dict]) -> types.InlineKeyboardMarkup:
     rows: list[list[types.InlineKeyboardButton]] = []
     for item in items:
         label = item.get("name", "")
-        amt = item.get("amount") or 0
-        unit = item.get("unit") or "шт"
-        btn_text = f"{label} — {amt:g} {unit}"
+        qty = format_quantity(item.get("amount"), item.get("unit"))
+        prefix = "⚠️ " if is_low(item) else ""
+        btn_text = f"{prefix}{label} — {qty}"
         rows.append(
             [
                 types.InlineKeyboardButton(text=btn_text[:40], callback_data=f"pantry:edit:{item['id']}"),
@@ -116,8 +117,8 @@ def _pantry_keyboard(items: list[dict]) -> types.InlineKeyboardMarkup:
 
 async def _render_pantry(message: types.Message, db) -> None:
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    rows = await repo.list_pantry_items(db, user["id"])
-    items = rows_to_dicts(rows)
+    rows_all = await repo.list_pantry_items(db, user["id"])
+    items = rows_to_dicts(rows_all)
     if not items:
         kb = types.InlineKeyboardMarkup(
             inline_keyboard=[[types.InlineKeyboardButton(text="➕ Добавить продукт", callback_data="pantry:add")]]
@@ -128,7 +129,27 @@ async def _render_pantry(message: types.Message, db) -> None:
             reply_markup=kb,
         )
         return
-    lines = ["Что у тебя есть дома (по ощущениям):"]
+    # мини-блок про сроки годности
+    now_utc = datetime.datetime.utcnow()
+    local_date = local_date_str(now_utc, user["timezone"])
+    wellness = await repo.get_wellness(db, user["id"])
+    window_days = int((wellness or {}).get("expiring_window_days", 3))
+    soon, expired = await repo.pantry_expiring(db, user["id"], local_date, window_days=window_days)
+    soon_d = rows_to_dicts(soon)
+    expired_d = rows_to_dicts(expired)
+
+    lines = []
+    if soon_d or expired_d:
+        lines.append("Смотрю на продукты со сроками годности.")
+        if soon_d:
+            names = ", ".join(row.get("name") for row in soon_d[:3] if row.get("name"))
+            lines.append(f"• Скоро истечёт срок у: {names}…")
+        if expired_d:
+            names = ", ".join(row.get("name") for row in expired_d[:3] if row.get("name"))
+            lines.append(f"• Похоже, срок уже прошёл у: {names}…")
+        lines.append("")
+
+    lines.append("Что у тебя есть дома (по ощущениям):")
     current_cat = None
     for item in items:
         cat = item.get("category") or "прочее"
@@ -136,14 +157,14 @@ async def _render_pantry(message: types.Message, db) -> None:
             current_cat = cat
             label = CATEGORY_LABELS.get(cat, cat)
             lines.append(f"\n<b>{label}</b>")
-        amt = item.get("amount") or 0
-        unit = item.get("unit") or "шт"
+        qty = format_quantity(item.get("amount"), item.get("unit"))
+        low_flag = " (почти кончилось)" if is_low(item) else ""
         if item.get("expires_at"):
             lines.append(
-                f"• {item['name']} — {amt:g} {unit}, годен до {format_date_display(item['expires_at'])}"
+                f"• {item['name']} — {qty}, годен до {format_date_display(item['expires_at'])}{low_flag}"
             )
         else:
-            lines.append(f"• {item['name']} — {amt:g} {unit}")
+            lines.append(f"• {item['name']} — {qty}{low_flag}")
     kb = _pantry_keyboard(items)
     await message.answer("\n".join(lines), reply_markup=kb)
 
@@ -158,7 +179,9 @@ async def pantry_expiring_view(callback: types.CallbackQuery, db) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     now_utc = datetime.datetime.utcnow()
     local_date = local_date_str(now_utc, user["timezone"])
-    soon, expired = await repo.pantry_expiring(db, user["id"], local_date, window_days=5)
+    wellness = await repo.get_wellness(db, user["id"])
+    window_days = int((wellness or {}).get("expiring_window_days", 3))
+    soon, expired = await repo.pantry_expiring(db, user["id"], local_date, window_days=window_days)
     soon_d = rows_to_dicts(soon)
     expired_d = rows_to_dicts(expired)
     if not soon_d and not expired_d:

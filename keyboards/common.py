@@ -27,6 +27,7 @@ def food_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Меню на неделю", callback_data="food:meal_plan")],
             [InlineKeyboardButton(text="Список покупок", callback_data="food:shoplist")],
             [InlineKeyboardButton(text="Из того, что есть", callback_data="food:pantry")],
+            [InlineKeyboardButton(text="Спасти продукты", callback_data="food:expiring_recipes")],
         ]
     )
 
@@ -50,6 +51,7 @@ def home_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⚡ Быстрые сценарии", callback_data="home:quickmenu")],
             [InlineKeyboardButton(text="📅 План на неделю", callback_data="home:week")],
             [InlineKeyboardButton(text="📋 Все дела по дому", callback_data="home:all")],
+            [InlineKeyboardButton(text="🧴 Бытовая химия", callback_data="home:supplies")],
             [InlineKeyboardButton(text="🧴 Запахи / стирка", callback_data="home:smell")],
         ]
     )
