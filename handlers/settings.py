@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils import texts
+from utils.sender import safe_edit
 from utils.time import is_valid_timezone, parse_hhmm
 from utils.user import ensure_user
 
@@ -25,33 +26,53 @@ class SettingsState(StatesGroup):
     household_join = State()
 
 
+def _settings_main_text(user) -> str:
+    return (
+        "Твои текущие настройки:\n"
+        f"• Имя: {user['name']}\n"
+        f"• Часовой пояс: {user['timezone']}\n"
+        f"• Подъём: {user['wake_up_time']} / Отбой: {user['sleep_time']}\n"
+        f"• Цель/приоритет: {user['goals'] or 'Нет цели пока'}\n\n"
+        "Что поменяем? Выбери ниже."
+    )
+
+
 def settings_keyboard() -> InlineKeyboardMarkup:
+    """
+    Компактное меню настроек.
+
+    Группируем схожие пункты, чтобы не было длинной простыни кнопок.
+    Детальные действия (подъём/отбой, время рутин, цели) открываются
+    во вложенных меню.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Часовой пояс", callback_data="settings:tz")],
-            [InlineKeyboardButton(text="Подъём", callback_data="settings:wake")],
-            [InlineKeyboardButton(text="Отбой", callback_data="settings:sleep")],
-            [InlineKeyboardButton(text="Цель/приоритет", callback_data="settings:goals")],
-            [InlineKeyboardButton(text="Профиль питания", callback_data="settings:mealprof")],
-            [InlineKeyboardButton(text="Аффирмации", callback_data="settings:affirm")],
+            [InlineKeyboardButton(text="Время и режим дня", callback_data="settings:time_menu")],
+            [InlineKeyboardButton(text="Рутины (шаги и время)", callback_data="settings:routines_menu")],
+            [InlineKeyboardButton(text="Питание и аффирмации", callback_data="settings:profile_menu")],
             [InlineKeyboardButton(text="Срок «скоро истечёт»", callback_data="settings:expiry")],
             [InlineKeyboardButton(text="ADHD-режим", callback_data="settings:adhd")],
-            [
-                InlineKeyboardButton(
-                    text="Время: утро", callback_data="settings:rt:morning"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Время: день", callback_data="settings:rt:day"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Время: вечер", callback_data="settings:rt:evening"
-                )
-            ],
             [InlineKeyboardButton(text="Общий дом", callback_data="settings:household")],
+        ]
+    )
+
+
+def _affirm_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+    """Собрать клавиатуру выбора режима аффирмаций с подсветкой текущего выбора и кнопкой Назад."""
+    def label(mode: str, text: str) -> str:
+        return f"✅ {text}" if current_mode == mode else text
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=label("off", "Выкл"), callback_data="settings:affirm:set:off"),
+                InlineKeyboardButton(text=label("morning", "Утром"), callback_data="settings:affirm:set:morning"),
+            ],
+            [
+                InlineKeyboardButton(text=label("evening", "Вечером"), callback_data="settings:affirm:set:evening"),
+                InlineKeyboardButton(text=label("both", "Утром и вечером"), callback_data="settings:affirm:set:both"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:profile_menu")],
         ]
     )
 
@@ -60,15 +81,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
 async def settings_entry(message: types.Message, state: FSMContext, db) -> None:
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await state.clear()
-    await message.answer(
-        "Твои текущие настройки:\n"
-        f"• Имя: {user['name']}\n"
-        f"• Часовой пояс: {user['timezone']}\n"
-        f"• Подъём: {user['wake_up_time']} / Отбой: {user['sleep_time']}\n"
-        f"• Цель/приоритет: {user['goals'] or 'не задано'}\n\n"
-        "Что поменяем? Выбери ниже.",
-        reply_markup=settings_keyboard(),
-    )
+    await message.answer(_settings_main_text(user), reply_markup=settings_keyboard())
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("settings:"))
@@ -79,7 +92,101 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
         return
     action = parts[1]
     await state.clear()
-    if action == "tz":
+    # Возврат в главное меню настроек
+    if action == "main":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        await safe_edit(callback.message, _settings_main_text(user), reply_markup=settings_keyboard())
+        await callback.answer()
+        return
+    # Вложенное меню «Время и режим дня».
+    if action == "time_menu":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Часовой пояс", callback_data="settings:tz"),
+                ],
+                [
+                    InlineKeyboardButton(text="Подъём", callback_data="settings:wake"),
+                    InlineKeyboardButton(text="Отбой", callback_data="settings:sleep"),
+                ],
+                [
+                    InlineKeyboardButton(text="Время: утро", callback_data="settings:rt:morning"),
+                    InlineKeyboardButton(text="Время: день", callback_data="settings:rt:day"),
+                    InlineKeyboardButton(text="Время: вечер", callback_data="settings:rt:evening"),
+                ],
+                [
+                    InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main"),
+                ],
+            ]
+        )
+        await safe_edit(
+            callback.message,
+            "Время и режим дня:\n"
+            "• Часовой пояс — для правильных дат и времени.\n"
+            "• Подъём/Отбой — для планов и щадящего режима.\n"
+            "• Время рутин — во сколько приходят Утро/День/Вечер.",
+            reply_markup=kb,
+        )
+    # Вложенное меню «Рутины».
+    elif action == "routines_menu":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Шаги утро/день/вечер", callback_data="settings:rsteps"),
+                ],
+                [
+                    InlineKeyboardButton(text="Время: утро", callback_data="settings:rt:morning"),
+                    InlineKeyboardButton(text="Время: день", callback_data="settings:rt:day"),
+                    InlineKeyboardButton(text="Время: вечер", callback_data="settings:rt:evening"),
+                ],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
+            ]
+        )
+        await safe_edit(
+            callback.message,
+            "Рутины:\n"
+            "Можно настроить шаги и время для утренней, дневной и вечерней рутин.",
+            reply_markup=kb,
+        )
+    elif action == "rsteps":
+        # Показываем меню выбора рутины для редактирования шагов (тот же поток, что /routine_steps).
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Утро", callback_data="rstep:routine:morning"),
+                    InlineKeyboardButton(text="День", callback_data="rstep:routine:day"),
+                    InlineKeyboardButton(text="Вечер", callback_data="rstep:routine:evening"),
+                ],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:routines_menu")],
+            ]
+        )
+        await safe_edit(
+            callback.message,
+            "Выбери рутину, чтобы включить/выключить шаги, переименовать или добавить новые.",
+            reply_markup=kb,
+        )
+    # Вложенное меню «Питание и аффирмации».
+    elif action == "profile_menu":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Профиль питания", callback_data="settings:mealprof"),
+                ],
+                [
+                    InlineKeyboardButton(text="Аффирмации", callback_data="settings:affirm"),
+                ],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
+            ]
+        )
+        await safe_edit(
+            callback.message,
+            "Питание и поддержка:\n"
+            "• Профиль питания — обычный/вегетарианский/веганский.\n"
+            "• Аффирмации — короткие фразы поддержки по времени дня.",
+            reply_markup=kb,
+        )
+    # Старые действия — оставляем для совместимости и прямых переходов.
+    elif action == "tz":
         await state.set_state(SettingsState.timezone)
         await callback.message.answer(
             "Сколько у тебя сейчас времени? Напиши в формате HH:MM (я сама посчитаю смещение).\n"
@@ -140,26 +247,15 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
         await callback.message.answer(
             "Пришли код дома, который дал тебе партнёр. Я попробую подключить тебя к тому же пространству.",
         )
-    elif action == "affirm":
+    elif action == "affirm" and len(parts) == 2:
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         wellness = await repo.get_wellness(db, user["id"])
         current = (wellness or {}).get("affirm_mode", "off")
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text=("✅ Выкл" if current == "off" else "Выкл"), callback_data="settings:affirm:set:off"),
-                    InlineKeyboardButton(text=("✅ Утром" if current == "morning" else "Утром"), callback_data="settings:affirm:set:morning"),
-                ],
-                [
-                    InlineKeyboardButton(text=("✅ Вечером" if current == "evening" else "Вечером"), callback_data="settings:affirm:set:evening"),
-                    InlineKeyboardButton(text=("✅ Утром и вечером" if current == "both" else "Утром и вечером"), callback_data="settings:affirm:set:both"),
-                ],
-            ]
-        )
-        await callback.message.answer(
+        await safe_edit(
+            callback.message,
             "Могу иногда подкидывать короткую фразу поддержки.\n"
             "Выбери, когда присылать аффирмации:",
-            reply_markup=kb,
+            reply_markup=_affirm_keyboard(current),
         )
     elif action == "expiry":
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
@@ -192,7 +288,11 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         enabled = not bool(user.get("adhd_mode"))
         await repo.toggle_adhd(db, user["id"], enabled)
-        text = "ADHD-режим включён: буду показывать только 3–5 пунктов и дробить задачи." if enabled else "ADHD-режим выключен."
+        text = (
+            "ADHD-режим включён: буду показывать меньше задач в /today и дробить шаги, чтобы не перегружать."
+            if enabled
+            else "ADHD-режим выключен."
+        )
         await callback.message.answer(text, reply_markup=main_menu_keyboard())
         await callback.answer("Обновлено")
         return
@@ -231,9 +331,13 @@ async def settings_affirm_mode(callback: types.CallbackQuery, db) -> None:
         "evening": "только вечером",
         "both": "утром и вечером",
     }
-    await callback.message.answer(
-        f"Аффирмации теперь {labels[mode]}. Если станет слишком много — всегда можно вернуть режим «выкл».",
-        reply_markup=main_menu_keyboard(),
+    wellness = await repo.get_wellness(db, user["id"])
+    current = (wellness or {}).get("affirm_mode", mode)
+    await safe_edit(
+        callback.message,
+        "Могу иногда подкидывать короткую фразу поддержки.\n"
+        f"Режим: {labels[current]}. Если станет слишком много — можно вернуть «Выкл».",
+        reply_markup=_affirm_keyboard(current),
     )
     await callback.answer("Сохранено")
 
@@ -268,7 +372,12 @@ async def settings_timezone(message: types.Message, state: FSMContext, db) -> No
             except Exception:
                 pass
         if not computed_tz:
-            await message.answer("Не поняла. Можно прислать текущее время (HH:MM) или таймзону вида Europe/Moscow, UTC+3.")
+            await message.answer(
+                texts.error(
+                    "не поняла. Можно прислать текущее время (HH:MM) или таймзону вида Europe/Moscow, UTC+3. "
+                    "Если запутаешься — можно вернуться к этому позже, остальные настройки сохранятся."
+                ),
+            )
             return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await repo.update_user_timezone(db, user["id"], tz)
@@ -283,7 +392,7 @@ async def settings_wake(message: types.Message, state: FSMContext, db) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
         await message.answer(
-            texts.error("не распознала время. Формат HH:MM, например 07:30."),
+            texts.error("не распознала время. Формат HH:MM, например 07:30. Если сейчас не до этого — можно вернуться к настройкам позже."),
         )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -300,7 +409,7 @@ async def settings_sleep(message: types.Message, state: FSMContext, db) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
         await message.answer(
-            texts.error("не распознала время. Формат HH:MM, например 23:30."),
+            texts.error("не распознала время. Формат HH:MM, например 23:30. Если сейчас не хочется менять — можно оставить как есть."),
         )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -350,7 +459,7 @@ async def settings_routine_time(message: types.Message, state: FSMContext, db) -
     hhmm = message.text.strip()
     if not parse_hhmm(hhmm):
         await message.answer(
-            texts.error("не распознала время. Формат HH:MM, например 07:30."),
+            texts.error("не распознала время. Формат HH:MM, например 07:30. Если сейчас сложно с цифрами — можно вернуться к этому позже, настройки не сломаются."),
         )
         return
     data = await state.get_data()

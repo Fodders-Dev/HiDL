@@ -8,6 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import repositories as repo
 from utils.time import local_date_str, should_trigger, tzinfo_from_string
+from utils.logger import log_debug
 
 
 class ReminderScheduler:
@@ -38,11 +39,13 @@ class ReminderScheduler:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                log_debug(f"[tick] skip user={user['id']} pause_until={user['pause_until']}")
                 continue
             await repo.ensure_user_routines(self.conn, user["id"])
             routines = await repo.list_user_routines(self.conn, user["id"])
             for routine in routines:
                 if routine["last_sent_date"] == local_date:
+                    log_debug(f"[tick] routine already sent user={user['id']} routine={routine['routine_id']} date={local_date}")
                     continue
                 if not should_trigger(
                     now_utc, user["timezone"], routine["reminder_time"], window_minutes=2
@@ -76,6 +79,7 @@ class ReminderScheduler:
                 continue
             plan = dict(plan)
             if plan.get("morning_sent") == local_date:
+                log_debug(f"[day_plan] already sent user={user['id']} date={local_date}")
                 continue
             wake_time = user.get("wake_up_time") or "08:00"
             if not should_trigger(now_utc, user["timezone"], wake_time, window_minutes=15):
@@ -107,6 +111,7 @@ class ReminderScheduler:
             )
             await self.bot.send_message(chat_id=user["telegram_id"], text="\n".join(lines), reply_markup=kb)
             await repo.mark_day_plan_morning_sent(self.conn, plan["id"], local_date)
+            log_debug(f"[day_plan] sent user={user['id']} items={len(items)} date={local_date}")
 
     async def _tick_meds(self) -> None:
         """Пинг по витаминам/таблеткам на основе meds/med_logs."""
@@ -181,6 +186,7 @@ class ReminderScheduler:
         for reminder in reminders:
             reminder = dict(reminder)
             if reminder["last_sent_date"] == local_date:
+                log_debug(f"[custom] skip already sent user={user['id']} rem={reminder['id']} date={local_date}")
                 continue
             if reminder["last_sent_date"]:
                 try:
@@ -188,6 +194,10 @@ class ReminderScheduler:
                     current_date = datetime.date.fromisoformat(local_date)
                     delta_days = (current_date - last_date).days
                     if delta_days < reminder["frequency_days"]:
+                        log_debug(
+                            f"[custom] skip freq user={user['id']} rem={reminder['id']} "
+                            f"delta_days={delta_days} freq_days={reminder['frequency_days']}"
+                        )
                         continue
                 except Exception:
                     pass
@@ -197,12 +207,21 @@ class ReminderScheduler:
                 tzinfo = tzinfo_from_string(tz)
                 local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
                 if local_dt.weekday() != reminder["target_weekday"]:
+                    log_debug(
+                        f"[custom] skip weekday user={user['id']} rem={reminder['id']} "
+                        f"today_wd={local_dt.weekday()} target_wd={reminder['target_weekday']}"
+                    )
                     continue
             if not should_trigger(
                 now_utc, user["timezone"], reminder["reminder_time"], window_minutes=2
             ):
+                log_debug(
+                    f"[custom] not in window user={user['id']} rem={reminder['id']} "
+                    f"time={reminder['reminder_time']} now_utc={now_utc.isoformat()}"
+                )
                 continue
             await self._send_custom(user, reminder, local_date)
+            log_debug(f"[custom] send user={user['id']} rem={reminder['id']} time={reminder['reminder_time']} date={local_date}")
             await repo.set_custom_reminder_sent(self.conn, reminder["id"], local_date)
             await repo.log_custom_task(
                 self.conn,
@@ -297,6 +316,9 @@ class ReminderScheduler:
         )
         await self.bot.send_message(
             chat_id=user["telegram_id"], text=text, reply_markup=keyboard
+        )
+        log_debug(
+            f"[custom] delivered user={user['id']} rem={reminder['id']} time={reminder['reminder_time']} date={local_date}"
         )
 
     async def _tick_wellness(self) -> None:

@@ -13,6 +13,7 @@ class Settings:
     bot_token: str
     database_url: str
     default_timezone: str = "UTC"
+    debug_log: bool = False
 
 
 def get_settings() -> Settings:
@@ -22,4 +23,5 @@ def get_settings() -> Settings:
         raise ValueError("BOT_TOKEN is required. Put it in .env or environment.")
 
     database_url = os.getenv("DATABASE_URL", "sqlite:///hidl.db")
-    return Settings(bot_token=bot_token, database_url=database_url)
+    debug_log = os.getenv("DEBUG_LOG", "0").lower() in {"1", "true", "yes"}
+    return Settings(bot_token=bot_token, database_url=database_url, debug_log=debug_log)

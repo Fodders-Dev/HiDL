@@ -37,6 +37,8 @@ from handlers import (
 from middlewares.db import DbSessionMiddleware
 from middlewares.ensure_user import EnsureUserMiddleware
 from middlewares.error_log import ErrorLogMiddleware
+from middlewares.debug_log import DebugLogMiddleware
+from utils.logger import DEBUG_ENABLED, log_debug
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,9 @@ async def create_app(test_mode: bool = False) -> AppContext:
     dp.update.middleware(DbSessionMiddleware(conn))
     dp.update.middleware(EnsureUserMiddleware(conn))
     dp.update.middleware(ErrorLogMiddleware())
+    if settings.debug_log or DEBUG_ENABLED:
+        dp.update.middleware(DebugLogMiddleware())
+        log_debug("[setup] DebugLogMiddleware enabled")
 
     # роутеры
     dp.include_router(start.router)

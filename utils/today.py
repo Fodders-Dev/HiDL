@@ -162,11 +162,11 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     finance_line = await payday_summary(db, user, local_date)
     home_summary = ""
     if reg_due:
-        names = ", ".join(r["title"] for r in reg_due[:2])
-        extra = "" if len(reg_due) <= 2 else f" и ещё {len(reg_due)-2}"
-        home_summary = f"🧹 Дом: сегодня {len(reg_due)} дела — {names}{extra}."
+        # В кратком резюме не перечисляем все задачи по дому, чтобы не
+        # дублировать список ниже в блоке «Регулярка по дому».
+        home_summary = f"🧹 Дом: сегодня {len(reg_due)} дела по дому."
     else:
-        home_summary = "🧹 Дом: на эту неделю всё чисто, можно отдохнуть."
+        home_summary = "🧹 Дом: на эту неделю всё чисто, можно выдохнуть."
     if finance_line:
         summary_lines.append(finance_line)
     if home_summary:

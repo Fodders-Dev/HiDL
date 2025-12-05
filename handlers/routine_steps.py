@@ -10,6 +10,7 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.time import local_date_str
 from utils.user import ensure_user
+from utils.rows import row_to_dict
 
 
 router = Router()
@@ -41,6 +42,7 @@ async def _render_steps(message: types.Message, db, user_id: int, routine_type: 
     if not routine:
         await message.answer("Не нашла такую рутину.")
         return
+    routine = row_to_dict(routine)
     steps_rows = await repo.list_routine_steps_for_routine(db, user_id, routine["id"], include_inactive=True)
     steps = [dict(s) for s in steps_rows]
     if not steps:
@@ -231,4 +233,3 @@ async def routine_step_trigger_set(callback: types.CallbackQuery, db) -> None:
     await callback.message.answer("Обновила привязку шага.", reply_markup=main_menu_keyboard())
     await _render_steps(callback.message, db, user["id"], routine_type)
     await callback.answer()
-

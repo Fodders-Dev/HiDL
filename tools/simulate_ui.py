@@ -26,6 +26,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
     User,
 )
@@ -45,6 +46,26 @@ class KeyboardState:
     reply_buttons: List[str]
     inline_buttons: List[str]
     inline_callback_data: List[str]
+
+
+def _flatten_reply_keyboard(markup: ReplyKeyboardMarkup) -> List[str]:
+    """Helper to flatten reply keyboard rows into a simple list of labels."""
+    buttons: List[str] = []
+    for row in markup.keyboard:
+        for button in row:
+            buttons.append(button.text)
+    return buttons
+
+
+def _flatten_inline_keyboard(markup: InlineKeyboardMarkup) -> tuple[List[str], List[str]]:
+    """Helper to flatten inline keyboard rows into labels and callback_data."""
+    labels: List[str] = []
+    data: List[str] = []
+    for row in markup.inline_keyboard:
+        for button in row:
+            labels.append(button.text or "")
+            data.append(button.callback_data or "")
+    return labels, data
 
 
 class TerminalRenderer:
@@ -95,23 +116,30 @@ class TerminalRenderer:
         message: Message,
         reply_markup: Optional[ReplyKeyboardMarkup | InlineKeyboardMarkup],
     ) -> None:
+        # Текст сообщения.
         print("[HiDL]")
         print(message.text or "")
         print()
 
-        reply_buttons: List[str] = []
+        # Reply‑клавиатура в Telegram живёт «под» чатом и не исчезает,
+        # пока её явно не заменили или не убрали. Поэтому:
+        # - если пришёл ReplyKeyboardMarkup — обновляем список;
+        # - если ReplyKeyboardRemove — очищаем;
+        # - если InlineKeyboardMarkup или None — оставляем предыдущие reply‑кнопки.
+        prev = self._last_keyboard
+        reply_buttons: List[str] = prev.reply_buttons
         inline_buttons: List[str] = []
         inline_callback_data: List[str] = []
 
         if isinstance(reply_markup, ReplyKeyboardMarkup):
-            for row in reply_markup.keyboard:
-                for button in row:
-                    reply_buttons.append(button.text)
-        elif isinstance(reply_markup, InlineKeyboardMarkup):
-            for row in reply_markup.inline_keyboard:
-                for button in row:
-                    inline_buttons.append(button.text or "")
-                    inline_callback_data.append(button.callback_data or "")
+            reply_buttons = _flatten_reply_keyboard(reply_markup)
+        elif isinstance(reply_markup, ReplyKeyboardRemove):
+            reply_buttons = []
+
+        # Inline‑кнопки привязаны к конкретному сообщению, поэтому их
+        # всегда пересчитываем с нуля для текущего сообщения.
+        if isinstance(reply_markup, InlineKeyboardMarkup):
+            inline_buttons, inline_callback_data = _flatten_inline_keyboard(reply_markup)
 
         # Reply‑кнопки.
         print("Reply‑кнопки:")
@@ -333,6 +361,23 @@ async def main_async(args: Sequence[str]) -> None:
     scenario_parser.add_argument("name", help="имя сценария")
 
     parsed = parser.parse_args(list(args))
+
+    # В тестовом режиме используем отдельную БД симулятора.
+    # Для сценариев важно получать «чистого» пользователя, поэтому
+    # перед запуском сценария пробуем сбросить файл БД.
+    if parsed.mode == "scenario":
+        try:
+            import os
+            from pathlib import Path
+
+            root = Path(__file__).resolve().parents[1]
+            sim_db = root / "hidl_simulator.db"
+            if sim_db.exists():
+                os.remove(sim_db)
+        except Exception:
+            # Если не получилось удалить БД — продолжаем, просто сценарий
+            # будет работать с уже существующим состоянием.
+            pass
 
     ctx = await create_app(test_mode=True)
 

@@ -172,6 +172,11 @@ async def routine_finish(callback: types.CallbackQuery, db) -> None:
     routine = dict(routine_row) if routine_row else {}
     title = routine.get("title", "Рутина")
     await callback.answer("Закончила.")
-    await callback.message.edit_text(
-        tone_ack("soft", f"{title} завершена, +{points} очков"), reply_markup=main_menu_keyboard()
-    )
+    text = tone_ack("soft", f"{title} завершена, +{points} очков")
+    # Убираем inline-кнопки редактированием без клавиатуры.
+    try:
+        await callback.message.edit_text(text, reply_markup=None)
+    except Exception:
+        await callback.message.answer(text, reply_markup=None)
+    # Отдельно кидаем меню, потому что edit_text не принимает ReplyKeyboardMarkup.
+    await callback.message.answer(text, reply_markup=main_menu_keyboard())

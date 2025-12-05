@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 WEEKDAY_MAP = {
     "понедельник": 0,
@@ -28,7 +28,7 @@ class ParsedCommand:
 
 def parse_expense(text: str) -> Optional[ParsedCommand]:
     txt = text.lower().strip()
-    m = re.search(r"(-|\+)?\\s*(\\d+[\\.,]?\\d*)", txt)
+    m = re.search(r"(-|\+)?\s*(\d+[.,]?\d*)", txt)
     if not m:
         return None
     amount = float(m.group(2).replace(",", "."))
@@ -45,55 +45,102 @@ def parse_reminder(text: str) -> Optional[ParsedCommand]:
     txt = text.lower().strip()
     if "напом" not in txt and "напиши" not in txt:
         return None
-    # время HH:MM
-    time_m = re.search(r"(\\d{1,2}:\\d{2})", txt)
-    hhmm = time_m.group(1) if time_m else None
-    # относительное время: через N часов/минут
-    rel_hours = None
-    rel_minutes = None
-    rel_m = re.search(r"через\\s+(\\d+)\\s*(час|ч)", txt)
-    if rel_m:
-        rel_hours = int(rel_m.group(1))
-    rel_m = re.search(r"через\\s+(\\d+)\\s*(мин|минут)", txt)
-    if rel_m:
-        rel_minutes = int(rel_m.group(1))
-    # дата: завтра/сегодня/день недели
-    day_offset = 0
-    target_weekday = None
-    if "завтра" in txt:
-        day_offset = 1
-    elif "послезавтра" in txt:
-        day_offset = 2
-    for wd_word, wd in WEEKDAY_MAP.items():
-        if wd_word in txt:
-            target_weekday = wd
-            break
-    # частота — если есть "каждый"
-    freq_days = None
-    if "каждый" in txt or "каждые" in txt:
-        if target_weekday is not None:
-            freq_days = 7
-        else:
-            # если нет явного дня недели — раз в сутки
-            freq_days = 1
-    # текст напоминания — всё после времени или слово после "напомни"
-    title = ""
+
+    def _extract_time(src: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+        """Return (hhmm, rel_hours, rel_minutes)."""
+        m = re.search(r"\b(\d{1,2})[:.](\d{2})\b", src)
+        if m:
+            return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}", None, None
+        m = re.search(r"\bв\s*(\d{1,2})(?!\d)", src)
+        if m:
+            return f"{int(m.group(1)):02d}:00", None, None
+        m = re.search(r"через\s+(\d+)\s*(час|ч)", src)
+        if m:
+            return None, int(m.group(1)), None
+        m = re.search(r"через\s+(\d+)\s*(мин|минут)", src)
+        if m:
+            return None, None, int(m.group(1))
+        if "полчас" in src:
+            return None, None, 30
+        return None, None, None
+
+    def _extract_day_offset(src: str) -> int:
+        if "послезавтра" in src:
+            return 2
+        if "завтра" in src:
+            return 1
+        if "сегодня" in src:
+            return 0
+        m = re.search(r"через\s+(\d+)\s*(дн|день|дня)", src)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 0
+        return 0
+
+    def _extract_weekday(src: str) -> Optional[int]:
+        for wd_word, wd in WEEKDAY_MAP.items():
+            if re.search(rf"\b{wd_word}\b", src):
+                return wd
+        return None
+
+    def _extract_freq(src: str, target_wd: Optional[int]) -> Tuple[Optional[int], bool]:
+        once = False
+        if re.search(r"однократ|только\s+один\s+раз|разово", src):
+            return 9999, True
+        if re.search(r"ежеднев|кажд\w*\s+день", src):
+            return 1, False
+        if "через день" in src:
+            return 2, False
+        m = re.search(r"кажд\w*\s+(\d+)\s*дн", src)
+        if m:
+            try:
+                return int(m.group(1)), False
+            except Exception:
+                pass
+        if re.search(r"раз\s+в\s+нед", src) or "еженед" in src:
+            return 7, False
+        if target_wd is not None and ("кажд" in src or "по " in src):
+            return 7, False
+        return None, once
+
+    hhmm, rel_hours, rel_minutes = _extract_time(txt)
+    day_offset = _extract_day_offset(txt)
+    target_weekday = _extract_weekday(txt)
+    freq_days, once_flag = _extract_freq(txt, target_weekday)
+
+    cleanup_patterns = [
+        r"(?i)\bнапомни( мне)?\b",
+        r"(?i)\bнапиши\b",
+        r"(?i)\bпоставь\s+напоминание\b",
+        r"(?i)\bзавтра\b",
+        r"(?i)\bпослезавтра\b",
+        r"(?i)\bсегодня\b",
+        r"(?i)\bраз\s+в\s+неделю\b",
+        r"(?i)\bкажд\w+\b",
+        r"(?i)\bеженед\w*\b",
+        r"(?i)\bежеднев\w*\b",
+        r"(?i)\bчерез\s+\d+\s*(час|ч|мин|минут|дн|день|дня)\b",
+    ]
+    title_src = text
     if hhmm:
-        title = txt.split(hhmm, 1)[1].strip()
-    elif "напомни" in txt:
-        title = txt.split("напомни", 1)[1].strip()
-    elif "напиши" in txt:
-        title = txt.split("напиши", 1)[1].strip()
+        cleanup_patterns.append(re.escape(hhmm))
+    for pat in cleanup_patterns:
+        title_src = re.sub(pat, " ", title_src)
+    title = re.sub(r"\s+", " ", title_src).strip(" ,.;:-")
+
     return ParsedCommand(
         type="reminder",
         payload={
             "time": hhmm,
-            "title": title,
+            "title": title or "Напоминание",
             "rel_hours": rel_hours,
             "rel_minutes": rel_minutes,
             "day_offset": day_offset,
             "target_weekday": target_weekday,
             "freq_days": freq_days,
+            "one_time": once_flag,
         },
     )
 
@@ -105,7 +152,7 @@ def parse_home(text: str) -> Optional[ParsedCommand]:
     if "план" in txt and "дом" in txt:
         return ParsedCommand(type="home", payload={"action": "home_plan"})
     if "перенеси" in txt or "отложи" in txt:
-        m = re.search(r"(\\d+)", txt)
+        m = re.search(r"(\d+)", txt)
         days = int(m.group(1)) if m else 1
         return ParsedCommand(type="home", payload={"action": "postpone", "days": days})
     if "дом" in txt or "что по дому" in txt:
