@@ -47,10 +47,12 @@ def check_mom_tips() -> None:
     data = json.loads(tips_path.read_text(encoding="utf-8"))
     if not isinstance(data, list) or not data:
         raise AssertionError("mom_tips.json пустой или неверный формат")
-    required_fields = {"id", "title", "tags", "body"}
+    required_fields = {"id", "title", "tags"}
     for tip in data[:5]:
         if not required_fields.issubset(set(tip.keys())):
             raise AssertionError(f"mom_tips.json: нет нужных полей в {tip}")
+        if not isinstance(tip.get("body") or tip.get("tips"), list):
+            raise AssertionError(f"mom_tips.json: ожидается список в body/tips у {tip.get('id')}")
 
 
 def main() -> int:

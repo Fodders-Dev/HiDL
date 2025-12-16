@@ -61,6 +61,7 @@ async def plan_tomorrow(message: types.Message, state: FSMContext, db) -> None:
     await message.answer(
         "Давай придумаем завтрашний день.\n"
         "Напиши 1–3 самых важных дела, которые точно хочешь успеть. "
+        "Это не жёсткий список, а ориентир. Утром мы сможем что‑то убрать или добавить.\n"
         "Можно через запятую или с новой строки. Если ничего не приходит в голову — напиши «нет».",
         reply_markup=main_menu_keyboard(),
     )
@@ -93,6 +94,10 @@ async def plan_tomorrow_extra(message: types.Message, state: FSMContext, db) -> 
         extra = _split_items(message.text or "")
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await _save_plan(db, user["id"], plan_date, important, extra)
+    
+    # Award points for planning
+    await repo.add_points(db, user["id"], 1, local_date=local_date_str(datetime.datetime.utcnow(), user["timezone"]))
+    
     await state.clear()
     lines = ["Завтра для тебя главное:"]
     if important:
@@ -104,7 +109,7 @@ async def plan_tomorrow_extra(message: types.Message, state: FSMContext, db) -> 
         lines.append("\nДополнительно по жизни:")
         for title in extra:
             lines.append(f"• {title}")
-    lines.append("\nОстальное — бонус. Утром я напомню про этот план в разделе Сегодня.")
+    lines.append("\nОстальное — бонус. Утром я напомню про этот план (+1 💎 за планирование).")
     await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
 
 
@@ -118,6 +123,91 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
     local_date = local_date_str(now_utc, user["timezone"])
     items_rows = await repo.list_day_plan_items(db, user["id"], local_date)
     items = rows_to_dicts(items_rows)
+    
+    if action == "list":
+        # Пагинация: page указывается как dplan:list:0, dplan:list:1 и т.д.
+        page = 0
+        if len(parts) > 2:
+            try:
+                page = int(parts[2])
+            except ValueError:
+                page = 0
+        
+        ITEMS_PER_PAGE = 15
+        total_items = len(items)
+        total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE if total_items > 0 else 1
+        
+        # Ограничиваем page в разумных пределах
+        page = max(0, min(page, total_pages - 1))
+        
+        start_idx = page * ITEMS_PER_PAGE
+        end_idx = start_idx + ITEMS_PER_PAGE
+        page_items = items[start_idx:end_idx]
+        
+        # Текстовый список
+        lines = ["<b>🎯 План на день — детали:</b>"]
+        if not items:
+            lines.append("Пока пусто.")
+        else:
+            for item in items:
+                icon = "✅" if item.get("done") else "⬜️"
+                kind = " (важное)" if item.get("is_important") else ""
+                lines.append(f"{icon} {item.get('title')}{kind}")
+        
+        # Интерактивные кнопки для текущей страницы
+        kb_rows = []
+        for item in page_items:
+            if not item.get("done"):
+                title = (item.get("title") or "")[:30]
+                kb_rows.append([
+                    types.InlineKeyboardButton(
+                        text=f"✅ {title}",
+                        callback_data=f"dplan:done:{item.get('id')}:list:{page}"
+                    )
+                ])
+        
+        # Пагинация (если нужна)
+        pagination_row = []
+        if total_pages > 1:
+            if page > 0:
+                pagination_row.append(
+                    types.InlineKeyboardButton(text="⬅️ Пред", callback_data=f"dplan:list:{page - 1}")
+                )
+            pagination_row.append(
+                types.InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="dplan:noop")
+            )
+            if page < total_pages - 1:
+                pagination_row.append(
+                    types.InlineKeyboardButton(text="След ➡️", callback_data=f"dplan:list:{page + 1}")
+                )
+        
+        if pagination_row:
+            kb_rows.append(pagination_row)
+        
+        # Управление
+        kb_rows.append([
+            types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
+            types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
+        ])
+        kb_rows.append([
+            types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")
+        ])
+        
+        kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+        await callback.answer()
+        return
+    
+    if action == "noop":
+        # Игнорируем клик на индикатор страниц
+        await callback.answer()
+        return
+
+    if action == "hide":
+        await callback.message.delete()
+        await callback.answer()
+        return
+
     if action == "ok":
         # помечаем важные пункты как «синхронизированные» с сегодняшним днём
         important_ids = [it["id"] for it in items if it.get("is_important")]
@@ -141,12 +231,18 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             [types.InlineKeyboardButton(text=it["title"][:32], callback_data=f"dplan:del:{it['id']}")]
             for it in items
         ]
+        # button to return to list
+        kb_rows.append([types.InlineKeyboardButton(text="⬅️ Отмена", callback_data="dplan:list")])
         kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
-        await callback.message.answer("Что убрать из плана?", reply_markup=kb)
+        # Edit text
+        await callback.message.edit_text("Что убираем? Это нормально, планы меняются.", reply_markup=kb)
         await callback.answer()
         return
     if action == "add":
         await state.set_state(DayPlanState.morning_add)
+        # For 'add', we usually need user input, so sending a new message is safer/easier
+        # Or we can edit the text to prompt, but then we need to handle the message response to delete/update it.
+        # Let's keep sending new message for input to avoid FSM confusion with old messages.
         await callback.message.answer(
             "Напиши одно дело, которое хочешь добавить к сегодняшнему плану.",
             reply_markup=main_menu_keyboard(),
@@ -154,12 +250,23 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         await callback.answer()
         return
     if action == "done" and len(parts) > 2:
-        # отметка пункта плана как выполненного из /today
+        # отметка пункта плана как выполненного
+        # Формат: dplan:done:ID или dplan:done:ID:list:PAGE
         try:
             item_id = int(parts[2])
         except ValueError:
             await callback.answer()
             return
+        
+        # Определяем откуда вызвано (list/today) и текущую страницу
+        from_list = len(parts) > 3 and parts[3] == "list"
+        page = 0
+        if from_list and len(parts) > 4:
+            try:
+                page = int(parts[4])
+            except ValueError:
+                page = 0
+        
         item = next((it for it in items if it.get("id") == item_id), None)
         await repo.mark_day_plan_item_done(db, item_id, True)
         # важные дела дают больше очков
@@ -170,10 +277,80 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             extra={"user_id": user["id"], "date": local_date, "item_id": item_id, "points": base_points},
         )
         await callback.answer("Отметила дело из плана.")
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        
+        # SMART REFRESH
+        if from_list:
+            # Refresh list view, сохраняя текущую страницу
+            items_rows = await repo.list_day_plan_items(db, user["id"], local_date)
+            items = rows_to_dicts(items_rows)
+            
+            ITEMS_PER_PAGE = 15
+            total_items = len(items)
+            total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE if total_items > 0 else 1
+            page = max(0, min(page, total_pages - 1))
+            
+            start_idx = page * ITEMS_PER_PAGE
+            end_idx = start_idx + ITEMS_PER_PAGE
+            page_items = items[start_idx:end_idx]
+            
+            lines = ["<b>🎯 План на день — детали:</b>"]
+            if not items:
+                lines.append("Пока пусто.")
+            else:
+                for item in items:
+                    icon = "✅" if item.get("done") else "⬜️"
+                    kind = " (важное)" if item.get("is_important") else ""
+                    lines.append(f"{icon} {item.get('title')}{kind}")
+            
+            kb_rows = []
+            for item in page_items:
+                if not item.get("done"):
+                    title = (item.get("title") or "")[:30]
+                    kb_rows.append([
+                        types.InlineKeyboardButton(
+                            text=f"✅ {title}",
+                            callback_data=f"dplan:done:{item.get('id')}:list:{page}"
+                        )
+                    ])
+            
+            pagination_row = []
+            if total_pages > 1:
+                if page > 0:
+                    pagination_row.append(
+                        types.InlineKeyboardButton(text="⬅️ Пред", callback_data=f"dplan:list:{page - 1}")
+                    )
+                pagination_row.append(
+                    types.InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="dplan:noop")
+                )
+                if page < total_pages - 1:
+                    pagination_row.append(
+                        types.InlineKeyboardButton(text="След ➡️", callback_data=f"dplan:list:{page + 1}")
+                    )
+            
+            if pagination_row:
+                kb_rows.append(pagination_row)
+            
+            kb_rows.append([
+                types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
+                types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
+            ])
+            kb_rows.append([
+                types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")
+            ])
+            
+            kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+            try:
+                await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+            except Exception:
+                pass
+        else:
+            # Refresh /today dashboard
+            from utils.today import render_today
+            text, kb = await render_today(db, user)
+            try:
+                await callback.message.edit_text(text, reply_markup=kb or main_menu_keyboard())
+            except Exception:
+                pass
         return
     if action == "del" and len(parts) > 2:
         try:
@@ -182,6 +359,29 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             await callback.answer()
             return
         await repo.delete_day_plan_item(db, user["id"], item_id)
+        
+        # Refresh the delete menu or list?
+        # Probably go back to list or refresh delmenu.
+        # Let's go back to list to show it's gone.
+        items_rows = await repo.list_day_plan_items(db, user["id"], local_date)
+        items = rows_to_dicts(items_rows)
+        lines = ["<b>🎯 План на день — детали:</b>"]
+        if not items:
+            lines.append("Пока пусто.")
+        for item in items:
+            icon = "✅" if item.get("done") else "⬜️"
+            kind = " (важное)" if item.get("is_important") else ""
+            lines.append(f"{icon} {item.get('title')}{kind}")
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
+                    types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
+                ],
+                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")]
+            ]
+        )
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb)
         await callback.answer("Убрала из плана.")
         return
     await callback.answer()

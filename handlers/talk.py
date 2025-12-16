@@ -23,8 +23,8 @@ LLM_PROMPT = (
 @router.message(Command("talk"))
 async def talk_placeholder(message: types.Message) -> None:
     await message.answer(
-        "Поболтать: здесь будет живое общение с HiDL через нейросеть.\n"
-        "Пока заглушка. Можешь написать, что беспокоит, я отвечу обычными подсказками.",
+        "Давай поболтаем. Я пока учусь, но могу выслушать или обсудить простые вещи. "
+        "(Если совсем скучно — спроси про «книги» или «кино», но это пока эксперимент).",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -91,8 +91,7 @@ async def talk_free(message: types.Message, db) -> None:
     log_info(f"Talk fallback text: {txt}")
     base = tone_message(
         tone,
-        "Я здесь, чтобы помочь по быту и поддержать. Можешь спросить про уборку, еду, финансы или нажать нужный раздел ниже. "
-        "Если что-то тревожит — напиши пару слов, разберёмся по‑человечески.",
+        "Я рядом. Спроси про пятна, еду, или просто расскажи, как прошел день. Если нужно — нажми кнопки меню.",
     )
     text = base if not reply_llm else f"{base}\n\n{reply_llm}"
     await message.answer(text, reply_markup=main_menu_keyboard())

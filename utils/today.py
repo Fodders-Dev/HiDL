@@ -143,7 +143,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     meds_total, meds_taken = await repo.meds_stats_for_date(db, user["id"], local_date)
 
     # summary block
-    points7 = await repo.points_window(db, user["id"], days=7)
+    points_week = await repo.points_week(db, user["id"], local_date)
     points_today = await repo.points_today(db, user["id"], local_date)
     streak = await repo.points_streak(db, user["id"], today=local_date)
     stats_r = await repo.routine_stats(db, user["id"], days=1)
@@ -154,7 +154,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     routine_done_cnt = sum(r["cnt"] for r in stats_r if r["status"] == "done")
     routine_total_cnt = sum(r["cnt"] for r in stats_r)
     summary_lines = [
-        f"🎯 Очки: сегодня {points_today}, за 7 дней {points7}, стрик {streak} дн.",
+        f"🎯 Очки: сегодня {points_today}, за неделю {points_week}, стрик {streak} дн.",
         f"✅ Прогресс: {done_today}/{important_total or total_today or 0} задач за сегодня",
         f"🌞 Рутины: {routine_done_cnt}/{routine_total_cnt} пунктов за сегодня",
         gentle_streak(streak),
@@ -238,18 +238,37 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     if bills_lines:
         blocks.append("<b>📅 Счета в ближайшие дни:</b>\n" + "\n".join(bills_lines))
     if plan_items:
-        plan_lines = ["<b>🎯 План на день — детали:</b>"]
-        for item in plan_items:
-            icon = "✅" if item.get("done") else "⬜️"
-            kind = " (важное)" if item.get("is_important") else ""
-            plan_lines.append(f"{icon} {item.get('title')}{kind}")
-        blocks.append("\n".join(plan_lines))
+        # Если слишком много пунктов, прячем детали (особенно в ADHD-режиме)
+        show_details = True
+        if len(plan_items) > 5:
+            show_details = False
+        
+        if show_details:
+            plan_lines = ["<b>🎯 План на день — детали:</b>"]
+            for item in plan_items:
+                icon = "✅" if item.get("done") else "⬜️"
+                kind = " (важное)" if item.get("is_important") else ""
+                plan_lines.append(f"{icon} {item.get('title')}{kind}")
+            blocks.append("\n".join(plan_lines))
+        # Если скрыли, верхняя строка саммари (строки 174-178) уже покажет статус
+
+    # Footer для ADHD режима
+    if adhd:
+        blocks.append("\n<i>В ADHD‑режиме я показываю не больше 3 пунктов в списках, остальное — по кнопкам.</i>")
 
     kb_buttons = []
-    kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
-    kb_buttons.append([types.InlineKeyboardButton(text="📅 План по дому", callback_data="home:week")])
+    has_any_reminders = bool(custom)
+    if has_any_reminders:
+        kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
+    else:
+        kb_buttons.append([types.InlineKeyboardButton(text="➕ Добавить напоминание", callback_data="rem:add")])
+    kb_buttons.append([types.InlineKeyboardButton(text="🧹 План по дому", callback_data="home:week")])
+    kb_buttons.append([types.InlineKeyboardButton(text="📅 План на день", callback_data="dplan:list")])
     kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
     kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
+    
+    # Кнопка для просмотра скрытого плана - УДАЛЕНА, так как теперь есть кнопка "План на день" выше.
+
     if meds_total:
         kb_buttons.append(
             [types.InlineKeyboardButton(text="Таблетки", callback_data="meds:today")]
@@ -258,20 +277,8 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         kb_buttons.append(
             [types.InlineKeyboardButton(text="Продукты", callback_data="pantry:expiring")]
         )
-    # быстрые кнопки для плана дня (ограничим тремя пунктами)
-    if plan_items:
-        for item in plan_items[:3]:
-            if item.get("done"):
-                continue
-            title = (item.get("title") or "")[:24]
-            kb_buttons.append(
-                [
-                    types.InlineKeyboardButton(
-                        text=f"🎯 {title}",
-                        callback_data=f"dplan:done:{item.get('id')}",
-                    )
-                ]
-            )
+    # Быстрые кнопки для плана дня - УДАЛЕНЫ
+    # Теперь все дела доступны через интерактивную кнопку "📅 План на день"
     inline_kb = types.InlineKeyboardMarkup(inline_keyboard=kb_buttons)
 
     return "\n\n".join(blocks), inline_kb

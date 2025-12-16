@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.bot import DefaultBotProperties
 
 from config import get_settings
 from db.database import connect, init_db
@@ -23,7 +25,7 @@ from handlers import (
     movement,
     routines,
     day_plan,
-    pantry,
+    kitchen,
     settings as settings_handler,
     start,
     stats,
@@ -60,8 +62,9 @@ async def create_app(test_mode: bool = False) -> AppContext:
     settings = get_settings()
     database_url = settings.database_url
     if test_mode:
-        # отдельный файл БД для симуляций, чтобы не трогать боевые данные
-        database_url = "sqlite:///hidl_simulator.db"
+        # отдельная БД для симуляций, чтобы не трогать боевые данные.
+        # Можно переопределить через env, чтобы избежать проблем с lock на Windows.
+        database_url = os.environ.get("HIDL_SIM_DB_URL", "sqlite:///hidl_simulator.db")
         logger.info("create_app in test mode, db=%s", database_url)
 
     conn = await connect(database_url)
@@ -74,7 +77,7 @@ async def create_app(test_mode: bool = False) -> AppContext:
         bot_token = "123456:SIMULATOR_FAKE_TOKEN"
     else:
         bot_token = settings.bot_token
-    bot = Bot(token=bot_token, parse_mode="HTML")
+    bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode="HTML"))
 
     dp = Dispatcher()
     dp.update.middleware(DbSessionMiddleware(conn))
@@ -100,7 +103,7 @@ async def create_app(test_mode: bool = False) -> AppContext:
     dp.include_router(home_supplies.router)
     dp.include_router(movement.router)
     dp.include_router(meds.router)
-    dp.include_router(pantry.router)
+    dp.include_router(kitchen.router)
     dp.include_router(donate.router)
     dp.include_router(stats.router)
     dp.include_router(natural.router)

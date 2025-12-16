@@ -55,8 +55,8 @@ async def meds_menu(message: types.Message, db) -> None:
     meds_rows = await repo.list_meds(db, user["id"], active_only=False)
     if not meds_rows:
         await message.answer(
-            "Витамины и таблетки пока не заведены.\n"
-            "Нажми «Добавить», чтобы я напоминала о чём-то конкретном.",
+            "Забота о себе — это база. Давай настроим напоминания о витаминах и лекарствах, без давления.\n\n"
+            "Пока ничего нет. Нажми «Добавить», чтобы я напоминала о чём-то конкретном.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить", callback_data="med:add")]]
             ),
@@ -212,7 +212,7 @@ async def med_times(message: types.Message, state: FSMContext, db) -> None:
         times = _parse_times(raw)
     except Exception:
         await message.answer(
-            texts.error("время нужно в формате HH:MM, например 09:00 или 09:00,21:00."),
+            texts.error("не поняла время. Напиши, например, 09:00 или 21:30."),
         )
         return
     # нормализуем schedule_type относительно количества времён
@@ -411,8 +411,7 @@ async def meds_today(callback: types.CallbackQuery, db) -> None:
         extra = " (отмечено)" if taken else ""
         lines.append(f"{mark} {time} — {name} {dose}{extra}")
     lines.append(
-        "\nЯ напоминаю о приёме, но не ставлю диагнозы и не заменяю назначения врача. "
-        "Если есть сомнения по курсу — лучше обсудить это с доктором."
+        "\nЯ просто напоминаю, но я не врач. Если есть сомнения — лучше обсуди это с доктором."
     )
     await callback.message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
     await callback.answer()

@@ -99,6 +99,16 @@ async def _compose_spent_week(db, user) -> str:
         return "За последние 7 дней расходов не записано."
     lines = [f"{cat}: {format_money(amt)}" for cat, amt in per_cat.items()]
     text = f"Траты за 7 дней: {format_money(total)}\n" + "\n".join(lines)
+    
+    import random
+    phrases = [
+        "Ты молодец, что следишь за этим.",
+        "Цифры — это просто цифры, главное — осознанность.",
+        "Заглядывать в расходы полезно, чтобы не тревожиться.",
+        "Всё под контролем.",
+    ]
+    text += f"\n\n<i>{random.choice(phrases)}</i>"
+
     budget = await repo.get_budget(db, user["id"])
     if budget:
         budget = dict(budget)
@@ -249,11 +259,8 @@ async def money_menu_entry(message: types.Message, state: FSMContext, db) -> Non
         ]
     )
     await message.answer(
-        "Деньги:\n"
-        "• Записать новую трату\n"
-        "• Посмотреть отчёт за неделю\n"
-        "• Настроить лимиты по категориям и общий месячный бюджет\n"
-        "• Управлять регулярными счетами и напоминаниями об оплате",
+        "Финансы — это не страшно. Я помогу следить за расходами, чтобы деньги не "
+        "исчезали в неизвестность.\n\nВыбери действие:",
         reply_markup=kb,
     )
 
@@ -264,7 +271,7 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
     action = callback.data.split(":")[1]
     if action == "spent":
         await state.set_state(SpendState.amount)
-        await callback.message.answer("Сколько потратил?")
+        await callback.message.answer("Сколько ушло? Напиши сумму, или сразу сумму и категорию (например «500 еда»).")
     elif action == "report":
         user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         text = await _compose_spent_week(db, user)

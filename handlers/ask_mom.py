@@ -12,6 +12,7 @@ from keyboards.common import main_menu_keyboard
 from utils.nl_parser import parse_command
 from utils.time import local_date_str
 from utils.tone import tone_message, tone_ack
+from services.knowledge import get_knowledge_service
 
 router = Router()
 
@@ -133,7 +134,7 @@ async def ask_mom_entry(message: types.Message, state: FSMContext) -> None:
             await message.answer(_tip_to_text(tip), reply_markup=_tip_actions_kb(tip.get("id")))
             return
     await message.answer(
-        "Напиши, в чём проблема, или выбери тему. Я отвечу по‑маминому: коротко и без шейминга.",
+        "Мама на связи. Я могу подсказать по быту (отстирать пятно, сварить яйцо), или просто поддержать. Выбери тему:",
         reply_markup=ask_menu_keyboard(),
     )
 
@@ -196,6 +197,15 @@ async def handle_question(message: types.Message, question: str) -> None:
                 break
     if not tip and "сил" in question.lower():
         tip = EXTRA_TIPS["low_energy"]
+    
+    # Попробуем найти в Базе Знаний
+    if not tip:
+        ks = get_knowledge_service()
+        kb_results = ks.search(question)
+        if kb_results:
+            await message.answer(kb_results[0], reply_markup=ask_menu_keyboard())
+            return
+    
     if tip:
         lines = [f"{tip.get('title','Совет')}:"]
         lines += [f"• {b}" for b in tip.get("body", [])]
@@ -238,10 +248,16 @@ async def ask_start(callback: types.CallbackQuery, state: FSMContext) -> None:
         )
     elif kind == "cleaning":
         await state.clear()
-        await send_tip(callback.message, "уборка")
-        extra = EXTRA_TIPS.get("clean_shortcuts")
-        if extra:
-            await callback.message.answer(_tip_to_text(extra), reply_markup=main_menu_keyboard())
+        # Сначала попробуем из Базы Знаний
+        ks = get_knowledge_service()
+        kb_tip = ks.get_random_cleaning_tip()
+        if kb_tip:
+            await callback.message.answer(kb_tip, reply_markup=main_menu_keyboard())
+        else:
+            await send_tip(callback.message, "уборка")
+            extra = EXTRA_TIPS.get("clean_shortcuts")
+            if extra:
+                await callback.message.answer(_tip_to_text(extra), reply_markup=main_menu_keyboard())
     elif kind == "cook":
         await start_cook_flow(callback.message, state)
     elif kind == "odor":
@@ -255,7 +271,13 @@ async def ask_start(callback: types.CallbackQuery, state: FSMContext) -> None:
         await send_tip(callback.message, "home")
     elif kind == "health":
         await state.clear()
-        await send_tip(callback.message, "health")
+        # Попробуем из Базы Знаний self-care
+        ks = get_knowledge_service()
+        kb_tip = ks.get_self_care_tip()
+        if kb_tip:
+            await callback.message.answer(kb_tip, reply_markup=main_menu_keyboard())
+        else:
+            await send_tip(callback.message, "health")
     elif kind == "free":
         await state.clear()
         await callback.message.answer("Напиши свой вопрос текстом. Я отвечу по ситуации.", reply_markup=main_menu_keyboard())

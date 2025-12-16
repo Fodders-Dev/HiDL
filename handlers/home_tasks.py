@@ -1,5 +1,6 @@
 import datetime
 from typing import List, Optional
+import json
 
 import aiosqlite
 
@@ -65,7 +66,10 @@ def _regular_keyboard(tasks):
             ]
         )
     rows.append([InlineKeyboardButton(text="📋 Все дела по дому", callback_data="home:all")])
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    rows.append([InlineKeyboardButton(text="⬅️ Дом", callback_data="home:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Дом", callback_data="home:menu")]]
+    )
 
 
 def _all_tasks_keyboard(tasks):
@@ -81,7 +85,10 @@ def _all_tasks_keyboard(tasks):
                 InlineKeyboardButton(text="🗑", callback_data=f"hall:hide:{row['id']}"),
             ]
         )
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    rows.append([InlineKeyboardButton(text="⬅️ Дом", callback_data="home:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Дом", callback_data="home:menu")]]
+    )
 
 
 def _paginate_tasks(tasks: list[dict], page: int, per_page: int = 6) -> tuple[list[dict], InlineKeyboardMarkup | None]:
@@ -109,6 +116,7 @@ def _paginate_tasks(tasks: list[dict], page: int, per_page: int = 6) -> tuple[li
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"hall:page:{page+1}"))
         kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Дом", callback_data="home:menu")])
     return slice_tasks, InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
 
 
@@ -329,348 +337,295 @@ async def hall_page(callback: types.CallbackQuery, db) -> None:
     await callback.answer()
 
 
-# --- Уборка сейчас ---
+# --- Cleaning 2.0 Session Logic ---
 
-def _clean_type_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✨ Быстрый порядок", callback_data="clean:type:surface")],
-            [InlineKeyboardButton(text="🧹 Нормальная уборка", callback_data="clean:type:normal")],
-            [InlineKeyboardButton(text="🧽 Одна зона поглубже", callback_data="clean:type:deep")],
-        ]
-    )
+class CleanState(StatesGroup):
+    choosing_zones = State()
+    choosing_mode = State()
+    active_session = State()
 
 
-def _clean_energy_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Почти не живая", callback_data="clean:energy:low")],
-            [InlineKeyboardButton(text="Могу нормально", callback_data="clean:energy:mid")],
-            [InlineKeyboardButton(text="Готова поработать", callback_data="clean:energy:high")],
-        ]
-    )
+ZONES_CONFIG = {
+    "kitchen": "🍳 Кухня",
+    "bathroom": "🛁 Ванна/Туалет",
+    "bedroom": "🛏 Спальня",
+    "living": "🛋 Гостиная",
+    "hallway": "🚪 Прихожая",
+    "floors": "🧹 Полы (везде)",
+}
+
+CLEAN_MODES = {
+    "maintenance": "✨ Поддерживающая (15-20 мин)",
+    "deep": "🧽 Основательная (час+)",
+}
 
 
-def _zone_keyboard() -> InlineKeyboardMarkup:
-    """Выбор типа уборки/зоны для сценария «Уборка сейчас»."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 Квартира в целом", callback_data="clean:zone:flat")],
-            [
-                InlineKeyboardButton(text="🛁 Только ванна/туалет", callback_data="clean:zone:bathroom"),
-                InlineKeyboardButton(text="🍳 Только кухня", callback_data="clean:zone:kitchen"),
-            ],
-            [
-                InlineKeyboardButton(text="🧹 Только полы", callback_data="clean:zone:floors"),
-            ],
-        ]
-    )
-
-
-def _quick_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⚡ Только полы", callback_data="quick:start:floors"),
-                InlineKeyboardButton(text="🛁 Ванна/туалет", callback_data="quick:start:bathroom"),
-            ],
-            [
-                InlineKeyboardButton(text="🍳 Только кухня", callback_data="quick:start:kitchen"),
-                InlineKeyboardButton(text="🧺 Раковина и посуда", callback_data="quick:start:sink"),
-            ],
-        ]
-    )
-
-
-async def start_clean_now(callback: types.CallbackQuery, db, state: FSMContext) -> None:
-    # если уже есть активный сценарий уборки — покажем его, не стирая state
-    resumed = await _resume_any_cleanup(callback.message, state)
-    if resumed:
-        await callback.answer("Продолжаем там, где остановились.")
-        return
-    await state.clear()
-    # лёгкое предложение проветрить, без очков и обязательности
-    air_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Открыла(открыл)", callback_data="clean:air:ok"),
-                InlineKeyboardButton(text="Пропустить", callback_data="clean:air:skip"),
-            ]
-        ]
-    )
-    await callback.message.answer(
-        "Пока начнём убираться, можно открыть окно/форточку на 5–10 минут — воздух сам сделает часть работы.",
-        reply_markup=air_kb,
-    )
-    await state.set_state(CleanNowState.choose_type)
-    await callback.message.answer("Что делаем по дому?", reply_markup=_clean_type_keyboard())
-    await callback.message.answer(
-        "Нужен короткий сценарий по зоне? Выбирай ниже.",
-        reply_markup=_quick_menu_keyboard(),
-    )
-    await callback.answer()
-
-
-def _surface_steps(energy: str) -> List[dict]:
-    steps = [
-        {"text": "Собери одежду в одну корзину/стопку", "points": 1},
-        {"text": "Протри стол или главную поверхность", "points": 1},
-        {"text": "Разгрузи раковину или замочи посуду", "points": 1},
-        {"text": "Вынеси мусор, если ведро полное", "points": 2},
-    ]
-    target = 3 if energy == "low" else (4 if energy == "mid" else 5)
-    return _init_steps(steps[:target])
-
-
-def _base_prep_steps(zone: str) -> List[dict]:
-    """Быстрые подготовительные шаги — замачивание и «фоновые» процессы."""
-    common = [
-        {"text": "Собери явный мусор в пакет, вынеси если полон", "points": 2},
-        {"text": "Собери посуду в раковину/ПММ и замочи", "points": 2},
-        {"text": "Собери одежду: грязное в корзину, остальное в одну стопку", "points": 1},
-        {"text": "Если есть стиралка с бельём — запусти стирку при подходящем режиме", "points": 2},
-    ]
-    soak = []
-    if zone == "bathroom":
-        soak.append({"text": "Налей средство в унитаз и оставь. Сбрызни раковину/кран.", "points": 1})
-    if zone == "kitchen":
-        soak.append({"text": "Сбрызни плиту/рабочую поверхность средством, пусть поработает.", "points": 1})
-    return _init_steps(soak + common)
-
-
-def _zone_steps(zone: str, energy: str) -> List[dict]:
-    base = {
-        "kitchen": [
-            {"text": "Разобрать одну полку/ящик на кухне", "points": 2},
-            {"text": "Протереть фасады шкафов и ручки", "points": 2},
-            {"text": "Плита/стол: протереть жирные пятна", "points": 2},
-            {"text": "Пол/плинтус в кухне быстро пройтись", "points": 3},
-        ],
-        "bathroom": [
-            {"text": "Протереть раковину и кран", "points": 2},
-            {"text": "Быстро пройтись по унитазу/сиденью", "points": 2},
-            {"text": "Душ/ванна: ополоснуть стены, протереть уголки", "points": 3},
-            {"text": "Сменить полотенца, проветрить", "points": 2},
-        ],
-        "room": [
-            {"text": "Разобрать одну поверхность (стол/тумба)", "points": 2},
-            {"text": "Собрать мелочи в коробку «разобрать позже»", "points": 1},
-            {"text": "Пропылесосить/пройтись влажной салфеткой под кроватью/диваном", "points": 3},
-            {"text": "Протереть пыль на видимых местах", "points": 2},
-        ],
-        "hallway": [
-            {"text": "Разложить обувь, убрать грязь у входа", "points": 2},
-            {"text": "Протереть зеркало/полку в прихожей", "points": 1},
-            {"text": "Быстро пройтись пылесосом/шваброй у входа", "points": 3},
-        ],
-        "floors": [
-            {"text": "Собрать крупный мусор и крошки с пола", "points": 2},
-            {"text": "Пройтись пылесосом/веником по основным проходам", "points": 3},
-            {"text": "Протереть влажной тряпкой самые грязные участки", "points": 3},
-        ],
-    }
-    steps = base.get(zone, base["room"])
-    target = 3 if energy == "low" else (4 if energy == "mid" else 5)
-    return _init_steps(steps[:target])
-
-
-def _normal_steps(home_tasks: List[dict], energy: str) -> List[dict]:
-    steps: List[dict] = []
-    for t_raw in home_tasks[:2]:
-        t = row_to_dict(t_raw)
-        if not t.get("title") or not t.get("id"):
-            continue
-        points = t.get("points") or 3
-        steps.append({"text": f"{t['title']} (по плану)", "points": points, "task_id": t["id"]})
-    steps.extend(_surface_steps(energy))
-    target = 4 if energy == "low" else (5 if energy == "mid" else 7)
-    return _init_steps(steps[:target])
-
-
-async def _build_steps(db, user_id: int, energy: str, clean_type: str, today: str, zone: str) -> List[dict]:
-    tasks = rows_to_dicts(
-        await repo.list_regular_tasks(db, user_id, local_date=today, due_in_days=7, include_inactive=False)
-    )
-    steps: List[dict] = []
-    # параллельные процессы (замачивание/стирка) только для обычной/глубокой уборки
-    if clean_type != "surface":
-        steps.extend(_base_prep_steps(zone))
-    if clean_type == "surface":
-        steps.extend(_surface_steps(energy))
-    elif clean_type == "normal":
-        steps.extend(_normal_steps(tasks, energy))
-    else:
-        steps.extend(_zone_steps(zone, energy))
-    if zone == "bathroom":
-        steps.append({"text": "Вернись к унитазу/раковине: смой средство и протри", "points": 2})
-    elif zone == "kitchen":
-        steps.append({"text": "Вернись к плите/поверхности: протри после замачивания", "points": 2})
-    # ограничим 7 шагами максимум
-    return _init_steps(steps[:7])
-
-
-def _steps_keyboard(steps: List[dict]) -> InlineKeyboardMarkup:
+def _zones_keyboard(selected: List[str]) -> InlineKeyboardMarkup:
     rows = []
-    for idx, step in enumerate(steps):
-        status = step.get("status", "pending")
-        label = "✅" if status == "done" else ("⏭" if status == "skip" else "•")
-        rows.append(
-            [
-                InlineKeyboardButton(text=f"{label} {idx+1}", callback_data=f"clean:mark:done:{idx}"),
-                InlineKeyboardButton(text="Пропустить", callback_data=f"clean:mark:skip:{idx}"),
-            ]
-        )
+    for key, label in ZONES_CONFIG.items():
+        icon = "✅ " if key in selected else "⬜ "
+        rows.append([InlineKeyboardButton(text=f"{icon}{label}", callback_data=f"cl2:toggle:{key}")])
+    
+    action_text = "🚀 Начать" if selected else "Выбери зоны"
+    rows.append([InlineKeyboardButton(text=action_text, callback_data="cl2:confirm")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _steps_text(steps: List[dict]) -> str:
-    lines = ["Сделай эти шаги:"]
-    for idx, step in enumerate(steps):
-        status = step.get("status", "pending")
-        prefix = "✅" if status == "done" else ("⏭" if status == "skip" else "•")
-        lines.append(f"{prefix} {idx+1}. {step['text']}")
-    return "\n".join(lines)
+def _modes_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for key, label in CLEAN_MODES.items():
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"cl2:mode:{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _finish_touches(zone: str) -> str:
-    common = [
-        "Вынеси мусор, если пакет полон.",
-        "Протри вокруг раковины/крана, чтобы не было подтёков.",
-        "Быстро глянь на вход: обувь/коврик по местам.",
-    ]
-    if zone == "bedroom":
-        common.append("Если меняла постельное — отметь, что готово, +очки.")
-    if zone == "kitchen":
-        common.append("Если духовка давно не чистилась — можно заглянуть внутрь и решить, не пора ли её помыть.")
-    return "Финишные штрихи:\n" + "\n".join(f"• {t}" for t in common)
+def _session_keyboard(session_id: int, current_idx: int, total: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Готово (+XP)", callback_data=f"cl2:step:done:{session_id}"),
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"cl2:step:skip:{session_id}"),
+            ],
+            [InlineKeyboardButton(text="⏸ Пауза / Стоп", callback_data=f"cl2:pause:{session_id}")],
+        ]
+    )
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("clean:air:"))
-async def clean_air(callback: types.CallbackQuery) -> None:
-    """Ответ на предложение проветрить — без очков и дополнительной логики."""
-    action = callback.data.split(":")[2]
-    if action == "ok":
-        await callback.answer("Отлично, пусть свежий воздух помогает.")
-    else:
-        await callback.answer("Хорошо, тогда двигаемся без окна.")
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+async def _generate_flow(zones: List[str], mode: str) -> List[dict]:
+    """Генерация умного сценария уборки по фазам."""
+    flow = []
+    
+    # helper
+    def add(text, points=1, phase="main"):
+        flow.append({"text": text, "points": points, "phase": phase, "status": "pending"})
+
+    # Phase 0: Prep / Soak (Deep only)
+    if mode == "deep":
+        if "kitchen" in zones:
+            add("Замочи посуду и залей плиту средством", 2, "prep")
+        if "bathroom" in zones:
+            add("Залей унитаз и раковину средством", 2, "prep")
+    
+    # Phase 1: Global Basics (Trash & Tidy)
+    add("Пройдись с пакетом: собери весь явный мусор", 2, "trash")
+    add("Собери одежду/вещи, которые валяются не на месте", 2, "tidy")
+    
+    # Phase 2: Zones
+    if "kitchen" in zones:
+        add("Кухня: разбери одну полку или поверхность", 2, "zone")
+        add("Кухня: протри фасады и ручки", 2, "zone")
+        if mode == "deep":
+            add("Кухня: смой средство с плиты и протри насухо", 2, "zone")
+    
+    if "bathroom" in zones:
+        add("Ванная: протри зеркало", 1, "zone")
+        if mode == "deep":
+            add("Ванная: почисти унитаз и смой средство", 3, "zone")
+            add("Ванная: ополоснуть ванну/душ", 2, "zone")
+        else:
+             add("Ванная: быстро протри раковину", 2, "zone")
+
+    if "bedroom" in zones:
+        add("Спальня: заправь кровать аккуратно", 1, "zone")
+        add("Спальня: протри пыль с тумбочек", 2, "zone")
+
+    if "hallway" in zones:
+        add("Прихожая: расставь обувь ровно", 1, "zone")
+        add("Прихожая: протри входной коврик или пол у двери", 2, "zone")
+
+    # Phase 3: Floors (if explicitly selected or deep mode included)
+    if "floors" in zones or (mode == "deep" and len(zones) > 2):
+        add("Пропылесось основные проходы", 3, "floors")
+        if mode == "deep":
+             add("Протри полы влажной тряпкой", 4, "floors")
+
+    # Phase 4: Finish
+    add("Вынеси мусор, если набралось", 2, "finish")
+    add("Проветри и похвали себя!", 1, "finish")
+    
+    return flow
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("clean:type:"))
-async def clean_choose_energy(callback: types.CallbackQuery, state: FSMContext) -> None:
-    clean_type = callback.data.split(":")[2]
-    await state.update_data(clean_type=clean_type)
-    await state.set_state(CleanNowState.choose_energy)
-    await callback.message.answer("Сколько сил есть?", reply_markup=_clean_energy_keyboard())
+@router.callback_query(lambda c: c.data == "home:now")
+async def start_clean_now(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    # Check active session
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    existing = await repo.get_active_session(db, user["id"])
+    
+    if existing:
+        # Prompt to resume
+        text = "У тебя есть незавершенная уборка. Продолжим?"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Продолжить", callback_data=f"cl2:resume:{existing['id']}")],
+            [InlineKeyboardButton(text="🗑 Начать новую", callback_data="cl2:new_force")]
+        ])
+        await callback.message.answer(text, reply_markup=kb)
+        return
+
+    # Start new selection
+    await state.set_state(CleanState.choosing_zones)
+    await state.update_data(selected_zones=[])
+    await callback.message.answer("Выбери зоны для уборки (можно несколько):", reply_markup=_zones_keyboard([]))
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("clean:energy:"))
-async def clean_generate(callback: types.CallbackQuery, db, state: FSMContext) -> None:
-    energy = callback.data.split(":")[2]
-    data = await state.get_data()
-    clean_type = data.get("clean_type", "surface")
-    await state.update_data(energy=energy, clean_type=clean_type)
-    await state.set_state(CleanNowState.choose_zone)
-    await callback.message.answer("Где навести порядок в первую очередь?", reply_markup=_zone_keyboard())
-    await callback.answer()
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("clean:zone:"))
-async def clean_choose_zone(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+@router.callback_query(lambda c: c.data and c.data.startswith("cl2:toggle:"))
+async def cl2_toggle_zone(callback: types.CallbackQuery, state: FSMContext) -> None:
     zone = callback.data.split(":")[2]
     data = await state.get_data()
-    clean_type = data.get("clean_type", "surface")
-    energy = data.get("energy", "mid")
-    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    # посмотрим на бытовую химию, чтобы мягко предупредить, если чего-то нет
-    await repo.ensure_supplies(db, user["id"])
-    supplies = rows_to_dicts(await repo.list_supplies(db, user["id"]))
-    warnings: list[str] = []
-    if zone == "bathroom":
-        chem = next((s for s in supplies if (s.get("name") or "").lower().startswith("средство для унитаза")), None)
-        if chem and (chem.get("status") or "full") == "empty":
-            warnings.append(
-                "Вижу, что средство для унитаза у тебя помечено как закончившееся. "
-                "Можем сейчас просто ополоснуть и протереть, а полноценную чистку оставить после покупки."
-            )
-    if zone == "kitchen":
-        dish = next((s for s in supplies if (s.get("name") or "").lower().startswith("средство для посуды")), None)
-        if dish and (dish.get("status") or "full") == "empty":
-            warnings.append(
-                "Средство для посуды сейчас отмечено как «нет». Можно ограничиться тёплой водой "
-                "и добавить средство в список покупок, когда будет настроение."
-            )
-    steps = await _build_steps(db, user["id"], energy, clean_type, today, zone)
-    await state.update_data(steps=steps, energy=energy, today=today, zone=zone)
-    text = _steps_text(steps)
-    if warnings:
-        text = "\n".join(warnings) + "\n\n" + text
-    kb = _steps_keyboard(steps)
-    await callback.message.answer(text, reply_markup=kb)
-    await state.set_state(CleanNowState.process)
+    selected = data.get("selected_zones", [])
+    
+    if zone in selected:
+        selected.remove(zone)
+    else:
+        selected.append(zone)
+    
+    await state.update_data(selected_zones=selected)
+    await safe_edit_markup(callback.message, reply_markup=_zones_keyboard(selected))
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("clean:mark:"))
-async def clean_mark(callback: types.CallbackQuery, db, state: FSMContext) -> None:
-    parts = callback.data.split(":")
-    action = parts[2]
-    idx = int(parts[3])
+@router.callback_query(lambda c: c.data == "cl2:confirm")
+async def cl2_confirm_zones(callback: types.CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    steps: List[dict] = data.get("steps", [])
-    if idx >= len(steps):
-        await callback.answer()
+    selected = data.get("selected_zones", [])
+    if not selected:
+        await callback.answer("Выбери хотя бы одну зону!", show_alert=True)
         return
-    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    today = data.get("today") or local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    step = steps[idx]
-    if step.get("status") in ("done", "skip"):
-        await callback.answer("Уже отмечено")
-        return
-    step["status"] = "done" if action == "done" else "skip"
-    if action == "done":
-        points = step.get("points", 2)
-        await repo.add_points(db, user["id"], points, local_date=today)
-        if step.get("task_id"):
-            await repo.mark_regular_done(db, user["id"], step["task_id"], today)
-    steps[idx] = step
-    await state.update_data(steps=steps, today=today)
-    pending = [s for s in steps if s.get("status") == "pending"]
-    kb = _steps_keyboard(steps)
-    text = _steps_text(steps)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb)
-    if not pending:
-        done_cnt = len([s for s in steps if s.get("status") == "done"])
-        total_points = sum(s.get("points", 0) for s in steps if s.get("status") == "done")
-        zone = data.get("zone", "room")
-        finish = _finish_touches(zone)
-        summary = (
-            f"Ты закрыла {done_cnt} из {len(steps)} шагов, +{total_points} очков.\n"
-            f"{finish}\n\nДома уже заметно легче — можешь остановиться или сделать ещё один круг позже."
-        )
-        extra_kb = types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [types.InlineKeyboardButton(text="🔁 Ещё круг", callback_data="clean:again")],
-                [types.InlineKeyboardButton(text="🏠 Дом", callback_data="home:menu")],
-            ]
-        )
-        await callback.message.answer(summary, reply_markup=extra_kb)
-        await state.clear()
-    await callback.answer("Обновлено")
+    
+    await state.set_state(CleanState.choosing_mode)
+    await callback.message.edit_text("Какой режим уборки?", reply_markup=_modes_keyboard())
 
 
-@router.callback_query(lambda c: c.data and c.data == "clean:again")
-async def clean_again(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+@router.callback_query(lambda c: c.data == "cl2:new_force")
+async def cl2_force_new(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    # Mark old as abandoned logic handled by create_cleaning_session automatically (logic updated in repo)
+    # But strictly repo creates active, so it abandons prev active.
+    # Just redirect to clean start
     await state.clear()
     await start_clean_now(callback, db, state)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("cl2:mode:"))
+async def cl2_start_session(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    mode = callback.data.split(":")[2]
+    data = await state.get_data()
+    selected = data.get("selected_zones", [])
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    
+    # Generate Steps
+    steps = await _generate_flow(selected, mode)
+    zones_json = json.dumps(selected)
+    steps_json = json.dumps(steps, ensure_ascii=False)
+    
+    # Create DB Session
+    session_id = await repo.create_cleaning_session(db, user["id"], mode, zones_json, steps_json)
+    
+    # Render Step 1
+    await _render_step(callback.message, session_id, 0, steps)
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("cl2:resume:"))
+async def cl2_resume(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    session_id = int(callback.data.split(":")[2])
+    # Fetch session to get steps
+    # We need a repo function to get session by ID or re-use active. 
+    # get_active_session returns ROW.
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    session = await repo.get_active_session(db, user["id"])
+    
+    if not session or session["id"] != session_id:
+        await callback.answer("Сессия не найдена или завершена.", show_alert=True)
+        await start_clean_now(callback, db, state)
+        return
+
+    steps = json.loads(session["steps_json"])
+    idx = session["current_step_index"]
+    await _render_step(callback.message, session_id, idx, steps)
+
+
+async def _render_step(message: types.Message, session_id: int, idx: int, steps: List[dict]) -> None:
+    if idx >= len(steps):
+        # Completed
+        await message.edit_text("🎉 Уборка завершена! Ты молодец!", reply_markup=main_menu_keyboard())
+        return
+
+    step = steps[idx]
+    total = len(steps)
+    progress_bar = "▓" * int((idx / total) * 10) + "░" * (10 - int((idx / total) * 10))
+    
+    text = (
+        f"🧹 Уборка: Шаг {idx + 1}/{total}\n"
+        f"[{progress_bar}]\n\n"
+        f"👉 **{step['text']}**\n"
+        f"(+{step['points']} XP)"
+    )
+    
+    await safe_edit(message, text, reply_markup=_session_keyboard(session_id, idx, total))
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("cl2:step:"))
+async def cl2_step_action(callback: types.CallbackQuery, db) -> None:
+    _, _, action, session_id_str = callback.data.split(":")
+    session_id = int(session_id_str)
+    
+    # Load session
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    session = await repo.get_active_session(db, user["id"])
+    
+    if not session or session["id"] != session_id:
+        await callback.answer("Сессия устарела.")
+        return
+
+    steps = json.loads(session["steps_json"])
+    idx = session["current_step_index"]
+    
+    # Award points if done
+    if action == "done" and idx < len(steps):
+        pts = steps[idx].get("points", 1)
+        # We need to mark step as done in JSON? Or just move index?
+        # Ideally update JSON too for history, but for now moving index is enough for progress.
+        # But user wants "steps_json" in DB to be updated? 
+        # Plan said: "steps_json" stores status.
+        steps[idx]["status"] = "done"
+        await repo.add_points(db, user["id"], pts, local_date=local_date_str(datetime.datetime.utcnow(), user["timezone"]))
+    elif action == "skip":
+        steps[idx]["status"] = "skipped"
+        
+    next_idx = idx + 1
+    
+    if next_idx >= len(steps):
+        await repo.complete_session(db, session_id)
+        await callback.message.edit_text(
+            f"🎉 Уборка завершена!\nВсе шаги пройдены. Дом стал чище, а ты — круче.", 
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        # Update DB
+        new_json = json.dumps(steps, ensure_ascii=False)
+        # We need a repo function to update JSON + index. 
+        # Currently `update_session_progress` only updates index.
+        # I will update `update_session_progress` in next tool call or usage `execute` here?
+        # Using direct execute for now to be safe or assuming I should add it.
+        # Wait, I can't easily modify repo from here.
+        # I will rely on `update_session_progress` updating index.
+        # And I'll run a raw query to update steps_json if I want to persist status.
+        await repo.update_session_progress(db, session_id, next_idx)
+        
+        # Also update json
+        await db.execute("UPDATE cleaning_sessions SET steps_json = ? WHERE id = ?", (new_json, session_id))
+        await db.commit()
+        
+        await _render_step(callback.message, session_id, next_idx, steps)
+    
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("cl2:pause:"))
+async def cl2_pause(callback: types.CallbackQuery) -> None:
+    await callback.message.edit_text("⏸ Уборка на паузе. Возвращайся, когда будешь готова (кнопка в меню).", reply_markup=None)
+    await callback.answer()
+
 
 
 # --- Быстрые сценарии зон ---
@@ -718,10 +673,18 @@ QUICK_PRESETS = {
     },
 }
 
+def _quick_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for key, preset in QUICK_PRESETS.items():
+        title = preset.get("title") or key
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"quick:start:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="home:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def _quick_steps_text(scenario: str, steps: list[dict]) -> str:
     title = QUICK_PRESETS.get(scenario, {}).get("title", "Уборка")
-    lines = [f"{title} — шаги:"]
+    lines = [f"{title} — шаги. Можно остановиться в любой момент:"]
     for idx, step in enumerate(steps):
         status = step.get("status", "pending")
         prefix = "✅" if status == "done" else ("⏭" if status == "skip" else "•")
@@ -881,7 +844,7 @@ async def send_smell_menu(message: types.Message) -> None:
         ]
     )
     await message.answer(
-        "Запахи и стирка: выбери, что беспокоит. Дам короткие шаги без шейминга.",
+        "Запахи и стирка: выбери, что сейчас беспокоит — стиралка, раковина, ванна или общий запах в комнате. Дам короткие шаги без шейминга.",
         reply_markup=kb,
     )
 

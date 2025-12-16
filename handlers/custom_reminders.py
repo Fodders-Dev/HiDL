@@ -355,7 +355,7 @@ async def reminder_when(callback: types.CallbackQuery, state: FSMContext, db) ->
         )
         await state.clear()
         await callback.message.answer(
-            ack(f"{data['title']} в {hhmm} (ежедневно)."),
+            ack(f"{data['title']} в {hhmm} (ежедневно).\n\nПосмотреть и удалить старые можно в разделе ⏰ Напоминания."),
             reply_markup=main_menu_keyboard(),
         )
         await callback.answer()
@@ -453,7 +453,7 @@ async def add_reminder_time(message: types.Message, state: FSMContext, db) -> No
 async def reminder_freq_choice(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     choice = callback.data.split(":")[2]
     if choice == "custom":
-        await callback.message.answer("Введи через сколько дней повторять (целое число, минимум 1).")
+        await callback.message.answer("Раз в сколько дней напоминать? Напиши число.\nНапример, 2 — через день, 7 — раз в неделю, 30 — раз в месяц.")
         await callback.answer()
         return
     if choice == "once":
@@ -510,9 +510,9 @@ async def add_reminder_frequency(message: types.Message, state: FSMContext, db) 
         if freq < 1:
             raise ValueError
     except Exception:
+        from utils import texts
         await message.answer(
-            "Нужно целое число дней (минимум 1).\n"
-            "Например: 1 — каждый день, 7 — раз в неделю, 30 — раз в месяц.",
+             texts.error("не поняла число. Напиши цифрами, например 7 (раз в неделю) или 1 (каждый день).")
         )
         return
     await _save_reminder_with_frequency(
@@ -591,7 +591,7 @@ async def _save_reminder_with_frequency(
             desc += ", раз в неделю"
     else:
         desc += f", каждые {freq} д."
-    await message.answer(ack(f"{desc}{note}"), reply_markup=main_menu_keyboard())
+    await message.answer(ack(f"{desc}{note}\n\nПосмотреть и удалить старые можно в разделе ⏰ Напоминания."), reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("reminders"))

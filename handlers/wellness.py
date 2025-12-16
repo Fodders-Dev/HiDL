@@ -69,7 +69,7 @@ async def focus_edit_input(message: types.Message, db) -> None:
     parts = message.text.strip().split()
     if len(parts) < 2:
         await message.answer(
-            texts.error("нужно два числа: работа отдых, например 20 10 или 10 5."),
+            texts.error("нужно два числа: работа отдых, например 20 10."),
         )
         return
     try:
@@ -79,7 +79,7 @@ async def focus_edit_input(message: types.Message, db) -> None:
             raise ValueError
     except Exception:
         await message.answer(
-            texts.error("нужны целые числа (работа отдых), минимум 2 и 1."),
+            texts.error("нужны целые числа (работа отдых)."),
         )
         return
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
@@ -115,7 +115,7 @@ async def time_edit_input(message: types.Message, db) -> None:
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     if not parts or any(not parse_hhmm(p) for p in parts):
         await message.answer(
-            texts.error("формат времени: HH:MM,HH:MM. Пример: 11:00,16:00"),
+            texts.error("время в формате HH:MM, например 11:00,16:00."),
         )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -269,3 +269,66 @@ async def gentle_off(message: types.Message, db) -> None:
         texts.GENTLE_OFF,
         reply_markup=main_menu_keyboard(),
     )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("mealconfirm:"))
+async def meal_confirm(callback: types.CallbackQuery, db) -> None:
+    """Handle meal confirmation: Да! (+1 point) or Напомни попозже."""
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer()
+        return
+    
+    local_date = parts[1]
+    action = parts[2]
+    
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    
+    if action == "yes":
+        # Добавляем +1 очко за приём пищи
+        await repo.add_points(db, user["id"], 1, local_date)
+        await callback.message.edit_text(
+            "🎉 Отлично! Молодец что позаботился о себе. +1 очко!",
+            reply_markup=None
+        )
+        await callback.answer("Записано! +1 🌟")
+    elif action == "later":
+        # TODO: можно добавить отложенное напоминание через 30-60 минут
+        await callback.message.edit_text(
+            "⏰ Ок, напомню попозже. Не забудь поесть!",
+            reply_markup=None
+        )
+        await callback.answer("Напомню позже")
+    else:
+        await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("waterconfirm:"))
+async def water_confirm(callback: types.CallbackQuery, db) -> None:
+    """Handle water confirmation: Выпил! (+1 point) or Позже."""
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer()
+        return
+    
+    local_date = parts[1]
+    action = parts[2]
+    
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    
+    if action == "yes":
+        await repo.add_points(db, user["id"], 1, local_date)
+        await callback.message.edit_text(
+            "💧 Умничка! Водный баланс — это важно. +1 очко!",
+            reply_markup=None
+        )
+        await callback.answer("Записано! +1 🌟")
+    elif action == "later":
+        await callback.message.edit_text(
+            "⏰ Ок, напомню попозже. Вода ждёт тебя!",
+            reply_markup=None
+        )
+        await callback.answer("Напомню позже")
+    else:
+        await callback.answer()
+

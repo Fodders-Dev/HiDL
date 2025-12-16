@@ -122,6 +122,18 @@ async def update_user_goals(
     await conn.commit()
 
 
+async def update_user_gender(
+    conn: aiosqlite.Connection, user_id: int, gender: str
+) -> None:
+    """Update user's gender (male/female/neutral) for personalized messages."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET gender = ?, updated_at = ? WHERE id = ?",
+        (gender, now, user_id),
+    )
+    await conn.commit()
+
+
 # --- Households / общий дом ---
 
 
@@ -1482,6 +1494,13 @@ async def upsert_wellness(
     meal_profile: Optional[str] = None,
     expiring_window_days: Optional[int] = None,
     affirm_mode: Optional[str] = None,
+    # Новые поля для аффирмаций 2.0
+    affirm_enabled: Optional[int] = None,
+    affirm_categories: Optional[str] = None,
+    affirm_frequency: Optional[str] = None,
+    affirm_hours: Optional[str] = None,
+    meal_notify_enabled: Optional[int] = None,
+    affirm_last_key: Optional[str] = None,
 ) -> None:
     now = utc_now_str()
     existing = await get_wellness(conn, user_id)
@@ -1503,19 +1522,33 @@ async def upsert_wellness(
             else existing.get("expiring_window_days", 3)
         )
         affirm_val = affirm_mode if affirm_mode is not None else existing.get("affirm_mode", "off")
+        # Новые поля
+        affirm_en = affirm_enabled if affirm_enabled is not None else existing.get("affirm_enabled", 0)
+        affirm_cats = affirm_categories if affirm_categories is not None else existing.get("affirm_categories", '["motivation","calm"]')
+        affirm_freq = affirm_frequency if affirm_frequency is not None else existing.get("affirm_frequency", "daily")
+        affirm_hrs = affirm_hours if affirm_hours is not None else existing.get("affirm_hours", "[9]")
+        meal_notify = meal_notify_enabled if meal_notify_enabled is not None else existing.get("meal_notify_enabled", 1)
+        affirm_lkey = affirm_last_key if affirm_last_key is not None else existing.get("affirm_last_key", "")
+        
         await conn.execute(
             """
             UPDATE wellness_settings
-            SET water_enabled = ?, meal_enabled = ?, focus_mode = ?, water_last_key = ?, meal_last_key = ?, focus_work = ?, focus_rest = ?, tone = ?, water_times = ?, meal_times = ?, meal_profile = ?, expiring_window_days = ?, affirm_mode = ?, updated_at = ?
+            SET water_enabled = ?, meal_enabled = ?, focus_mode = ?, water_last_key = ?, meal_last_key = ?, 
+                focus_work = ?, focus_rest = ?, tone = ?, water_times = ?, meal_times = ?, meal_profile = ?, 
+                expiring_window_days = ?, affirm_mode = ?, affirm_enabled = ?, affirm_categories = ?,
+                affirm_frequency = ?, affirm_hours = ?, meal_notify_enabled = ?, affirm_last_key = ?, updated_at = ?
             WHERE user_id = ?
             """,
-            (water, meal, focus, wkey, mkey, work, rest, tone_val, wtimes, mtimes, mprof, exp_days, affirm_val, now, user_id),
+            (water, meal, focus, wkey, mkey, work, rest, tone_val, wtimes, mtimes, mprof, 
+             exp_days, affirm_val, affirm_en, affirm_cats, affirm_freq, affirm_hrs, meal_notify, affirm_lkey, now, user_id),
         )
     else:
         await conn.execute(
             """
-            INSERT INTO wellness_settings (user_id, water_enabled, meal_enabled, focus_mode, water_last_key, meal_last_key, focus_work, focus_rest, tone, water_times, meal_times, meal_profile, expiring_window_days, affirm_mode, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO wellness_settings (user_id, water_enabled, meal_enabled, focus_mode, water_last_key, meal_last_key, 
+                focus_work, focus_rest, tone, water_times, meal_times, meal_profile, expiring_window_days, affirm_mode,
+                affirm_enabled, affirm_categories, affirm_frequency, affirm_hours, meal_notify_enabled, affirm_last_key, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -1532,6 +1565,12 @@ async def upsert_wellness(
                 meal_profile or "omnivore",
                 expiring_window_days if expiring_window_days is not None else 3,
                 affirm_mode or "off",
+                affirm_enabled or 0,
+                affirm_categories or '["motivation","calm"]',
+                affirm_frequency or "daily",
+                affirm_hours or "[9]",
+                meal_notify_enabled if meal_notify_enabled is not None else 1,
+                affirm_last_key or "",
                 now,
                 now,
             ),
@@ -1943,6 +1982,21 @@ async def points_window(conn: aiosqlite.Connection, user_id: int, days: int = 7)
     return row["pts"] if row else 0
 
 
+async def points_week(conn: aiosqlite.Connection, user_id: int, local_date: str) -> int:
+    """Очки за текущую неделю (с понедельника по local_date включительно)."""
+    try:
+        d = datetime.date.fromisoformat(local_date)
+    except Exception:
+        d = datetime.date.today()
+    week_start = d - datetime.timedelta(days=d.weekday())  # Monday
+    cursor = await conn.execute(
+        "SELECT COALESCE(SUM(points),0) as pts FROM points_log WHERE user_id = ? AND local_date >= ?",
+        (user_id, week_start.isoformat()),
+    )
+    row = await cursor.fetchone()
+    return row["pts"] if row else 0
+
+
 async def points_today(conn: aiosqlite.Connection, user_id: int, local_date: Optional[str] = None) -> int:
     if local_date is None:
         local_date = datetime.date.today().isoformat()
@@ -1991,9 +2045,148 @@ async def home_stats_window(conn: aiosqlite.Connection, user_id: int, days: int 
     return (row["cnt"] if row else 0, row["pts"] if row else 0)
 
 
+async def home_stats_since(conn: aiosqlite.Connection, user_id: int, since_date: str) -> Tuple[int, int]:
+    """Количество дел по дому и очков с даты (YYYY-MM-DD) включительно."""
+    cursor = await conn.execute(
+        """
+        SELECT COUNT(*) as cnt, COALESCE(SUM(points),0) as pts
+        FROM regular_tasks
+        WHERE user_id = ? AND last_done_date IS NOT NULL AND date(last_done_date) >= date(?)
+          AND (is_active IS NULL OR is_active=1)
+        """,
+        (user_id, since_date),
+    )
+    row = await cursor.fetchone()
+    return (row["cnt"] if row else 0, row["pts"] if row else 0)
+
+
 async def reset_month_points(conn: aiosqlite.Connection, current_month: str) -> None:
     await conn.execute(
         "UPDATE users SET points_month = 0, last_points_reset = ?, updated_at = ?",
         (current_month, utc_now_str()),
     )
+    await conn.commit()
+
+
+# Shopping List Logic
+async def create_shopping_item(
+    conn: aiosqlite.Connection, user_id: int, name: str, qty: float = 1.0, unit: str = "шт", category: str = "misc"
+) -> int:
+    cursor = await conn.execute(
+        "SELECT id, quantity FROM shopping_list WHERE user_id = ? AND item_name = ? AND is_bought = 0",
+        (user_id, name)
+    )
+    row = await cursor.fetchone()
+    now = utc_now_str()
+    if row:
+        await conn.execute(
+            "UPDATE shopping_list SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+            (qty, now, row["id"])
+        )
+        await conn.commit()
+        return row["id"]
+    else:
+        cursor = await conn.execute(
+            "INSERT INTO shopping_list (user_id, item_name, quantity, unit, category, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, qty, unit, category, now, now)
+        )
+        await conn.commit()
+        return cursor.lastrowid
+
+async def list_shopping_items(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
+    cursor = await conn.execute(
+        "SELECT * FROM shopping_list WHERE user_id = ? AND is_bought = 0 ORDER BY category, item_name",
+        (user_id,)
+    )
+    return await cursor.fetchall()
+
+async def mark_shopping_bought(conn: aiosqlite.Connection, user_id: int, item_id: int, bought: bool = True) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE shopping_list SET is_bought = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        (1 if bought else 0, now, item_id, user_id)
+    )
+    await conn.commit()
+
+async def delete_shopping_item(conn: aiosqlite.Connection, user_id: int, item_id: int) -> None:
+    await conn.execute("DELETE FROM shopping_list WHERE id = ? AND user_id = ?", (item_id, user_id))
+    await conn.commit()
+
+async def complete_shopping_trip(conn: aiosqlite.Connection, user_id: int) -> int:
+    """Move bought items from shopping list to pantry."""
+    now = utc_now_str()
+    # 1. Select bought items
+    cursor = await conn.execute(
+        "SELECT * FROM shopping_list WHERE user_id = ? AND is_bought = 1", (user_id,)
+    )
+    rows = await cursor.fetchall()
+    count = 0
+    for row in rows:
+        pantry_cursor = await conn.execute(
+            "SELECT id FROM pantry_items WHERE user_id = ? AND name = ?", (user_id, row["item_name"])
+        )
+        pantry_row = await pantry_cursor.fetchone()
+        if pantry_row:
+             await conn.execute(
+                 "UPDATE pantry_items SET amount = amount + ?, updated_at = ? WHERE id = ?",
+                 (row["quantity"], now, pantry_row["id"])
+             )
+        else:
+             await conn.execute(
+                 "INSERT INTO pantry_items (user_id, name, amount, unit, category, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (user_id, row["item_name"], row["quantity"], row["unit"], row["category"], now, now)
+             )
+        count += 1
+    
+    # 3. Delete from shopping list (only bought ones)
+    await conn.execute("DELETE FROM shopping_list WHERE user_id = ? AND is_bought = 1", (user_id,))
+    await conn.commit()
+    return count
+
+
+# Cleaning Session Logic
+
+async def create_cleaning_session(
+    conn: aiosqlite.Connection, user_id: int, mode: str, zones_json: str, steps_json: str
+) -> int:
+    now = utc_now_str()
+    # Close any existing active sessions
+    await conn.execute(
+        "UPDATE cleaning_sessions SET status = 'abandoned', updated_at = ? WHERE user_id = ? AND status = 'active'",
+        (now, user_id)
+    )
+    cursor = await conn.execute(
+        "INSERT INTO cleaning_sessions (user_id, status, mode, zones_json, steps_json, current_step_index, created_at, updated_at) VALUES (?, 'active', ?, ?, ?, 0, ?, ?)",
+        (user_id, mode, zones_json, steps_json, now, now)
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+async def get_active_session(conn: aiosqlite.Connection, user_id: int) -> Optional[aiosqlite.Row]:
+    cursor = await conn.execute(
+        "SELECT * FROM cleaning_sessions WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+        (user_id,)
+    )
+    return await cursor.fetchone()
+
+async def update_session_progress(
+    conn: aiosqlite.Connection, session_id: int, current_step_index: int
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE cleaning_sessions SET current_step_index = ?, updated_at = ? WHERE id = ?",
+        (current_step_index, now, session_id)
+    )
+    await conn.commit()
+
+async def complete_session(conn: aiosqlite.Connection, session_id: int) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE cleaning_sessions SET status = 'completed', updated_at = ? WHERE id = ?",
+        (now, session_id)
+    )
+    await conn.commit()
+
+async def delete_session(conn: aiosqlite.Connection, session_id: int) -> None:
+    await conn.execute("DELETE FROM cleaning_sessions WHERE id = ?", (session_id,))
     await conn.commit()

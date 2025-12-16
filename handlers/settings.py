@@ -24,6 +24,7 @@ class SettingsState(StatesGroup):
     routine_time = State()
     expiry = State()
     household_join = State()
+    affirm_custom_time = State()
 
 
 def _settings_main_text(user) -> str:
@@ -47,9 +48,10 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="settings:profile")],
+            [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
             [InlineKeyboardButton(text="Время и режим дня", callback_data="settings:time_menu")],
             [InlineKeyboardButton(text="Рутины (шаги и время)", callback_data="settings:routines_menu")],
-            [InlineKeyboardButton(text="Питание и аффирмации", callback_data="settings:profile_menu")],
             [InlineKeyboardButton(text="Срок «скоро истечёт»", callback_data="settings:expiry")],
             [InlineKeyboardButton(text="ADHD-режим", callback_data="settings:adhd")],
             [InlineKeyboardButton(text="Общий дом", callback_data="settings:household")],
@@ -167,22 +169,28 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
         )
     # Вложенное меню «Питание и аффирмации».
     elif action == "profile_menu":
+        # Legacy redirect or keep as separate if needed, but we are moving to settings:profile
+        # For now, let's redirect to main profile
+        await settings_select(callback.replace(data="settings:profile"), state, db)
+        return
+
+    # Вложенное меню «Мой профиль»
+    elif action == "profile":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        gender_label = {"male": "👨 Мужчина", "female": "👩 Женщина", "neutral": "🙂 Не указан"}.get(user.get("gender", "neutral"), "Не указан")
+        
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Профиль питания", callback_data="settings:mealprof"),
-                ],
-                [
-                    InlineKeyboardButton(text="Аффирмации", callback_data="settings:affirm"),
-                ],
+                [InlineKeyboardButton(text=f"Пол: {gender_label}", callback_data="settings:gender")],
+                [InlineKeyboardButton(text="Профиль питания", callback_data="settings:mealprof")],
+                [InlineKeyboardButton(text="Цель/Приоритет", callback_data="settings:goals")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
             ]
         )
         await safe_edit(
             callback.message,
-            "Питание и поддержка:\n"
-            "• Профиль питания — обычный/вегетарианский/веганский.\n"
-            "• Аффирмации — короткие фразы поддержки по времени дня.",
+            "👤 Мой профиль\n\n"
+            "Здесь хранится информация о тебе для персонализации бота.",
             reply_markup=kb,
         )
     # Старые действия — оставляем для совместимости и прямых переходов.
@@ -247,16 +255,337 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
         await callback.message.answer(
             "Пришли код дома, который дал тебе партнёр. Я попробую подключить тебя к тому же пространству.",
         )
-    elif action == "affirm" and len(parts) == 2:
+    # --- Выбор пола ---
+    elif action == "profile":
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         wellness = await repo.get_wellness(db, user["id"])
-        current = (wellness or {}).get("affirm_mode", "off")
+        
+        # Gender
+        gender = user.get("gender", "neutral")
+        g_label = {"male": "👨 Мужчина", "female": "👩 Женщина", "neutral": "🙂 Не указан"}.get(gender, gender)
+        
+        # Diet
+        diet = (wellness or {}).get("meal_profile", "omnivore")
+        d_label = {"omnivore": "🥩 Обычный", "vegetarian": "🥗 Вегетарианец", "vegan": "🌱 Веган"}.get(diet, diet)
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"Пол: {g_label}", callback_data="settings:gender")],
+                [InlineKeyboardButton(text=f"Питание: {d_label}", callback_data="settings:mealprof")],
+                [InlineKeyboardButton(text="⬅️ Меню настроек", callback_data="settings:main")],
+            ]
+        )
         await safe_edit(
             callback.message,
-            "Могу иногда подкидывать короткую фразу поддержки.\n"
-            "Выбери, когда присылать аффирмации:",
-            reply_markup=_affirm_keyboard(current),
+            "👤 <b>Мой профиль</b>\n\nЗдесь можно уточнить данные о себе, чтобы я лучше подбирала советы и рецепты.",
+            reply_markup=kb,
         )
+
+    # --- Выбор пола ---
+    elif action == "gender":
+        # Если это установка пола
+        if len(parts) >= 4 and parts[2] == "set":
+            gender = parts[3]
+            if gender in {"male", "female", "neutral"}:
+                user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+                await repo.update_user_gender(db, user["id"], gender)
+                await callback.answer("Сохранено")
+        
+        # Отображение меню (обновленного или первичного)
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        current_gender = user.get("gender", "neutral")
+        
+        def g_label(g: str, text: str) -> str:
+            return f"✅ {text}" if current_gender == g else text
+            
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text=g_label("female", "👩 Женщина"), callback_data="settings:gender:set:female"),
+                    InlineKeyboardButton(text=g_label("male", "👨 Мужчина"), callback_data="settings:gender:set:male"),
+                ],
+                [
+                    InlineKeyboardButton(text=g_label("neutral", "🙂 Не указывать"), callback_data="settings:gender:set:neutral"),
+                ],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:profile")],
+            ]
+        )
+        
+        try:
+            await callback.message.edit_text(
+                "👤 Выбери пол для персонализации сообщений.\n\n"
+                "Это влияет на окончания слов: «ты поел» / «ты поела».",
+                reply_markup=kb
+            )
+        except:
+            # Если текст не изменился (пользователь нажал на тот же пол), aiogram может кинуть ошибку
+            pass
+            
+        if not (len(parts) >= 4 and parts[2] == "set"):
+             # Если мы просто открыли меню, answer нужен, чтобы убрать часики
+             await callback.answer()
+    # --- Уведомления ---
+    elif action == "notifications":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        wellness = await repo.get_wellness(db, user["id"])
+        w = dict(wellness) if wellness else {}
+        
+        meal_enabled = w.get("meal_enabled", 1)
+        water_enabled = w.get("water_enabled", 0)
+        affirm_enabled = w.get("affirm_enabled", 0)
+        
+        meal_icon = "✅" if meal_enabled else "❌"
+        water_icon = "✅" if water_enabled else "❌"
+        affirm_icon = "✅" if affirm_enabled else "❌"
+        
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")],
+                [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
+                [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
+            ]
+        )
+        await safe_edit(
+            callback.message,
+            "🔔 Настройки уведомлений\n\n"
+            "Включай и выключай напоминания по категориям:",
+            reply_markup=kb,
+        )
+    elif action == "notify" and len(parts) >= 3:
+        notify_type = parts[2]
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        wellness = await repo.get_wellness(db, user["id"])
+        w = dict(wellness) if wellness else {}
+        
+        if notify_type == "meal":
+            new_val = 0 if w.get("meal_enabled", 1) else 1
+            await repo.upsert_wellness(db, user["id"], meal_enabled=new_val)
+            await callback.answer("Еда: " + ("вкл" if new_val else "выкл"))
+        elif notify_type == "affirm_menu":
+            affirm_enabled = w.get("affirm_enabled", 0)
+            affirm_hours_raw = w.get("affirm_hours", "[9]")
+            try:
+                import json
+                affirm_hours = json.loads(affirm_hours_raw) if affirm_hours_raw else [9]
+            except:
+                affirm_hours = [9]
+            affirm_hours.sort()
+            
+            # Helper to check active preset
+            def is_preset(target):
+                return affirm_hours == sorted(target)
+                
+            presets = {
+                "morning": [9],
+                "evening": [21],
+                "both": [9, 21],
+                "allday": [9, 13, 17, 21]
+            }
+            
+            # Find active mode
+            active_mode = "custom"
+            for mode, hours in presets.items():
+                if is_preset(hours):
+                    active_mode = mode
+                    break
+            
+            def btn(label, mode):
+                check = "✅ " if active_mode == mode else ""
+                return InlineKeyboardButton(text=f"{check}{label}", callback_data=f"settings:affirm:set_sched:{mode}")
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text=f"{'✅ Аффирмации включены' if affirm_enabled else '❌ Аффирмации выключены'}",
+                        callback_data="settings:affirm_toggle"
+                    )],
+                    [InlineKeyboardButton(text="--- Частота отправки: ---", callback_data="settings:ignore")],
+                    [btn("🌤️ Утром (09:00)", "morning")],
+                    [btn("🌙 Вечером (21:00)", "evening")],
+                    [btn("🌗 Утро и Вечер", "both")],
+                    [btn("⚡ Весь день (4 раза)", "allday")],
+                    [btn("⚙️ Своё время...", "custom")],
+                    [InlineKeyboardButton(text="--- Настройки: ---", callback_data="settings:ignore")],
+                    [InlineKeyboardButton(text="📝 Категории фраз", callback_data="settings:affirm_cat_menu")],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:notifications")],
+                ]
+            )
+            
+            await safe_edit(
+                callback.message,
+                "🌟 Аффирмации\n\n"
+                "Выбери, как часто ты хочешь получать поддержку:",
+                reply_markup=kb,
+            )
+            await callback.answer()
+            return
+        elif notify_type == "affirm_cat_menu":
+            # Show category picker (logic moved from affirm_menu)
+            affirm_enabled = w.get("affirm_enabled", 0)
+            categories_raw = w.get("affirm_categories", '["motivation","calm"]')
+            try:
+                import json
+                categories = json.loads(categories_raw) if categories_raw else []
+            except:
+                categories = ["motivation", "calm"]
+            
+            cat_labels = {
+                "motivation": "💪 Мотивация",
+                "calm": "🧘 Спокойствие", 
+                "confidence": "🌟 Уверенность",
+                "quotes": "📚 Цитаты"
+            }
+            
+            cat_buttons = []
+            for cat_key, cat_name in cat_labels.items():
+                check = "☑️" if cat_key in categories else "☐"
+                cat_buttons.append(
+                    InlineKeyboardButton(
+                        text=f"{check} {cat_name}",
+                        callback_data=f"settings:affirm_cat:{cat_key}"
+                    )
+                )
+            
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    cat_buttons[:2],
+                    cat_buttons[2:],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:notify:affirm_menu")],
+                ]
+            )
+            await safe_edit(
+                callback.message,
+                "📝 Категории аффирмаций\n\n"
+                "Отметь темы, которые тебе интересны:",
+                reply_markup=kb,
+            )
+            await callback.answer()
+            return
+        
+        # Обновляем меню уведомлений
+        wellness = await repo.get_wellness(db, user["id"])
+        w = dict(wellness) if wellness else {}
+        meal_icon = "✅" if w.get("meal_enabled", 1) else "❌"
+        water_icon = "✅" if w.get("water_enabled", 0) else "❌"
+        affirm_icon = "✅" if w.get("affirm_enabled", 0) else "❌"
+        
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")],
+                [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
+                [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
+            ]
+        )
+        try:
+            await callback.message.edit_reply_markup(reply_markup=kb)
+        except:
+            pass
+    elif action == "affirm_toggle":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        wellness = await repo.get_wellness(db, user["id"])
+        w = dict(wellness) if wellness else {}
+        new_val = 0 if w.get("affirm_enabled", 0) else 1
+        await repo.upsert_wellness(db, user["id"], affirm_enabled=new_val)
+        await callback.answer("Аффирмации: " + ("вкл" if new_val else "выкл"))
+        # Помечаем что надо обновить меню - пользователь нажмёт Назад
+    elif action == "affirm_cat" and len(parts) >= 3:
+        cat = parts[2]
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        wellness = await repo.get_wellness(db, user["id"])
+        w = dict(wellness) if wellness else {}
+        
+        categories_raw = w.get("affirm_categories", '["motivation","calm"]')
+        try:
+            import json
+            categories = json.loads(categories_raw) if categories_raw else []
+        except:
+            categories = ["motivation", "calm"]
+        
+        # Toggle category
+        if cat in categories:
+            categories.remove(cat)
+        else:
+            categories.append(cat)
+        
+        import json
+        await repo.upsert_wellness(db, user["id"], affirm_categories=json.dumps(categories))
+        
+        # Обновляем клавиатуру с новыми галочками
+        wellness = await repo.get_wellness(db, user["id"])
+        w = dict(wellness) if wellness else {}
+        affirm_enabled = w.get("affirm_enabled", 0)
+        
+        cat_labels = {
+            "motivation": "💪 Мотивация",
+            "calm": "🧘 Спокойствие", 
+            "confidence": "🌟 Уверенность",
+            "quotes": "📚 Цитаты"
+        }
+        
+        cat_buttons = []
+        for cat_key, cat_name in cat_labels.items():
+            check = "☑️" if cat_key in categories else "☐"
+            cat_buttons.append(
+                InlineKeyboardButton(
+                    text=f"{check} {cat_name}",
+                    callback_data=f"settings:affirm_cat:{cat_key}"
+                )
+            )
+        
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"{'✅ Включены' if affirm_enabled else '❌ Выключены'}",
+                    callback_data="settings:affirm_toggle"
+                )],
+                cat_buttons[:2],  # Мотивация, Спокойствие
+                cat_buttons[2:],  # Уверенность, Цитаты
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:notifications")],
+            ]
+        )
+        
+        try:
+            await callback.message.edit_reply_markup(reply_markup=kb)
+        except:
+            pass
+        
+        await callback.answer(f"{cat}: {'добавлено' if cat in categories else 'убрано'}")
+
+    elif action == "affirm" and len(parts) >= 4 and parts[2] == "set_sched":
+        mode = parts[3]
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        
+        if mode == "custom":
+            await state.set_state(SettingsState.affirm_custom_time)
+            await callback.message.answer(
+                "⚙️ Настройка времени\n\n"
+                "Напиши часы, в которые хочешь получать аффирмации (от 0 до 23), через запятую или пробел.\n"
+                "Например: `9 14 20` или `10`."
+            )
+            await callback.answer()
+            return
+            
+        presets = {
+            "morning": [9],
+            "evening": [21],
+            "both": [9, 21],
+            "allday": [9, 13, 17, 21]
+        }
+        
+        new_hours = presets.get(mode, [9])
+        import json
+        await repo.upsert_wellness(db, user["id"], affirm_hours=json.dumps(new_hours), affirm_frequency=mode)
+        
+        # Refresh menu to show checkmark
+        # We can just redirect to affirm_menu logic
+        # But callback data is immutable, so we call settings_select with modified data
+        # Or simpler: just re-render the menu here (code duplication but safer) or call recursively
+        # Recursion is fine here as stack depth is low
+        new_cb = callback.replace(data="settings:notify:affirm_menu")
+        await settings_select(new_cb, state, db)
+        return
     elif action == "expiry":
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         wellness = await repo.get_wellness(db, user["id"])
@@ -277,7 +606,8 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
                     InlineKeyboardButton(text="Обычный", callback_data="settings:mealprof:set:omnivore"),
                     InlineKeyboardButton(text="Вегетарианец", callback_data="settings:mealprof:set:vegetarian"),
                     InlineKeyboardButton(text="Веган", callback_data="settings:mealprof:set:vegan"),
-                ]
+                ],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:profile")]
             ]
         )
         await callback.message.answer("Выбери профиль питания:", reply_markup=kb)
@@ -289,7 +619,7 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
         enabled = not bool(user.get("adhd_mode"))
         await repo.toggle_adhd(db, user["id"], enabled)
         text = (
-            "ADHD-режим включён: буду показывать меньше задач в /today и дробить шаги, чтобы не перегружать."
+            "ADHD-режим включён: теперь я буду бережнее — меньше задач в списке, чтобы не перегружать."
             if enabled
             else "ADHD-режим выключен."
         )
@@ -313,7 +643,20 @@ async def settings_meal_profile(callback: types.CallbackQuery, db) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     await repo.upsert_wellness(db, user["id"], meal_profile=profile)
     label = {"omnivore": "Обычный", "vegetarian": "Вегетарианец", "vegan": "Веган"}.get(profile, profile)
-    await callback.message.answer(f"Профиль питания обновлён: {label}.", reply_markup=main_menu_keyboard())
+    label = {"omnivore": "Обычный", "vegetarian": "Вегетарианец", "vegan": "Веган"}.get(profile, profile)
+    
+    # Refresh profile menu
+    callback.data = "settings:profile" 
+    # Use recursion by calling settings_select with new data? 
+    # Or just edit text manually to avoid recursion issues if arguments differ.
+    # Simpler: call settings_select.
+    # But wait, logic above for gender calls settings_select? No, it edits text. 
+    # I'll just edit text to confirm and show Back button.
+    
+    await callback.message.answer(f"✅ Профиль питания обновлён: {label}", reply_markup=main_menu_keyboard())
+    # Or better return to profile menu?
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👤 К профилю", callback_data="settings:profile")]])
+    await callback.message.answer(f"Сохранила: {label}", reply_markup=kb)
     await callback.answer("Сохранено")
 
 
@@ -374,8 +717,7 @@ async def settings_timezone(message: types.Message, state: FSMContext, db) -> No
         if not computed_tz:
             await message.answer(
                 texts.error(
-                    "не поняла. Можно прислать текущее время (HH:MM) или таймзону вида Europe/Moscow, UTC+3. "
-                    "Если запутаешься — можно вернуться к этому позже, остальные настройки сохранятся."
+                    "не совсем поняла. Можно прислать текущее время (HH:MM) или таймзону (Europe/Moscow, UTC+3)."
                 ),
             )
             return
@@ -392,7 +734,7 @@ async def settings_wake(message: types.Message, state: FSMContext, db) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
         await message.answer(
-            texts.error("не распознала время. Формат HH:MM, например 07:30. Если сейчас не до этого — можно вернуться к настройкам позже."),
+            texts.error("не распознала время. Напиши, например, 07:30."),
         )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -409,7 +751,7 @@ async def settings_sleep(message: types.Message, state: FSMContext, db) -> None:
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
         await message.answer(
-            texts.error("не распознала время. Формат HH:MM, например 23:30. Если сейчас не хочется менять — можно оставить как есть."),
+            texts.error("не распознала время. Напиши, например, 23:30."),
         )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -459,7 +801,7 @@ async def settings_routine_time(message: types.Message, state: FSMContext, db) -
     hhmm = message.text.strip()
     if not parse_hhmm(hhmm):
         await message.answer(
-            texts.error("не распознала время. Формат HH:MM, например 07:30. Если сейчас сложно с цифрами — можно вернуться к этому позже, настройки не сломаются."),
+            texts.error("не распознала время. Напиши, например, 07:30."),
         )
         return
     data = await state.get_data()
@@ -501,4 +843,35 @@ async def settings_household_join(message: types.Message, state: FSMContext, db)
     await message.answer(
         "Подключила тебя к общему дому. Теперь кладовка продуктов и бытовая химия будут общими для вас.",
         reply_markup=main_menu_keyboard(),
+    )
+
+
+@router.message(SettingsState.affirm_custom_time)
+async def settings_affirm_custom_time(message: types.Message, state: FSMContext, db) -> None:
+    text = message.text.replace(",", " ").replace(";", " ")
+    parts = text.split()
+    hours = []
+    try:
+        seen = set()
+        for p in parts:
+            h = int(p)
+            if 0 <= h <= 23:
+                if h not in seen:
+                    hours.append(h)
+                    seen.add(h)
+        if not hours:
+            raise ValueError
+        hours.sort()
+    except ValueError:
+        await message.answer("Пожалуйста, введи корректные часы (от 0 до 23), например: 9 14 20")
+        return
+
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    import json
+    await repo.upsert_wellness(db, user["id"], affirm_hours=json.dumps(hours), affirm_frequency="custom")
+    
+    await state.clear()
+    await message.answer(
+        f"✅ Принято! Аффирмации будут приходить в эти часы: {', '.join(map(str, hours))}.",
+        reply_markup=main_menu_keyboard()
     )

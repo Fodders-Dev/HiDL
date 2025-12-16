@@ -9,6 +9,10 @@
 
 from __future__ import annotations
 
+import sys
+import os
+sys.path.append(os.getcwd())  # Add project root to path for 'hidl' module import
+
 import argparse
 import asyncio
 import logging
@@ -18,7 +22,14 @@ from datetime import datetime
 from typing import Any, List, Optional, Sequence
 
 from aiogram import Dispatcher
-from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage, TelegramMethod
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    DeleteMessage,
+    EditMessageReplyMarkup,
+    EditMessageText,
+    SendMessage,
+    TelegramMethod,
+)
 from aiogram.types import (
     CallbackQuery,
     Chat,
@@ -39,6 +50,17 @@ logger = logging.getLogger(__name__)
 
 SIM_USER_ID = 424242
 SIM_CHAT_ID = 424242
+
+
+def safe_print(text: str) -> None:
+    """Helper to safely print text that might contain emojis on Windows consoles."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Fallback: encode with replacement (scrambles emojis to '?' but doesn't crash)
+        encoding = sys.stdout.encoding or "utf-8"
+        sanitized = text.encode(encoding, errors="replace").decode(encoding)
+        print(sanitized)
 
 
 @dataclass
@@ -111,17 +133,35 @@ class TerminalRenderer:
         self._render(edited, reply_markup)
         return edited
 
+    async def edit_message_reply_markup(
+        self,
+        message: Message,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> Message:
+        # In terminal, we just re-render the message with new markup
+        # For simplicity, we assume we are editing the message referenced by 'message'
+        # In a real GUI we'd look up by ID, here we just print the new state
+        print(f"[HiDL] (Edited markup for msg {message.message_id})")
+        self._render(message, reply_markup)
+        return message
+
+    async def delete_message(self, message_id: int) -> bool:
+        print(f"[HiDL] (Deleted message {message_id})")
+        print()
+        return True
+
+
     def _render(
         self,
         message: Message,
         reply_markup: Optional[ReplyKeyboardMarkup | InlineKeyboardMarkup],
     ) -> None:
         # Текст сообщения.
-        print("[HiDL]")
-        print(message.text or "")
+        safe_print("[HiDL]")
+        safe_print(message.text or "")
         print()
 
-        # Reply‑клавиатура в Telegram живёт «под» чатом и не исчезает,
+        # Reply-клавиатура в Telegram живёт «под» чатом и не исчезает,
         # пока её явно не заменили или не убрали. Поэтому:
         # - если пришёл ReplyKeyboardMarkup — обновляем список;
         # - если ReplyKeyboardRemove — очищаем;
@@ -141,23 +181,23 @@ class TerminalRenderer:
         if isinstance(reply_markup, InlineKeyboardMarkup):
             inline_buttons, inline_callback_data = _flatten_inline_keyboard(reply_markup)
 
-        # Reply‑кнопки.
-        print("Reply‑кнопки:")
+        # Reply-кнопки.
+        safe_print("Reply-кнопки:")
         if reply_buttons:
             for i, label in enumerate(reply_buttons, start=1):
-                print(f"  ({i}) {label}")
+                safe_print(f"  ({i}) {label}")
         else:
-            print("  — нет —")
+            safe_print("  — нет —")
 
-        # Inline‑кнопки.
+        # Inline-кнопки.
         print()
-        print("Inline‑кнопки:")
+        safe_print("Inline-кнопки:")
         if inline_buttons:
             for idx, label in enumerate(inline_buttons):
                 letter = string.ascii_lowercase[idx]
-                print(f"  ({letter}) {label}")
+                safe_print(f"  ({letter}) {label}")
         else:
-            print("  — нет —")
+            safe_print("  — нет —")
 
         print()
 
@@ -203,6 +243,20 @@ class TerminalBotProxy:
         reply_markup = kwargs.get("reply_markup")
         return await self._renderer.edit_message_text(dummy, text=text, reply_markup=reply_markup)
 
+    async def edit_message_reply_markup(self, chat_id: int | None = None, message_id: int | None = None, **kwargs) -> Message:  # type: ignore[override]
+        dummy = Message(
+            message_id=message_id or 0,
+            date=datetime.utcnow(),
+            chat=Chat(id=SIM_CHAT_ID, type="private"),
+            from_user=User(id=SIM_USER_ID, is_bot=True, first_name="HiDL"),
+            text="(... content unchanged ...)",
+        )
+        reply_markup = kwargs.get("reply_markup")
+        return await self._renderer.edit_message_reply_markup(dummy, reply_markup=reply_markup)
+
+    async def delete_message(self, chat_id: int, message_id: int) -> bool:  # type: ignore[override]
+        return await self._renderer.delete_message(message_id)
+
     async def answer_callback_query(self, *_, **__) -> None:  # type: ignore[override]
         # Сообщения об обработке callback в терминале не нужны.
         return None
@@ -235,6 +289,22 @@ class TerminalBotProxy:
                 text=method.text or "",
                 reply_markup=method.reply_markup,
             )
+
+        if isinstance(method, EditMessageReplyMarkup):
+            dummy = Message(
+                message_id=method.message_id or 0,
+                date=datetime.utcnow(),
+                chat=build_chat(),
+                from_user=User(id=SIM_USER_ID, is_bot=True, first_name="HiDL"),
+                text="(... content unchanged ...)",
+            )
+            return await self.edit_message_reply_markup(
+                message=dummy,
+                reply_markup=method.reply_markup,
+            )
+
+        if isinstance(method, DeleteMessage):
+            return await self.delete_message(chat_id=method.chat_id, message_id=method.message_id)
 
         if isinstance(method, AnswerCallbackQuery):
             return await self.answer_callback_query()
@@ -330,14 +400,14 @@ async def run_scenario(ctx: AppContext, name: str) -> None:
     dp = ctx.dp
 
     scenario: Scenario = scenarios[name]
-    print(f"=== Сценарий: {name} ===\n")
+    safe_print(f"=== Сценарий: {name} ===\n")
 
     for step in scenario:
         if step.type == "message" and step.text is not None:
-            print(f"[USER] {step.text}")
+            safe_print(f"[USER] {step.text}")
             await _feed_message(dp, bot, step.text)
         elif step.type == "button_reply" and step.label is not None:
-            print(f"[USER REPLY] {step.label}")
+            safe_print(f"[USER REPLY] {step.label}")
             await _feed_message(dp, bot, step.label)
         elif step.type == "button_inline" and step.label is not None:
             # Поиск callback по подписи.
@@ -345,10 +415,10 @@ async def run_scenario(ctx: AppContext, name: str) -> None:
             if step.label in kb.inline_buttons:
                 idx = kb.inline_buttons.index(step.label)
                 data = kb.inline_callback_data[idx]
-                print(f"[USER INLINE] {step.label}")
+                safe_print(f"[USER INLINE] {step.label}")
                 await _feed_callback(dp, bot, data)
             else:
-                print(f"[WARN] Не нашли inline‑кнопку с текстом '{step.label}', пропускаю шаг.")
+                safe_print(f"[WARN] Не нашли inline-кнопку с текстом '{step.label}', пропускаю шаг.")
 
 
 async def main_async(args: Sequence[str]) -> None:
@@ -365,6 +435,9 @@ async def main_async(args: Sequence[str]) -> None:
     # В тестовом режиме используем отдельную БД симулятора.
     # Для сценариев важно получать «чистого» пользователя, поэтому
     # перед запуском сценария пробуем сбросить файл БД.
+    #
+    # На Windows файл может быть залочен сторонним процессом (IDE/antivirus).
+    # В этом случае переключаемся на in-memory БД, чтобы симулятор оставался рабочим.
     if parsed.mode == "scenario":
         try:
             import os
@@ -373,20 +446,34 @@ async def main_async(args: Sequence[str]) -> None:
             root = Path(__file__).resolve().parents[1]
             sim_db = root / "hidl_simulator.db"
             if sim_db.exists():
-                os.remove(sim_db)
+                try:
+                    os.remove(sim_db)
+                except PermissionError:
+                    os.environ["HIDL_SIM_DB_URL"] = "sqlite:///:memory:"
         except Exception:
             # Если не получилось удалить БД — продолжаем, просто сценарий
             # будет работать с уже существующим состоянием.
             pass
 
     ctx = await create_app(test_mode=True)
-
-    if parsed.mode == "interactive" or parsed.mode is None:
-        await interactive(ctx)
-    elif parsed.mode == "scenario":
-        await run_scenario(ctx, parsed.name)
-    else:
-        parser.print_help()
+    try:
+        if parsed.mode == "interactive" or parsed.mode is None:
+            await interactive(ctx)
+        elif parsed.mode == "scenario":
+            await run_scenario(ctx, parsed.name)
+        else:
+            parser.print_help()
+    finally:
+        # Важно: закрываем соединение с БД, иначе aiosqlite может держать фоновые потоки
+        # и процесс будет "висеть" после завершения сценария/интерактива.
+        try:
+            await ctx.db_conn.close()
+        except Exception:
+            pass
+        try:
+            await ctx.bot.session.close()
+        except Exception:
+            pass
 
 
 def main() -> None:

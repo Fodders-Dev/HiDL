@@ -21,6 +21,11 @@ from utils.today import render_today
 
 router = Router()
 
+@router.callback_query(lambda c: c.data and c.data == "main:menu")
+async def main_menu_callback(callback: types.CallbackQuery) -> None:
+    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+    await callback.answer()
+
 
 @router.message(Command("menu"))
 @router.message(lambda m: m.text and "меню" in m.text.lower())
@@ -56,7 +61,10 @@ async def settings_info(message: types.Message, db) -> None:
 
 @router.message(lambda m: m.text and "еда" in m.text.lower())
 async def food_menu(message: types.Message) -> None:
-    await message.answer("Еда: выбери, что нужно.", reply_markup=food_menu_keyboard())
+    await message.answer(
+        "Еда — это топливо и радость. Я помогу не ломать голову над вопросом «что приготовить» и следить за запасами.",
+        reply_markup=food_menu_keyboard(),
+    )
 
 
 
@@ -224,4 +232,12 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
         from handlers import settings as settings_handler
 
         await settings_handler.settings_entry(callback.message, state=state, db=db)
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data == "dmenu:plan_tomorrow")
+async def dmenu_plan_tomorrow(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+    from handlers import day_plan
+    # Call the command handler logic directly
+    await day_plan.plan_tomorrow(callback.message, state, db)
     await callback.answer()

@@ -51,16 +51,19 @@ async def stats(message: types.Message, db) -> None:
 
     now_utc = datetime.datetime.utcnow()
     local_today = local_date_str(now_utc, user["timezone"])
+    d_today = datetime.date.fromisoformat(local_today)
+    week_start = d_today - datetime.timedelta(days=d_today.weekday())  # Monday
+    days_in_week = d_today.weekday() + 1
 
-    routine_rows = await repo.routine_stats(db, user["id"], days=7)
-    custom_rows = await repo.custom_stats(db, user["id"], days=7)
+    routine_rows = await repo.routine_stats(db, user["id"], days=days_in_week)
+    custom_rows = await repo.custom_stats(db, user["id"], days=days_in_week)
 
     routine_by_date = _aggregate(routine_rows)
     custom_by_date = _aggregate(custom_rows)
 
     def lines(by_date, label):
         if not by_date:
-            return [f"{label}: нет данных за последние 7 дней."]
+            return [f"{label}: нет данных на этой неделе."]
         out = []
         for date in sorted(by_date.keys(), reverse=True):
             d = by_date[date]
@@ -78,8 +81,8 @@ async def stats(message: types.Message, db) -> None:
     custom_total = sum(v["total"] for v in custom_by_date.values())
     custom_done = sum(v["done"] for v in custom_by_date.values())
     today_points = await repo.points_today(db, user["id"], local_date=local_today)
-    points7 = await repo.points_window(db, user["id"], days=7)
-    home_cnt, home_pts = await repo.home_stats_window(db, user["id"], days=7)
+    points_week = await repo.points_week(db, user["id"], local_today)
+    home_cnt, home_pts = await repo.home_stats_since(db, user["id"], week_start.isoformat())
     user_full = await repo.get_user(db, user["id"])
     points_month = user_full["points_month"]
     points_total = user_full["points_total"]
@@ -95,15 +98,15 @@ async def stats(message: types.Message, db) -> None:
         achievements.append("🎯 10+ задач закрыто за неделю")
 
     text = (
-        "Статистика за 7 дней:\n\n"
+        "Статистика за неделю:\n\n"
         f"Рутины: {routine_done}/{routine_total} (стрик полных дней: {routine_streak})\n"
         + "\n".join(routine_summary)
         + "\n\n"
         f"Свои напоминания: {custom_done}/{custom_total} (стрик: {custom_streak})\n"
         + "\n".join(custom_summary)
     )
-    text += f"\n\nОчки: сегодня — {today_points}, за 7 дней — {points7}, за месяц — {points_month}, всего — {points_total}"
-    text += f"\nДом: за 7 дней {home_cnt} дел, очков {home_pts}. "
+    text += f"\n\nОчки: сегодня - {today_points}, за неделю - {points_week}, за месяц - {points_month}, всего - {points_total}"
+    text += f"\nДом: за неделю {home_cnt} дел, очков {home_pts}. "
     if home_cnt == 0:
         text += "Если не до уборки — нормально. Можно начать с одного пункта."
     elif home_cnt < 4:
@@ -117,13 +120,13 @@ async def stats(message: types.Message, db) -> None:
     wellness = await repo.get_wellness(db, user["id"])
     if wellness:
         tone = wellness["tone"]
-    if points7 < 10:
+    if points_week < 10:
         tone = "soft"
-    elif points7 > 40:
+    elif points_week > 40:
         tone = "pushy"
     # Иногда добавляем аффирмацию поддержки
     extra = None
-    if points7 < 10 or routine_streak <= 1:
+    if points_week < 10 or routine_streak <= 1:
         extra = random_affirmation_text("self_worth")
     elif routine_streak >= 7:
         extra = random_affirmation_text("motivation")
@@ -140,15 +143,17 @@ async def stats_view(callback: types.CallbackQuery, db) -> None:
 
 @router.message(Command("weekly_report"))
 async def weekly_report(message: types.Message, db) -> None:
-    """Сводка за 7 дней: рутины/напоминания + деньги и лимиты."""
+    """Сводка за неделю: рутины/напоминания + деньги и лимиты."""
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
 
     now_utc = datetime.datetime.utcnow()
     local_today = local_date_str(now_utc, user["timezone"])
+    d_today = datetime.date.fromisoformat(local_today)
+    days_in_week = d_today.weekday() + 1
 
     # Задачи
-    routine_rows = await repo.routine_stats(db, user["id"], days=7)
-    custom_rows = await repo.custom_stats(db, user["id"], days=7)
+    routine_rows = await repo.routine_stats(db, user["id"], days=days_in_week)
+    custom_rows = await repo.custom_stats(db, user["id"], days=days_in_week)
     routine_by_date = _aggregate(routine_rows)
     custom_by_date = _aggregate(custom_rows)
     routine_done = sum(v["done"] for v in routine_by_date.values())
@@ -158,7 +163,7 @@ async def weekly_report(message: types.Message, db) -> None:
     routine_streak = _streak(routine_by_date, local_today)
 
     # Деньги
-    expenses = await repo.expenses_last_days(db, user["id"], days=7)
+    expenses = await repo.expenses_last_days(db, user["id"], days=days_in_week)
     per_cat = defaultdict(float)
     total = 0.0
     for e in expenses:
@@ -173,10 +178,10 @@ async def weekly_report(message: types.Message, db) -> None:
         cat_lines.append(f"{c['category']}: {spent_cat:.0f}/{c['limit_amount']:.0f}")
 
     text = (
-        "Сводка за 7 дней:\n"
+        "Сводка за неделю:\n"
         f"Рутины: {routine_done}/{routine_total} (стрик полных дней: {routine_streak})\n"
         f"Свои напоминания: {custom_done}/{custom_total}\n"
-        "\nДеньги за 7 дней:\n"
+        "\nДеньги за неделю:\n"
         + ("\n".join(f"- {cat}: {amt:.0f}" for cat, amt in per_cat.items()) if per_cat else "нет записей")
         + f"\nМесяц: {month_total:.0f}"
     )

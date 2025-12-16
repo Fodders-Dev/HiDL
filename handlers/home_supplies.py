@@ -52,7 +52,13 @@ def _supplies_keyboard(supplies: list[dict]) -> InlineKeyboardMarkup:
                 ),
             ]
         )
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Добавить позже", callback_data="supply:none:0")]])
+    rows.append([InlineKeyboardButton(text="⬅️ Дом", callback_data="home:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Добавить позже", callback_data="supply:none:0")],
+            [InlineKeyboardButton(text="⬅️ Дом", callback_data="home:menu")],
+        ]
+    )
 
 
 async def _render_supplies(message: types.Message, supplies: list[dict]) -> None:

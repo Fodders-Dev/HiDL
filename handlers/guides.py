@@ -386,7 +386,8 @@ async def recipe_cooked(callback: types.CallbackQuery, db) -> None:
     # обновить БД
     for item in pantry_items:
         await repo.update_pantry_item(db, user["id"], item["id"], amount=item.get("amount"), expires_at=None)
-    lines = ["Что изменилось в запасах после готовки:"]
+    lines = ["Отлично! Надеюсь, было вкусно. Списала продукты (если они были в запасах).", ""]
+    lines.append("Что изменилось в запасах после готовки:")
     if not finished and not low_left:
         lines.append("• Я не увидела изменений по продуктам, но блюдо всё равно засчитываем.")
     if finished:

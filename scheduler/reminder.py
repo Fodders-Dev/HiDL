@@ -3,6 +3,7 @@ from typing import Optional
 from collections import defaultdict
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -29,8 +30,55 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_weight_prompt, "cron", hour=8, minute=30, id="weight_prompt")
         self.scheduler.add_job(self._weekly_home_plan, "cron", day_of_week="sun", hour=10, minute=0, id="home_plan_weekly")
         self.scheduler.add_job(self._tick_day_plan, "interval", minutes=5, id="day_plan_morning")
+        self.scheduler.add_job(self._tick_day_plan_evening, "interval", minutes=15, id="day_plan_evening")
         self.scheduler.add_job(self._tick_meds, "interval", seconds=60, id="meds_tick")
+        self.scheduler.add_job(self._tick_affirmations, "interval", minutes=5, id="affirmations_tick")
         self.scheduler.start()
+
+    async def _safe_send_message(
+        self,
+        user: dict,
+        local_date: str,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        **kwargs,
+    ) -> bool:
+        telegram_id = user.get("telegram_id")
+        if not telegram_id:
+            log_debug(f"[send] missing telegram_id user={user.get('id')}")
+            return False
+        try:
+            await self.bot.send_message(
+                chat_id=telegram_id, text=text, reply_markup=reply_markup, **kwargs
+            )
+            return True
+        except TelegramForbiddenError as e:
+            msg = str(e)
+            log_debug(
+                f"[send] forbidden user={user.get('id')} chat_id={telegram_id} err={msg}"
+            )
+            try:
+                if "bots can't send messages to bots" in msg:
+                    await repo.set_user_pause(self.conn, user["id"], "9999-12-31")
+                else:
+                    pause_until = (
+                        datetime.date.fromisoformat(local_date)
+                        + datetime.timedelta(days=7)
+                    ).isoformat()
+                    await repo.set_user_pause(self.conn, user["id"], pause_until)
+            except Exception:
+                pass
+            return False
+        except TelegramAPIError as e:
+            log_debug(
+                f"[send] telegram api error user={user.get('id')} chat_id={telegram_id} err={e}"
+            )
+            return False
+        except Exception as e:
+            log_debug(
+                f"[send] unexpected error user={user.get('id')} chat_id={telegram_id} err={e}"
+            )
+            return False
 
     async def _tick(self) -> None:
         now_utc = datetime.datetime.utcnow()
@@ -48,10 +96,12 @@ class ReminderScheduler:
                     log_debug(f"[tick] routine already sent user={user['id']} routine={routine['routine_id']} date={local_date}")
                     continue
                 if not should_trigger(
-                    now_utc, user["timezone"], routine["reminder_time"], window_minutes=2
+                    now_utc, user["timezone"], routine["reminder_time"], window_minutes=5
                 ):
                     continue
-                await self._send_routine(user, routine, local_date)
+                sent = await self._send_routine(user, routine, local_date)
+                if not sent:
+                    continue
                 await repo.set_routine_sent(
                     self.conn, user["id"], routine["routine_id"], local_date
                 )
@@ -109,9 +159,72 @@ class ReminderScheduler:
                     ],
                 ]
             )
-            await self.bot.send_message(chat_id=user["telegram_id"], text="\n".join(lines), reply_markup=kb)
-            await repo.mark_day_plan_morning_sent(self.conn, plan["id"], local_date)
-            log_debug(f"[day_plan] sent user={user['id']} items={len(items)} date={local_date}")
+            sent = await self._safe_send_message(
+                user, local_date, "\n".join(lines), reply_markup=kb
+            )
+            if sent:
+                await repo.mark_day_plan_morning_sent(self.conn, plan["id"], local_date)
+                log_debug(
+                    f"[day_plan] sent user={user['id']} items={len(items)} date={local_date}"
+                )
+
+    async def _tick_day_plan_evening(self) -> None:
+        """Вечернее напоминание о планировании завтрашнего дня."""
+        now_utc = datetime.datetime.utcnow()
+        users = await repo.list_users(self.conn)
+        for user_row in users:
+            user = dict(user_row)
+            local_date = local_date_str(now_utc, user["timezone"])
+            
+            # Проверки паузы
+            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+
+            # Определяем целевое время (сон - 1 час, дефолт 22:00)
+            sleep_time = user.get("sleep_time") or "23:00"
+            try:
+                dt_sleep = datetime.datetime.strptime(sleep_time, "%H:%M")
+                dt_target = dt_sleep - datetime.timedelta(hours=1)
+                target_time = dt_target.strftime("%H:%M")
+            except ValueError:
+                target_time = "22:00"
+            
+            # Проверяем окно времени (15 минут)
+            if not should_trigger(now_utc, user["timezone"], target_time, window_minutes=15):
+                continue
+
+            # Проверяем, есть ли УЖЕ план на завтра
+            local_dt_today = datetime.datetime.strptime(local_date, "%Y-%m-%d").date()
+            tomorrow_date = (local_dt_today + datetime.timedelta(days=1)).isoformat()
+            
+            existing_plan = await repo.get_day_plan(self.conn, user["id"], tomorrow_date)
+            if existing_plan:
+                # План уже есть, не надоедаем
+                continue
+            
+            # Отправляем напоминание
+            text = (
+                "🌙 Самое время скинуть мысли из головы и набросать план на завтра.\n"
+                "Это поможет спать спокойнее (+1 💎 за планирование)."
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📝 Спланировать", callback_data="dmenu:plan_tomorrow")]
+                ]
+            )
+            # Внимание: dmenu:plan_tomorrow нужно поддержать в handlers/menu.py или ловить команду /plan_tomorrow
+            # Сейчас /plan_tomorrow это команда. Добавим коллбэк позже или используем текст.
+            # Лучше всего текст "Спланировать" (эмуляция команды) или новый callback.
+            # В menu.py нет обработчика dmenu. Добавим callback который триггерит команду.
+            
+            # Чтобы не усложнять, отправим просто текст с предложением нажать команду
+            # Но кнопка удобнее. Пусть будет callback, который мы добавим в menu.py
+            
+            sent = await self._safe_send_message(user, local_date, text, reply_markup=kb)
+            if sent:
+                log_debug(
+                    f"[day_plan_evening] sent prompt user={user['id']} date={local_date}"
+                )
 
     async def _tick_meds(self) -> None:
         """Пинг по витаминам/таблеткам на основе meds/med_logs."""
@@ -173,11 +286,14 @@ class ReminderScheduler:
                     )
                     keyboard.inline_keyboard[0][0].callback_data = f"medtake:{log_id}"
                     keyboard.inline_keyboard[0][1].callback_data = f"medskip:{log_id}"
-                    await self.bot.send_message(
-                        chat_id=user["telegram_id"],
-                        text=text,
-                        reply_markup=keyboard,
+                    sent = await self._safe_send_message(
+                        user, local_date, text, reply_markup=keyboard
                     )
+                    if not sent:
+                        await self.conn.execute(
+                            "DELETE FROM med_logs WHERE id = ?", (log_id,)
+                        )
+                        await self.conn.commit()
 
     async def _tick_custom(
         self, user: dict, now_utc: datetime.datetime, local_date: str
@@ -213,15 +329,19 @@ class ReminderScheduler:
                     )
                     continue
             if not should_trigger(
-                now_utc, user["timezone"], reminder["reminder_time"], window_minutes=2
+                now_utc, user["timezone"], reminder["reminder_time"], window_minutes=5
             ):
                 log_debug(
                     f"[custom] not in window user={user['id']} rem={reminder['id']} "
                     f"time={reminder['reminder_time']} now_utc={now_utc.isoformat()}"
                 )
                 continue
-            await self._send_custom(user, reminder, local_date)
-            log_debug(f"[custom] send user={user['id']} rem={reminder['id']} time={reminder['reminder_time']} date={local_date}")
+            sent = await self._send_custom(user, reminder, local_date)
+            if not sent:
+                continue
+            log_debug(
+                f"[custom] send user={user['id']} rem={reminder['id']} time={reminder['reminder_time']} date={local_date}"
+            )
             await repo.set_custom_reminder_sent(self.conn, reminder["id"], local_date)
             await repo.log_custom_task(
                 self.conn,
@@ -233,7 +353,7 @@ class ReminderScheduler:
 
     async def _send_routine(
         self, user: dict, routine: dict, local_date: str
-    ) -> Optional[None]:
+    ) -> bool:
         items = await repo.list_routine_steps_for_routine(self.conn, user["id"], routine["routine_id"])
         task = await repo.get_user_task(self.conn, user["id"], routine["routine_id"], local_date)
         done = set()
@@ -288,13 +408,11 @@ class ReminderScheduler:
                 ]
             )
         keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
-        await self.bot.send_message(
-            chat_id=user["telegram_id"], text=text, reply_markup=keyboard
-        )
+        return await self._safe_send_message(user, local_date, text, reply_markup=keyboard)
 
     async def _send_custom(
         self, user: dict, reminder: dict, local_date: str
-    ) -> Optional[None]:
+    ) -> bool:
         text = f"🔔 Напоминание: {reminder['title']}\nВремя: {reminder['reminder_time']} (локально)"
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -314,12 +432,12 @@ class ReminderScheduler:
                 ]
             ]
         )
-        await self.bot.send_message(
-            chat_id=user["telegram_id"], text=text, reply_markup=keyboard
-        )
-        log_debug(
-            f"[custom] delivered user={user['id']} rem={reminder['id']} time={reminder['reminder_time']} date={local_date}"
-        )
+        sent = await self._safe_send_message(user, local_date, text, reply_markup=keyboard)
+        if sent:
+            log_debug(
+                f"[custom] delivered user={user['id']} rem={reminder['id']} time={reminder['reminder_time']} date={local_date}"
+            )
+        return sent
 
     async def _tick_wellness(self) -> None:
         now_utc = datetime.datetime.utcnow()
@@ -355,11 +473,28 @@ class ReminderScheduler:
                             text += " Даже пару глотков — уже хорошо."
                         if wellness and wellness.get("tone") == "pushy":
                             text += " Сделай это сейчас."
-                        await self.bot.send_message(chat_id=user["telegram_id"], text=text)
-                        await repo.upsert_wellness(
-                            self.conn, user["id"], water_last_key=key
+                        keyboard = InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="💧 Выпил!",
+                                        callback_data=f"waterconfirm:{local_date}:yes"
+                                    ),
+                                    InlineKeyboardButton(
+                                        text="⏰ Позже",
+                                        callback_data=f"waterconfirm:{local_date}:later"
+                                    ),
+                                ]
+                            ]
                         )
-                        wellness = await repo.get_wellness(self.conn, user["id"])
+                        sent = await self._safe_send_message(
+                            user, local_date, text, reply_markup=keyboard
+                        )
+                        if sent:
+                            await repo.upsert_wellness(
+                                self.conn, user["id"], water_last_key=key
+                            )
+                            wellness = await repo.get_wellness(self.conn, user["id"])
             # Meal reminders
             if wellness.get("meal_enabled"):
                 for t in meal_times:
@@ -367,16 +502,43 @@ class ReminderScheduler:
                     if wellness.get("meal_last_key") == key:
                         continue
                     if should_trigger(now_utc, user["timezone"], t, window_minutes=2):
-                        text = "🍲 Ты ел(а) за последние пару часов? Даже перекус пойдёт."
+                        # Персонализация по полу
+                        gender = user.get("gender", "neutral")
+                        if gender == "female":
+                            ate_word = "ела"
+                        elif gender == "male":
+                            ate_word = "ел"
+                        else:
+                            ate_word = "ел(а)"
+                        
+                        text = f"🍽 Привет! Ты {ate_word} за последние пару часов?\nДаже небольшой перекус даст тебе энергии 💪"
                         if wellness and wellness.get("tone") == "soft":
-                            text += " Если нет — возьми что-то простое, я верю в тебя."
+                            text += "\n\nЕсли сейчас не до этого — можно напомнить попозже."
                         if wellness and wellness.get("tone") == "pushy":
-                            text += " Не тянем, сходи за едой."
-                        await self.bot.send_message(chat_id=user["telegram_id"], text=text)
-                        await repo.upsert_wellness(
-                            self.conn, user["id"], meal_last_key=key
+                            text += "\n\nНе откладывай — организму нужна энергия!"
+                        
+                        keyboard = InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="✅ Да!",
+                                        callback_data=f"mealconfirm:{local_date}:yes"
+                                    ),
+                                    InlineKeyboardButton(
+                                        text="⏰ Напомни попозже",
+                                        callback_data=f"mealconfirm:{local_date}:later"
+                                    ),
+                                ]
+                            ]
                         )
-                        wellness = await repo.get_wellness(self.conn, user["id"])
+                        sent = await self._safe_send_message(
+                            user, local_date, text, reply_markup=keyboard
+                        )
+                        if sent:
+                            await repo.upsert_wellness(
+                                self.conn, user["id"], meal_last_key=key
+                            )
+                            wellness = await repo.get_wellness(self.conn, user["id"])
 
     async def _tick_bills(self) -> None:
         users = await repo.list_users(self.conn)
@@ -389,7 +551,7 @@ class ReminderScheduler:
                 continue
             lines = [f"{b['title']}: до {b['due_date']} (~{b['amount']:.0f} ₽)" for b in bills]
             text = "📅 Счета скоро к оплате:\n" + "\n".join(lines)
-            await self.bot.send_message(chat_id=user["telegram_id"], text=text)
+            await self._safe_send_message(user, local_date, text)
 
     async def _tick_weekly_finance(self) -> None:
         """Раз в день в 09:00 UTC: если у пользователя сегодня воскресенье (локально), отправить недельный отчёт."""
@@ -428,7 +590,7 @@ class ReminderScheduler:
                     text += " ⚠️ превысил лимит"
             if cat_lines:
                 text += "\nКатегории:\n" + "\n".join(cat_lines)
-            await self.bot.send_message(chat_id=user["telegram_id"], text=text)
+            await self._safe_send_message(user, local_date, text)
 
     async def _reset_points_month(self) -> None:
         """Первое число — обнулить помесячные очки."""
@@ -465,10 +627,8 @@ class ReminderScheduler:
                             [InlineKeyboardButton(text="Отметить сделанным", callback_data=f"care:{col}:{local_date}")]
                         ]
                     )
-                    await self.bot.send_message(
-                        chat_id=user["telegram_id"],
-                        text=f"{text}\nДата сегодня: {note_date}",
-                        reply_markup=kb,
+                    await self._safe_send_message(
+                        user, local_date, f"{text}\nДата сегодня: {note_date}", reply_markup=kb
                     )
 
     async def _tick_weight_prompt(self) -> None:
@@ -491,12 +651,14 @@ class ReminderScheduler:
                 kb = InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="Обновить вес", callback_data="move:weight")]]
                 )
-                await self.bot.send_message(
-                    chat_id=user["telegram_id"],
-                    text="⚖ Обновишь вес? Коротко и без оценок — только цифра.",
+                sent = await self._safe_send_message(
+                    user,
+                    local_date,
+                    "⚖ Обновишь вес? Коротко и без оценок — только цифра.",
                     reply_markup=kb,
                 )
-                await repo.update_weight_prompt(self.conn, user["id"], local_date)
+                if sent:
+                    await repo.update_weight_prompt(self.conn, user["id"], local_date)
 
     async def _weekly_home_plan(self) -> None:
         """По воскресеньям присылать план по дому на неделю."""
@@ -516,4 +678,88 @@ class ReminderScheduler:
             lines = ["План по дому на неделю:"]
             for t in tasks:
                 lines.append(f"• {t['title']} — до {t['next_due_date']}")
-            await self.bot.send_message(chat_id=user["telegram_id"], text="\n".join(lines))
+            await self._safe_send_message(user, today, "\n".join(lines))
+
+    async def _tick_affirmations(self) -> None:
+        """Отправка аффирмаций по расписанию пользователя."""
+        import json
+        from services.knowledge import get_knowledge_service
+        
+        now_utc = datetime.datetime.utcnow()
+        users = await repo.list_users(self.conn)
+        
+        for user_row in users:
+            user = dict(user_row)
+            local_date = local_date_str(now_utc, user["timezone"])
+            
+            # Проверяем паузу
+            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            
+            # Получаем настройки wellness
+            wellness_row = await repo.get_wellness(self.conn, user["id"])
+            if not wellness_row:
+                continue
+            wellness = dict(wellness_row)
+            
+            # Проверяем включены ли аффирмации
+            if not wellness.get("affirm_enabled", 0):
+                continue
+            
+            # Получаем часы отправки
+            affirm_hours_raw = wellness.get("affirm_hours", "[9]")
+            try:
+                affirm_hours = json.loads(affirm_hours_raw) if affirm_hours_raw else [9]
+            except:
+                affirm_hours = [9]
+            
+            # Проверяем локальное время
+            tzinfo = tzinfo_from_string(user["timezone"])
+            local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
+            current_hour = local_dt.hour
+            
+            # Проверяем попадает ли час в список
+            if current_hour not in affirm_hours:
+                continue
+            
+            # Создаём ключ для предотвращения повторной отправки
+            affirm_key = f"affirm:{local_date}:{current_hour}"
+            last_key = wellness.get("affirm_last_key", "")
+            if last_key == affirm_key:
+                continue
+            
+            # Получаем категории
+            categories_raw = wellness.get("affirm_categories", '["motivation","calm"]')
+            try:
+                categories = json.loads(categories_raw) if categories_raw else ["motivation", "calm"]
+            except:
+                categories = ["motivation", "calm"]
+            
+            # Получаем аффирмацию
+            ks = get_knowledge_service()
+            affirmation = ks.get_random_affirmation(categories=categories)
+            
+            if not affirmation:
+                continue
+            
+            # Отправляем
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🌟 Ещё одну", callback_data="affirm:more"),
+                        InlineKeyboardButton(text="💚 Спасибо", callback_data="affirm:thanks"),
+                    ]
+                ]
+            )
+            
+            sent = await self._safe_send_message(
+                user, local_date, affirmation, reply_markup=keyboard
+            )
+            if not sent:
+                continue
+
+            # Сохраняем ключ
+            await repo.upsert_wellness(self.conn, user["id"], affirm_last_key=affirm_key)
+            log_debug(
+                f"[affirmations] sent to user={user['id']} hour={current_hour} date={local_date}"
+            )

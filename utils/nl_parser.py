@@ -28,16 +28,37 @@ class ParsedCommand:
 
 def parse_expense(text: str) -> Optional[ParsedCommand]:
     txt = text.lower().strip()
-    m = re.search(r"(-|\+)?\s*(\d+[.,]?\d*)", txt)
+    
+    # Исключаем чистый формат времени (08:00, 23:30)
+    if re.match(r"^\s*\d{1,2}:\d{2}\s*$", txt):
+        return None
+    
+    # Ищем число, но не в формате времени
+    # Исключаем паттерны типа "08:00" (время)
+    m = re.search(r"(-|\+)?\s*(\d+[.,]?\d*)(?!\s*:)", txt)
     if not m:
         return None
+    
     amount = float(m.group(2).replace(",", "."))
     sign = -1 if m.group(1) == "-" else 1
     amount *= sign
-    # категория — слово после числа или последнее слово
-    after = txt[m.end():].strip()
-    parts = after.split()
-    category = parts[0] if parts else txt.split()[-1]
+    
+    # Категория: ищем слово после "на"
+    # "потратила 500 на еду" → "еду"
+    category = "другое"
+    na_match = re.search(r"\bна\s+(\w+)", txt)
+    if na_match:
+        category = na_match.group(1)
+    else:
+        # Fallback: слово после числа (но не служебные слова)
+        after = txt[m.end():].strip()
+        parts = after.split()
+        skip_words = {"рублей", "руб", "р", "на", "в", "и", "или", "за"}
+        for part in parts:
+            if part not in skip_words and len(part) > 1:
+                category = part
+                break
+    
     return ParsedCommand(type="expense", payload={"amount": amount, "category": category})
 
 

@@ -70,20 +70,70 @@ async def natural_handler(message: types.Message, db) -> None:
             return
         # если вообще нечего отмечать — падаем дальше по логике
 
+    # Проверим, не это ли чистое время (HH:MM) - тогда игнорируем (FSM обработает)
+    time_only = re.match(r"^\s*\d{1,2}:\d{2}\s*$", text_original)
+    if time_only:
+        # Это время для какого-то FSM диалога (например, регистрация, настройки)
+        # Если FSM не активен, просто сообщим пользователю
+        await message.answer(
+            "Это похоже на время. Если ты хотела изменить время подъёма/отбоя, зайди в Настройки (⚙️).",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # Кладовка: естественный язык для добавления продуктов
+    pantry_patterns = [r"купил[аи]?", r"взял[аи]?", r"принес(?:ла)?", r"добавь в кладовку", r"закупил[аи]?"]
+    pantry_match = any(re.search(p, text) for p in pantry_patterns)
+    if pantry_match:
+        # Извлекаем продукты из текста
+        cleaned = text
+        for pattern in pantry_patterns:
+            cleaned = re.sub(pattern, "", cleaned)
+        # Разделяем по " и ", ","
+        items = re.split(r",|\s+и\s+", cleaned)
+        items = [item.strip() for item in items if item.strip() and len(item.strip()) > 1]
+        
+        if items:
+            user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+            added = []
+            for item_name in items:
+                # Простой вариант: добавляем продукт без количества и срока
+                await repo.create_pantry_item(db, user["id"], item_name.capitalize(), amount=1, unit="шт", expires_at=None, category="продукты")
+                added.append(item_name)
+            items_str = ", ".join(added)
+            await message.answer(
+                f"Добавила в кладовку: {items_str}. \n"
+                f"Посмотреть всё можно в 🍽 Еда → 📦 Кладовка.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
     # траты
     if "потрат" in text or "запиши трату" in text or "стоило" in text:
         amount = _extract_amount(text)
         if amount is None:
             return
-        words = text.split()
+        
+        # Извлекаем категорию: ищем слово после "на" 
+        # "потратила 500 на еду" → "еду"
+        # "потратила 500 рублей на такси" → "такси"
         category = "другое"
-        for w in words:
-            if w.isalpha() and not w.startswith("потрат") and not re.match(r"\d", w):
-                category = w
-                break
+        na_match = re.search(r"\bна\s+(\w+)", text)
+        if na_match:
+            category = na_match.group(1)
+        else:
+            # Fallback: ищем существительное после числа
+            words = text.split()
+            for i, w in enumerate(words):
+                if re.match(r"\d", w) and i + 1 < len(words):
+                    next_word = words[i + 1]
+                    if next_word.isalpha() and next_word not in ("рублей", "руб", "р", "на"):
+                        category = next_word
+                        break
+        
         user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
         await repo.add_expense(db, user["id"], amount, category)
-        await message.answer(f"Записала трату: {amount:.0f} ({category}).", reply_markup=main_menu_keyboard())
+        await message.answer(f"Записала трату: {amount:.0f} ₽ ({category}).", reply_markup=main_menu_keyboard())
         return
 
     # напоминание

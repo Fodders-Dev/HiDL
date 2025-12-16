@@ -278,6 +278,32 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
             FOREIGN KEY (med_id) REFERENCES meds(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS shopping_list (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            item_name TEXT NOT NULL,
+            quantity REAL DEFAULT 1,
+            unit TEXT DEFAULT 'шт',
+            category TEXT DEFAULT 'misc',
+            is_bought INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS cleaning_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            mode TEXT NOT NULL,
+            zones_json TEXT NOT NULL,
+            steps_json TEXT NOT NULL,
+            current_step_index INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
     await ensure_columns(conn)
@@ -330,6 +356,25 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             await conn.execute("ALTER TABLE wellness_settings ADD COLUMN expiring_window_days INTEGER DEFAULT 3;")
         if "affirm_mode" not in wellness_cols:
             await conn.execute("ALTER TABLE wellness_settings ADD COLUMN affirm_mode TEXT DEFAULT 'off';")
+        # Новые поля для системы аффирмаций 2.0
+        if "affirm_enabled" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN affirm_enabled INTEGER DEFAULT 0;")
+        if "affirm_categories" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN affirm_categories TEXT DEFAULT '[\"motivation\",\"calm\"]';")
+        if "affirm_frequency" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN affirm_frequency TEXT DEFAULT 'daily';")
+        if "affirm_hours" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN affirm_hours TEXT DEFAULT '[9]';")
+        if "meal_notify_enabled" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN meal_notify_enabled INTEGER DEFAULT 1;")
+        if "affirm_last_key" not in wellness_cols:
+            await conn.execute("ALTER TABLE wellness_settings ADD COLUMN affirm_last_key TEXT DEFAULT '';")
+    
+    # Добавляем поле gender в users
+    users_gender_info = await conn.execute_fetchall("PRAGMA table_info(users);")
+    users_gender_cols = {row["name"] for row in users_gender_info}
+    if "gender" not in users_gender_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN gender TEXT DEFAULT 'neutral';")
 
     weights_info = await conn.execute_fetchall("PRAGMA table_info(weights);")
     if not weights_info:
@@ -353,6 +398,7 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             CREATE TABLE IF NOT EXISTS pantry_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
+                household_id INTEGER,
                 name TEXT NOT NULL,
                 amount REAL DEFAULT 0,
                 unit TEXT NOT NULL DEFAULT 'шт',
@@ -375,8 +421,35 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         if "household_id" not in pantry_cols:
             await conn.execute("ALTER TABLE pantry_items ADD COLUMN household_id INTEGER;")
             await conn.execute(
-                "UPDATE pantry_items SET household_id = user_id WHERE household_id IS NULL"
+                """
+                UPDATE pantry_items
+                SET household_id = (
+                    SELECT household_id FROM users WHERE users.id = pantry_items.user_id
+                )
+                WHERE household_id IS NULL
+                """
             )
+
+
+
+    shop_info = await conn.execute_fetchall("PRAGMA table_info(shopping_list);")
+    if not shop_info:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shopping_list (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity REAL DEFAULT 1,
+                unit TEXT DEFAULT 'шт',
+                category TEXT DEFAULT 'misc',
+                is_bought INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
 
     # бытовая химия и расходники (общий инвентарь по дому)
     supplies_info = await conn.execute_fetchall("PRAGMA table_info(supplies);")
@@ -528,8 +601,8 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
                 "Умыться и почистить зубы",
                 "Заправить кровать и открыть окно",
                 "Выпить воды",
-                "Позавтракать чем угодно, не кофе",
-                "Проверь, что есть чистые вещи на день",
+                "Съесть что-то простое (хотя бы 5 минут)",
+                "Проверь, что с собой ключи/кошелёк/телефон (и зарядка, если нужно)",
             ],
         },
         {
@@ -537,7 +610,7 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
             "title": "День",
             "default_time": "13:00",
             "items": [
-                "Пообедать без фастфуда",
+                "Поесть нормально (без идеала)",
                 "Выпить воды",
                 "Выйти на улицу хотя бы на 15 минут",
                 "Разобрать посуду/кружки со стола",
@@ -571,6 +644,34 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
                 (routine["routine_key"], routine["title"], routine["default_time"]),
             )
             routine_id = cursor.lastrowid
+
+        # Мягкие правки копирайта в базовых рутинах (обновляем существующие строки).
+        if routine["routine_key"] == "morning":
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Проверь, что с собой ключи/кошелёк/телефон (и зарядка, если нужно)",
+                    routine_id,
+                    "Проверь, что есть чистые вещи на день",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Съесть что-то простое (хотя бы 5 минут)",
+                    routine_id,
+                    "Позавтракать чем угодно, не кофе",
+                ),
+            )
+        if routine["routine_key"] == "day":
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Поесть нормально (без идеала)",
+                    routine_id,
+                    "Пообедать без фастфуда",
+                ),
+            )
 
         existing_items = await conn.execute_fetchall(
             "SELECT title, sort_order FROM routine_items WHERE routine_id = ?",
