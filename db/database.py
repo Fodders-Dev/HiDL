@@ -1,6 +1,9 @@
 import asyncio
 import datetime
 import os
+import shutil
+import tempfile
+import urllib.request
 from typing import Any, Dict, List
 
 import aiosqlite
@@ -14,9 +17,59 @@ def _sqlite_path(database_url: str) -> str:
     return database_url
 
 
+def _is_sqlite_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+        return header.startswith(b"SQLite format 3\x00")
+    except Exception:
+        return False
+
+
+def _maybe_bootstrap_sqlite_db(path: str) -> None:
+    """
+    Optional one-time bootstrap for Railway volumes.
+
+    If DATABASE_URL points to a SQLite file that doesn't exist yet and
+    BOOTSTRAP_DB_URL is set, downloads the DB to the target path.
+    """
+    bootstrap_url = os.getenv("BOOTSTRAP_DB_URL", "").strip()
+    if not bootstrap_url:
+        return
+
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return
+
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        with urllib.request.urlopen(bootstrap_url, timeout=60) as resp:
+            with open(tmp_path, "wb") as out:
+                shutil.copyfileobj(resp, out)
+
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            raise RuntimeError("BOOTSTRAP_DB_URL download produced empty file")
+        if not _is_sqlite_file(tmp_path):
+            raise RuntimeError("BOOTSTRAP_DB_URL does not look like a SQLite database")
+
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
 async def connect(database_url: str) -> aiosqlite.Connection:
     """Open SQLite connection with row factory."""
     path = _sqlite_path(database_url)
+    _maybe_bootstrap_sqlite_db(path)
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
     conn = await aiosqlite.connect(path)
     conn.row_factory = aiosqlite.Row
