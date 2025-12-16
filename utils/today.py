@@ -13,6 +13,15 @@ from utils.rows import rows_to_dicts
 from utils.affirmations import random_affirmation_text
 
 
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
 async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     """Build /today text and inline keyboard as dashboard."""
     user = dict(user)
@@ -164,9 +173,28 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     if reg_due:
         # В кратком резюме не перечисляем все задачи по дому, чтобы не
         # дублировать список ниже в блоке «Регулярка по дому».
-        home_summary = f"🧹 Дом: сегодня {len(reg_due)} дела по дому."
+        total_home = len(reg_due)
+        max_titles = 1 if adhd else 2
+        titles = []
+        for r_raw in reg_due[:max_titles]:
+            title = row_to_dict(r_raw).get("title")
+            if title:
+                titles.append(title)
+        if titles:
+            listed = ", ".join(titles)
+            extra = total_home - len(titles)
+            extra_note = f" и ещё {extra}" if extra > 0 else ""
+            home_summary = (
+                f"🧹 Дом: сегодня {total_home} "
+                f"{_ru_plural(total_home, 'дело', 'дела', 'дел')} — {listed}{extra_note}."
+            )
+        else:
+            home_summary = (
+                f"🧹 Дом: сегодня {total_home} "
+                f"{_ru_plural(total_home, 'дело', 'дела', 'дел')} по дому."
+            )
     else:
-        home_summary = "🧹 Дом: на эту неделю всё чисто, можно выдохнуть."
+        home_summary = "🧹 Дом: на эту неделю всё чисто, можешь выдохнуть."
     if finance_line:
         summary_lines.append(finance_line)
     if home_summary:
