@@ -44,7 +44,10 @@ def _maybe_bootstrap_sqlite_db(path: str) -> None:
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+    # IMPORTANT: create temp file on the same filesystem as the target path.
+    # Railway volumes are mounted separately, and os.replace/rename from /tmp
+    # would fail with EXDEV (Invalid cross-device link).
+    with tempfile.NamedTemporaryFile(delete=False, dir=dir_name or None) as tmp:
         tmp_path = tmp.name
 
     try:
