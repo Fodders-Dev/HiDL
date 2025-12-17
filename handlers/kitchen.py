@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import math
+from html import escape as _html_escape
 from typing import Tuple, List, Optional
 
 from aiogram import Router, types, F
@@ -64,6 +65,10 @@ class CookingState(StatesGroup):
     confirm = State()
 
 # --- HELPERS ---
+def _h(value: object) -> str:
+    return _html_escape(str(value or ""))
+
+
 def load_recipes() -> List[dict]:
     if not os.path.exists(RECIPES_FILE):
         return []
@@ -179,8 +184,9 @@ def _from_base(amount_base: float, unit: str) -> float:
 
 
 def _format_ing_line(name: str, qty: float, unit: str) -> str:
+    name = _h(name)
     q = f"{qty:g}"
-    u = (unit or "").strip()
+    u = _h(unit).strip()
     if not u:
         return f"• {name}: {q}"
     return f"• {name}: {q} {u}"
@@ -469,7 +475,9 @@ async def view_recipe(callback: types.CallbackQuery):
     servings = max(1, servings)
     factor = servings / base
 
-    text = f"<b>{recipe.get('title','Рецепт')}</b>\n{recipe.get('desc','')}\n\n"
+    title = _h(recipe.get("title", "Рецепт"))
+    desc = _h(recipe.get("desc", ""))
+    text = f"<b>{title}</b>\n{desc}\n\n"
     text += f"⏱ {int(recipe.get('time_minutes', 15))} мин • 🍽 {servings} порц.\n\n"
     text += f"🧾 <b>Ингредиенты</b> (на {servings} порц.):\n"
     for ing in recipe.get("ingredients") or []:
@@ -478,7 +486,8 @@ async def view_recipe(callback: types.CallbackQuery):
 
     steps = recipe.get("steps") or []
     if steps:
-        text += "\n👩‍🍳 <b>Шаги</b>:\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps[:12])])
+        safe_steps = [_h(s) for s in steps[:12]]
+        text += "\n👩‍🍳 <b>Шаги</b>:\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(safe_steps)])
         if len(steps) > 12:
             text += "\n…"
 
@@ -516,13 +525,14 @@ async def cook_check_ingredients(callback: types.CallbackQuery, state: FSMContex
     servings = max(1, servings)
     factor = servings / base
 
-    text = f"🧑‍🍳 <b>Готовим: {recipe['title']}</b> ({servings} порц.)\n\nПроверка продуктов:\n"
+    text = f"🧑‍🍳 <b>Готовим: {_h(recipe.get('title', 'Рецепт'))}</b> ({servings} порц.)\n\nПроверка продуктов:\n"
     missing = []
     
     for ing in recipe.get("ingredients") or []:
+        ing_name = str(ing.get("name", ""))
         needed = _scale_qty(ing.get("qty", 0), factor, ing.get("unit", ""))
         # Find in pantry (rough matching)
-        found = next((p for p in pantry if ing["name"].lower() in p["name"].lower()), None)
+        found = next((p for p in pantry if ing_name.lower() in (p.get("name", "") or "").lower()), None)
         have = float(found["amount"]) if found and found.get("amount") is not None else 0.0
         unit = ing.get("unit", "")
         have_unit = (found.get("unit") if found else "") or unit
@@ -530,7 +540,7 @@ async def cook_check_ingredients(callback: types.CallbackQuery, state: FSMContex
         status = "✅"
         if not found:
             status = "❌ Нет"
-            missing.append({"name": ing["name"], "qty": needed, "unit": unit})
+            missing.append({"name": ing_name, "qty": needed, "unit": unit})
         else:
             need_base, kind_n = _to_base(needed, unit)
             have_base, kind_h = _to_base(have, have_unit)
@@ -539,11 +549,11 @@ async def cook_check_ingredients(callback: types.CallbackQuery, state: FSMContex
                     status = "⚠️ Мало" if have_base > 0 else "❌ Нет"
                     miss_base = max(0.0, need_base - have_base)
                     miss_qty = _from_base(miss_base, unit)
-                    missing.append({"name": ing["name"], "qty": miss_qty, "unit": unit})
+                    missing.append({"name": ing_name, "qty": miss_qty, "unit": unit})
             else:
                 status = "❔"
         
-        text += f"{status} {ing['name']}: надо {needed:g} {unit}, (есть {have:g} {have_unit})\n"
+        text += f"{status} {_h(ing_name)}: надо {needed:g} {_h(unit)}, (есть {have:g} {_h(have_unit)})\n"
         
     text += "\nНачинаем готовить?"
     
@@ -639,10 +649,10 @@ async def fridge_view(callback: types.CallbackQuery, db):
             cats[c].append(i)
             
         for c, c_items in cats.items():
-            text += f"\n<b>{c.capitalize()}</b>:\n"
+            text += f"\n<b>{_h((c or '').capitalize())}</b>:\n"
             for i in c_items:
                 low = " ⚠️" if is_low(i) else ""
-                text += f"• {i['name']} — {format_quantity(i['amount'], i['unit'])}{low}\n"
+                text += f"• {_h(i.get('name',''))} — {format_quantity(i['amount'], i['unit'])}{low}\n"
                 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить продукт", callback_data="kitchen:fridge_add")],

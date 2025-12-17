@@ -234,7 +234,14 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
 
         await wellness.wellness_settings(callback.message, db)
     elif action == "profile":
-        await callback.message.answer("Профиль питания можно выбрать в «Спросить маму» → готовка.", reply_markup=main_menu_keyboard())
+        from handlers import settings as settings_handler
+
+        await settings_handler.settings_select(
+            callback.replace(data="settings:profile"),
+            state=state,
+            db=db,
+            skip_answer=True,
+        )
     elif action == "settings":
         from handlers import settings as settings_handler
 

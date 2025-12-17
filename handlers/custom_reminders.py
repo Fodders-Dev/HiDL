@@ -356,16 +356,23 @@ async def reminder_when(callback: types.CallbackQuery, state: FSMContext, db) ->
         now_utc = datetime.datetime.utcnow()
         hhmm = format_time_local(now_utc + datetime.timedelta(hours=1), user["timezone"])
         data = await state.get_data()
-        await repo.create_custom_reminder(
+        target_date = local_date_str(now_utc + datetime.timedelta(hours=1), user["timezone"])
+        reminder_id = await repo.create_custom_reminder(
             db,
             user_id=user["id"],
             title=data["title"],
             reminder_time=hhmm,
-            frequency_days=1,
+            frequency_days=9999,
         )
+        try:
+            due = datetime.date.fromisoformat(target_date)
+            baseline = (due - datetime.timedelta(days=9999)).isoformat()
+            await repo.set_custom_reminder_sent(db, reminder_id, baseline)
+        except Exception:
+            pass
         await state.clear()
         await callback.message.answer(
-            ack(f"{data['title']} в {hhmm} (ежедневно).\n\nПосмотреть и удалить старые можно в разделе ⏰ Напоминания."),
+            ack(f"{data['title']} в {hhmm} (один раз).\n\nПосмотреть и удалить старые можно в разделе ⏰ Напоминания."),
             reply_markup=main_menu_keyboard(),
         )
         await callback.answer()
@@ -379,7 +386,7 @@ async def reminder_when(callback: types.CallbackQuery, state: FSMContext, db) ->
     if choice in ("today", "tomorrow", "custom"):
         await state.update_data(when_choice=choice)
         await state.set_state(CustomReminderState.time)
-        await callback.message.answer("Введи время в формате HH:MM (например 09:00). Напоминание будет повторяться.")
+        await callback.message.answer("Введи время в формате HH:MM (например 09:00). Потом выберем повтор.")
         await callback.answer()
 
 
@@ -412,12 +419,12 @@ async def add_reminder_time(message: types.Message, state: FSMContext, db) -> No
     reminder_time = hhmm_norm
     # Смещение старта для завтра: пометим последнюю отправку как сегодня, чтобы первый раз пришло завтра.
     last_sent = None
+    local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    target_date = local_date
     if when_choice == "tomorrow":
-        from utils.time import local_date_str
-
-        local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+        target_date = (datetime.date.fromisoformat(local_date) + datetime.timedelta(days=1)).isoformat()
         last_sent = local_date
-    await state.update_data(reminder_time=reminder_time, last_sent=last_sent)
+    await state.update_data(reminder_time=reminder_time, last_sent=last_sent, target_date=target_date)
     if when_choice == "weekly":
         await state.update_data(pending_freq=7)
         await state.set_state(CustomReminderState.weekday)
@@ -569,6 +576,15 @@ async def _save_reminder_with_frequency(
     user_dict = dict(user)
     reminder_time = data.get("reminder_time", "09:00")
     last_sent = data.get("last_sent")
+    effective_last_sent = last_sent
+    if freq == 9999:
+        tz = user_dict.get("timezone", "UTC")
+        tdate = data.get("target_date") or local_date_str(datetime.datetime.utcnow(), tz)
+        try:
+            due = datetime.date.fromisoformat(tdate)
+            effective_last_sent = (due - datetime.timedelta(days=9999)).isoformat()
+        except Exception:
+            effective_last_sent = last_sent
     title = data.get("title", "Напоминание")
     reminder_id = await repo.create_custom_reminder(
         db,
@@ -582,8 +598,8 @@ async def _save_reminder_with_frequency(
         f"custom_reminder.create user_id={user['id']} tg_user_id={tg_user_id} title={title!r} time={reminder_time} "
         f"freq={freq} target_weekday={target_weekday} last_sent={last_sent}"
     )
-    if last_sent:
-        await repo.set_custom_reminder_sent(db, reminder_id, last_sent)
+    if effective_last_sent:
+        await repo.set_custom_reminder_sent(db, reminder_id, effective_last_sent)
     await state.clear()
     note = ""
     today = local_date_str(datetime.datetime.utcnow(), user_dict.get("timezone", "UTC"))
