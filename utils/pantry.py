@@ -14,12 +14,15 @@ def format_quantity(amount: float | int | None, unit: str | None) -> str:
     except (TypeError, ValueError):
         value = 0.0
     u = (unit or "").strip()
+    # normalize common units for RU UI
+    u_map = {"g": "г", "гр": "г", "kg": "кг", "ml": "мл", "l": "л"}
+    u_norm = u_map.get(u.lower(), u)
     # Для красивого вывода избегаем длинных хвостов после запятой
     if abs(value - int(value)) < 1e-6:
         num = f"{int(value)}"
     else:
         num = f"{value:.2g}"
-    return f"{num} {u or 'шт'}".strip()
+    return f"{num} {u_norm or 'шт'}".strip()
 
 
 def is_low(item: Mapping[str, Any]) -> bool:
@@ -52,4 +55,3 @@ def is_low(item: Mapping[str, Any]) -> bool:
 
     # Для штук — когда осталась одна или меньше
     return amount <= 1
-

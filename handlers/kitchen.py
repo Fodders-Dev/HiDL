@@ -269,20 +269,27 @@ def recipes_paged_keyboard(items: List[dict], category: str, page: int, page_siz
     rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="kitchen:recipes")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def shopping_list_keyboard(items: List[dict]) -> InlineKeyboardMarkup:
+def shopping_list_keyboard(items: List[dict], scope: str = "household") -> InlineKeyboardMarkup:
     rows = []
     for item in items:
-        status = "✅" if item["is_bought"] else "⭕️"
-        txt = f"{status} {item['item_name']} ({item['quantity']:g} {item['unit']})"
+        status = "✅" if item.get("is_bought") else "⭕️"
+        txt = f"{status} {item['item_name']} ({format_quantity(item.get('quantity'), item.get('unit'))})"
         rows.append([
-            InlineKeyboardButton(text=txt, callback_data=f"kitchen:shop_toggle:{item['id']}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"kitchen:shop_del:{item['id']}")
+            InlineKeyboardButton(text=txt, callback_data=f"kitchen:shop_toggle:{item['id']}:{scope}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"kitchen:shop_del:{item['id']}:{scope}"),
         ])
-    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="kitchen:shop_add")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"kitchen:shop_add:{scope}")])
     if any(i["is_bought"] for i in items):
-        rows.append([InlineKeyboardButton(text="🏠 Я всё купил (в холодильник)", callback_data="kitchen:shop_finish")])
+        rows.append([InlineKeyboardButton(text="🏠 Перенести отмеченное в холодильник", callback_data=f"kitchen:shop_finish:{scope}")])
     rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _scope_switch_row(current: str) -> list[InlineKeyboardButton]:
+    return [
+        InlineKeyboardButton(text=("✅ 👥 Общий" if current != "personal" else "👥 Общий"), callback_data="kitchen:shoplist:household"),
+        InlineKeyboardButton(text=("✅ 👤 Личный" if current == "personal" else "👤 Личный"), callback_data="kitchen:shoplist:personal"),
+    ]
 
 # --- HANDLERS: MAIN ---
 @router.message(Command("kitchen"))
@@ -295,64 +302,86 @@ async def kitchen_home(callback: types.CallbackQuery):
     await callback.answer()
 
 # --- HANDLERS: SHOPPING LIST ---
-@router.callback_query(lambda c: c.data == "kitchen:shoplist")
-async def show_shoplist(callback: types.CallbackQuery, db):
+async def _render_shoplist(callback: types.CallbackQuery, db, scope: str) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    rows = await repo.list_shopping_items(db, user["id"])
+    rows = await repo.list_shopping_items(db, user["id"], scope=scope)
     items = rows_to_dicts(rows)
     text = "<b>🛒 Список покупок</b>\n"
+    scope_label = "👥 общий" if scope != "personal" else "👤 личный"
     if not items:
         text += "Пока пусто. Можно добавить продукты вручную или из рецептов."
     else:
         bought_cnt = sum(1 for i in items if i["is_bought"])
-        text += f"Всего: {len(items)}, куплено: {bought_cnt}"
+        text += f"{scope_label}\nВсего: {len(items)}, отмечено: {bought_cnt}"
     
-    await callback.message.edit_text(text, reply_markup=shopping_list_keyboard(items), parse_mode="HTML")
+    kb = shopping_list_keyboard(items, scope=scope)
+    kb.inline_keyboard.insert(0, _scope_switch_row(scope))
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shoplist"))
+async def show_shoplist(callback: types.CallbackQuery, db):
+    parts = (callback.data or "").split(":")
+    scope = parts[2] if len(parts) > 2 else "household"
+    await _render_shoplist(callback, db, scope=scope)
     await callback.answer()
 
 
 async def send_shoplist(message: types.Message, db) -> None:
     """Открыть список покупок из обычного сообщения (reply-кнопки)."""
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    rows = await repo.list_shopping_items(db, user["id"])
+    rows = await repo.list_shopping_items(db, user["id"], scope="household")
     items = rows_to_dicts(rows)
     text = "<b>🛒 Список покупок</b>\n"
     if not items:
         text += "Пока пусто. Можно добавить продукты вручную или из рецептов."
     else:
         bought_cnt = sum(1 for i in items if i["is_bought"])
-        text += f"Всего: {len(items)}, куплено: {bought_cnt}"
-    await message.answer(text, reply_markup=shopping_list_keyboard(items), parse_mode="HTML")
+        text += f"👥 общий\nВсего: {len(items)}, отмечено: {bought_cnt}"
+    kb = shopping_list_keyboard(items, scope="household")
+    kb.inline_keyboard.insert(0, _scope_switch_row("household"))
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shop_toggle:"))
 async def toggle_shop_item(callback: types.CallbackQuery, db):
-    iid = int(callback.data.split(":")[2])
+    parts = callback.data.split(":")
+    iid = int(parts[2])
+    scope = parts[3] if len(parts) > 3 else "household"
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    rows = await repo.list_shopping_items(db, user["id"]) # Get current state to toggle
+    rows = await repo.list_shopping_items(db, user["id"], scope=scope) # includes both bought/unbought
     items = rows_to_dicts(rows)
     item = next((i for i in items if i["id"] == iid), None)
     if item:
         new_status = not item["is_bought"]
-        await repo.mark_shopping_bought(db, user["id"], iid, new_status)
-    await show_shoplist(callback, db) # refresh
+        await repo.mark_shopping_bought(db, user["id"], iid, new_status, scope=scope)
+    await _render_shoplist(callback, db, scope=scope)
+    await callback.answer()
 
 @router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shop_del:"))
 async def del_shop_item(callback: types.CallbackQuery, db):
-    iid = int(callback.data.split(":")[2])
+    parts = callback.data.split(":")
+    iid = int(parts[2])
+    scope = parts[3] if len(parts) > 3 else "household"
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    await repo.delete_shopping_item(db, user["id"], iid)
-    await show_shoplist(callback, db)
+    await repo.delete_shopping_item(db, user["id"], iid, scope=scope)
+    await _render_shoplist(callback, db, scope=scope)
+    await callback.answer()
 
-@router.callback_query(lambda c: c.data == "kitchen:shop_finish")
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shop_finish"))
 async def finish_shopping(callback: types.CallbackQuery, db):
+    parts = (callback.data or "").split(":")
+    scope = parts[2] if len(parts) > 2 else "household"
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    count = await repo.complete_shopping_trip(db, user["id"])
+    count = await repo.complete_shopping_trip(db, user["id"], scope=scope)
     await callback.answer(f"Перенесено продуктов: {count}", show_alert=True)
-    await show_shoplist(callback, db)
+    await _render_shoplist(callback, db, scope=scope)
 
-@router.callback_query(lambda c: c.data == "kitchen:shop_add")
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shop_add"))
 async def add_shop_start(callback: types.CallbackQuery, state: FSMContext):
+    parts = (callback.data or "").split(":")
+    scope = parts[2] if len(parts) > 2 else "household"
     await state.set_state(ShoppingAddState.name)
+    await state.update_data(shop_scope=scope)
     await callback.message.answer("Что нужно купить? (Напиши название)", reply_markup=main_menu_keyboard())
     await callback.answer()
 
@@ -367,11 +396,12 @@ async def add_shop_amount(message: types.Message, state: FSMContext, db):
     amount, unit = _parse_amount_unit(message.text)
     data = await state.get_data()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    await repo.create_shopping_item(db, user["id"], data["name"], amount, unit)
+    scope = data.get("shop_scope") or "household"
+    await repo.create_shopping_item(db, user["id"], data["name"], amount, unit, scope=scope)
     await state.clear()
     await message.answer(f"✅ Добавлено: {data['name']} ({amount} {unit}) в список покупок.")
     # Show list again? Maybe just button
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 К списку", callback_data="kitchen:shoplist")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 К списку", callback_data=f"kitchen:shoplist:{scope}")]])
     await message.answer("Перейти к списку?", reply_markup=kb)
 
 # --- HANDLERS: RECIPES ---
@@ -624,6 +654,38 @@ async def fridge_view(callback: types.CallbackQuery, db):
     await callback.answer()
 
 
+@router.callback_query(lambda c: c.data == "kitchen:fridge_del_view")
+async def fridge_delete_menu(callback: types.CallbackQuery, db):
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    rows_all = await repo.list_pantry_items(db, user["id"])
+    items = rows_to_dicts(rows_all)
+    if not items:
+        await callback.answer("Тут пусто.", show_alert=True)
+        await fridge_view(callback, db)
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items[:40]:
+        label = f"🗑 {item['name']} ({format_quantity(item.get('amount'), item.get('unit'))})"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"kitchen:fridge_del:{item['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="kitchen:fridge")])
+    await callback.message.edit_text(
+        "<b>Удалить продукт</b>\nВыбери, что убрать из холодильника:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:fridge_del:"))
+async def fridge_delete_item(callback: types.CallbackQuery, db):
+    item_id = int(callback.data.split(":")[2])
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    await repo.delete_pantry_item(db, user["id"], item_id)
+    await callback.answer("Убрала")
+    await fridge_view(callback, db)
+
+
 @router.callback_query(lambda c: c.data == "kitchen:shop_min:add")
 async def add_minimum_shoplist(callback: types.CallbackQuery, db):
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
@@ -664,10 +726,10 @@ async def add_minimum_shoplist(callback: types.CallbackQuery, db):
         ]
 
     for name, qty, unit in items:
-        await repo.create_shopping_item(db, user["id"], name, qty, unit, category="минимум")
+        await repo.create_shopping_item(db, user["id"], name, qty, unit, category="минимум", scope="household")
 
     await callback.answer("Добавила базовый минимум 🛒", show_alert=True)
-    await show_shoplist(callback, db)
+    await _render_shoplist(callback, db, scope="household")
 
 @router.callback_query(lambda c: c.data == "kitchen:fridge_add")
 async def fridge_add_start(callback: types.CallbackQuery, state: FSMContext):

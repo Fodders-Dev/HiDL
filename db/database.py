@@ -339,6 +339,8 @@ async def init_db(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS shopping_list (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            household_id INTEGER,
+            scope TEXT DEFAULT 'household',
             item_name TEXT NOT NULL,
             quantity REAL DEFAULT 1,
             unit TEXT DEFAULT 'шт',
@@ -501,6 +503,8 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             CREATE TABLE IF NOT EXISTS shopping_list (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
+                household_id INTEGER,
+                scope TEXT DEFAULT 'household',
                 item_name TEXT NOT NULL,
                 quantity REAL DEFAULT 1,
                 unit TEXT DEFAULT 'шт',
@@ -512,6 +516,28 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             );
             """
         )
+    else:
+        shop_cols = {row["name"] for row in shop_info}
+        if "household_id" not in shop_cols:
+            try:
+                await conn.execute("ALTER TABLE shopping_list ADD COLUMN household_id INTEGER;")
+            except Exception:
+                pass
+        if "scope" not in shop_cols:
+            try:
+                await conn.execute("ALTER TABLE shopping_list ADD COLUMN scope TEXT DEFAULT 'household';")
+            except Exception:
+                pass
+        try:
+            await conn.execute(
+                """
+                UPDATE shopping_list
+                SET household_id = (SELECT household_id FROM users WHERE users.id = shopping_list.user_id)
+                WHERE (household_id IS NULL OR household_id = 0) AND (scope IS NULL OR scope = '' OR scope = 'household')
+                """
+            )
+        except Exception:
+            pass
 
     # бытовая химия и расходники (общий инвентарь по дому)
     supplies_info = await conn.execute_fetchall("PRAGMA table_info(supplies);")

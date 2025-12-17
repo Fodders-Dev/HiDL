@@ -11,9 +11,9 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="🍽 Еда")],
             [KeyboardButton(text="💰 Деньги"), KeyboardButton(text="🧹 Дом")],
-            [KeyboardButton(text="🏋️ Спорт"), KeyboardButton(text="⚙ Настройки")],
-            [KeyboardButton(text="🛒 Покупки"), KeyboardButton(text="🤱 Спросить маму")],
-            [KeyboardButton(text="💬 Поговорить"), KeyboardButton(text="☕ Поддержать")],
+            [KeyboardButton(text="🏋️ Спорт"), KeyboardButton(text="🛒 Покупки")],
+            [KeyboardButton(text="🤱 Спросить маму"), KeyboardButton(text="💬 Поговорить")],
+            [KeyboardButton(text="⚙ Настройки"), KeyboardButton(text="☕ Поддержать")],
         ],
         resize_keyboard=True,
     )
