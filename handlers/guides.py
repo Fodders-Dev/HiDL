@@ -315,7 +315,7 @@ async def recipe_steps(callback: types.CallbackQuery) -> None:
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="Я приготовил(а)", callback_data=f"recipe:cooked:{key}:{servings}"
+                    text="Готово ✅", callback_data=f"recipe:cooked:{key}:{servings}"
                 )
             ]
         ]

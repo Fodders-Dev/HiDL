@@ -6,6 +6,7 @@ from aiogram import Router, types
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.tone import tone_ack
+from utils.gender import done_button_label
 
 
 def _visible_steps(items: list[dict], done: set[int]) -> list[tuple[int, dict]]:
@@ -48,7 +49,7 @@ def _render_routine_text(title: str, reminder_time: str, items, done: set[int]) 
         else:
             text_lines.append(f"• {it['title']}")
     header = f"🕒 {title} ({reminder_time})\n\n" + "\n".join(text_lines)
-    footer = "\n\nОтметь статус:"
+    footer = "\n\nЕсли сил мало — выбери один пункт. Этого уже достаточно.\n\nОтметь статус:"
     if has_pills:
         footer += (
             "\n\nНапоминание про таблетки — это только чтобы не забыть. "
@@ -58,12 +59,12 @@ def _render_routine_text(title: str, reminder_time: str, items, done: set[int]) 
 
 
 def _build_routine_keyboard(
-    routine_id: int, local_date: str, items, done: set[int], status: str
+    user: dict, routine_id: int, local_date: str, items, done: set[int], status: str
 ) -> types.InlineKeyboardMarkup:
     kb_rows = [
         [
-            types.InlineKeyboardButton(text="Сделал(а) ✔", callback_data=f"routine:{routine_id}:{local_date}:done"),
-            types.InlineKeyboardButton(text="Напомнить позже", callback_data=f"routine:{routine_id}:{local_date}:later"),
+            types.InlineKeyboardButton(text=done_button_label(user), callback_data=f"routine:{routine_id}:{local_date}:done"),
+            types.InlineKeyboardButton(text="Позже", callback_data=f"routine:{routine_id}:{local_date}:later"),
             types.InlineKeyboardButton(text="Пропустить", callback_data=f"routine:{routine_id}:{local_date}:skip"),
         ]
     ]
@@ -81,7 +82,7 @@ def _build_routine_keyboard(
         kb_rows.append(
             [
                 types.InlineKeyboardButton(
-                    text="Закончить сейчас", callback_data=f"ritemfinish:{routine_id}:{local_date}"
+                    text="Закончить без отметок", callback_data=f"ritemfinish:{routine_id}:{local_date}"
                 )
             ]
         )
@@ -129,18 +130,18 @@ async def routine_item_toggle(callback: types.CallbackQuery, db) -> None:
         await repo.upsert_user_task(db, user["id"], routine_id, local_date, status="done")
         new_status = "done"
     text = _render_routine_text(title, reminder_time, items, done)
-    kb = _build_routine_keyboard(routine_id, local_date, items, done, new_status)
+    kb = _build_routine_keyboard(user, routine_id, local_date, items, done, new_status)
     try:
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer("Отметила." if added else "Сняла отметку.")
+    await callback.answer("Отмечено." if added else "Снято.")
     # если все видимые шаги закрыты — отправить краткое подтверждение и убрать клавиатуру
     if visible_indices and visible_indices.issubset(done):
         try:
-            await callback.message.edit_text(f"🕒 {title} завершена ✔", reply_markup=None)
+            await callback.message.edit_text(f"✅ {title} — готово. Можешь выдохнуть.", reply_markup=None)
         except Exception:
-            await callback.message.answer(f"🕒 {title} завершена ✔", reply_markup=None)
+            await callback.message.answer(f"✅ {title} — готово. Можешь выдохнуть.", reply_markup=None)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("ritemfinish:"))
@@ -171,7 +172,7 @@ async def routine_finish(callback: types.CallbackQuery, db) -> None:
     routine_row = await repo.get_user_routine(db, user["id"], routine_id)
     routine = dict(routine_row) if routine_row else {}
     title = routine.get("title", "Рутина")
-    await callback.answer("Закончила.")
+    await callback.answer("Готово.")
     text = tone_ack("soft", f"{title} завершена, +{points} очков")
     # Убираем inline-кнопки редактированием без клавиатуры.
     try:

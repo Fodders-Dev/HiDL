@@ -14,6 +14,7 @@ from keyboards.common import main_menu_keyboard
 from utils.time import local_date_str
 from utils.user import ensure_user
 from utils import texts
+from utils.gender import button_label
 from utils.vitamins import vitamin_names, get_vitamin
 
 router = Router()
@@ -262,11 +263,12 @@ async def _med_later(bot, db, log_id: int) -> None:
     user = await repo.get_user(db, log["user_id"])
     if not user:
         return
+    user_d = dict(user)
     text = f"Напоминание позже: {med['name']} ({med['dose_text']})."
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Принял(а)", callback_data=f"medtake:{log_id}"),
+                InlineKeyboardButton(text=button_label(user_d, "Принял ✅", "Приняла ✅"), callback_data=f"medtake:{log_id}"),
                 InlineKeyboardButton(text="Пропустить", callback_data=f"medskip:{log_id}"),
             ]
         ]

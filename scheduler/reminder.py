@@ -9,6 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import repositories as repo
 from utils.time import local_date_str, should_trigger, tzinfo_from_string
+from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
 
 
@@ -262,7 +263,7 @@ class ReminderScheduler:
                         continue
                     text = (
                         f"💊 Пора «{med['name']}»: {med['dose_text'] or 'принять дозу'}.\n"
-                        "Ты уже принял(а)?"
+                        f"{g(user, 'Ты уже принял?', 'Ты уже приняла?', 'Ты уже принял(а)?')}"
                     )
                     if tone == "soft":
                         text += "\nЕсли сейчас не до этого — можно перенести на позже."
@@ -270,7 +271,7 @@ class ReminderScheduler:
                         inline_keyboard=[
                             [
                                 InlineKeyboardButton(
-                                    text="Принял(а)",
+                                    text=button_label(user, "Принял ✅", "Приняла ✅"),
                                     callback_data="",  # будет подставлен после вставки лога
                                 ),
                                 InlineKeyboardButton(
@@ -379,16 +380,17 @@ class ReminderScheduler:
         task_lines = "\n".join(lines)
         text = (
             f"🕒 {routine['title']} ({routine['reminder_time']} локального времени)\n\n"
+            f"Если сил мало — выбери один пункт. Этого уже достаточно.\n\n"
             f"{task_lines}\n\nОтметь статус:"
         )
         rows = [
             [
                 InlineKeyboardButton(
-                    text="Сделал(а) ✔",
+                    text=done_button_label(user),
                     callback_data=f"routine:{routine['routine_id']}:{local_date}:done",
                 ),
                 InlineKeyboardButton(
-                    text="Напомнить позже",
+                    text="Позже",
                     callback_data=f"routine:{routine['routine_id']}:{local_date}:later",
                 ),
                 InlineKeyboardButton(
@@ -418,11 +420,11 @@ class ReminderScheduler:
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="Сделал(а) ✔",
+                        text=done_button_label(user),
                         callback_data=f"custom:{reminder['id']}:{local_date}:done",
                     ),
                     InlineKeyboardButton(
-                        text="Напомнить позже",
+                        text="Позже",
                         callback_data=f"custom:{reminder['id']}:{local_date}:later",
                     ),
                     InlineKeyboardButton(

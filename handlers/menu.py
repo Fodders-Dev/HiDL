@@ -84,9 +84,9 @@ async def home_menu(message: types.Message, db) -> None:
     )
 
 
-@router.message(lambda m: m.text and "движ" in m.text.lower())
+@router.message(lambda m: m.text and ("спорт" in m.text.lower() or "движ" in m.text.lower()))
 async def move_menu(message: types.Message) -> None:
-    await message.answer("Движение: прогулки, фокус.", reply_markup=movement_menu_keyboard())
+    await message.answer("Спорт: чуть подвигаться, чтобы стало легче в голове и теле.", reply_markup=movement_menu_keyboard())
 
 
 @router.message(lambda m: m.text and ("поговор" in m.text.lower() or "болта" in m.text.lower()))

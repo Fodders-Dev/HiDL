@@ -14,6 +14,7 @@ router = Router()
 
 class Registration(StatesGroup):
     name = State()
+    gender = State()
     timezone = State()
     wake_up = State()
     sleep = State()
@@ -54,10 +55,19 @@ async def regname_choice(callback: types.CallbackQuery, state: FSMContext) -> No
     choice = callback.data.split(":")[1]
     if choice != "other":
         await state.update_data(name=choice)
-        await state.set_state(Registration.timezone)
+        await state.set_state(Registration.gender)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="👩 Она", callback_data="reggender:female"),
+                    InlineKeyboardButton(text="👨 Он", callback_data="reggender:male"),
+                ],
+                [InlineKeyboardButton(text="🙂 Не важно", callback_data="reggender:neutral")],
+            ]
+        )
         await callback.message.answer(
-            "В каком ты часовом поясе? Можно прислать текущее время (HH:MM) — я сама посчитаю смещение. "
-            "Или введи явно: Europe/Moscow, UTC+3. Потом можно поменять в ⚙ Настройки."
+            "Как мне к тебе обращаться? Это нужно, чтобы писать окончания нормально (сделал/сделала).",
+            reply_markup=kb,
         )
     else:
         await callback.message.answer("Как к тебе обращаться?")
@@ -67,11 +77,35 @@ async def regname_choice(callback: types.CallbackQuery, state: FSMContext) -> No
 @router.message(Registration.name)
 async def reg_name(message: types.Message, state: FSMContext) -> None:
     await state.update_data(name=(message.text or "").strip() or message.from_user.first_name or "друг")
-    await state.set_state(Registration.timezone)
+    await state.set_state(Registration.gender)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👩 Она", callback_data="reggender:female"),
+                InlineKeyboardButton(text="👨 Он", callback_data="reggender:male"),
+            ],
+            [InlineKeyboardButton(text="🙂 Не важно", callback_data="reggender:neutral")],
+        ]
+    )
     await message.answer(
-        "В каком ты часовом поясе? Можно прислать текущее время (HH:MM) — я сама посчитаю смещение. "
+        "Как мне к тебе обращаться? Это нужно, чтобы писать окончания нормально (сделал/сделала).",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("reggender:"))
+async def reggender_choice(callback: types.CallbackQuery, state: FSMContext) -> None:
+    gender = callback.data.split(":")[1]
+    if gender not in {"male", "female", "neutral"}:
+        await callback.answer()
+        return
+    await state.update_data(gender=gender)
+    await state.set_state(Registration.timezone)
+    await callback.message.answer(
+        "В каком ты часовом поясе? Можно прислать текущее время (HH:MM) - я сама посчитаю смещение. "
         "Или введи явно: Europe/Moscow, UTC+3. Потом можно поменять в ⚙ Настройки."
     )
+    await callback.answer("Сохранено")
 
 
 @router.message(Registration.timezone)
@@ -118,6 +152,7 @@ async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
         timezone=data["timezone"],
         wake_up_time=data["wake_up"],
         sleep_time=message.text.strip(),
+        gender=data.get("gender", "neutral"),
     )
     await repo.ensure_user_routines(db, user_id)
     # Аудит запускаем по желанию через меню Дом -> План
@@ -129,7 +164,7 @@ async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
         "• 🍽 Еда — тарелка дня, рецепты, меню и запасы дома.\n"
         "• 🧹 Дом — уборка сейчас, план по дому и регулярные дела.\n"
         "• 💰 Деньги — траты, отчёты и лимиты по категориям.\n"
-        "• 🚶 Движение — прогулки, фокус‑таймер, цели по активности.\n"
+        "• 🏋️ Спорт — прогулки, разминка, фокус‑таймер, цели по активности.\n"
         "• ⏰ Напоминания — свои напоминания и кастомные задачи.\n"
         "• ⚙ Настройки — имя, часовой пояс, подъём/отбой, тон, режимы.\n"
         "• 🤱 Спросить маму — диалоги по быту, стирке, готовке.\n\n"
@@ -150,7 +185,7 @@ async def cmd_help(message: types.Message) -> None:
         "🍽 Еда — тарелка дня, рецепты, меню, список покупок\n"
         "💰 Деньги — траты, отчёт, лимиты (всё через кнопки)\n"
         "🧹 Дом — уборка, зоны, стирка/запах, план по дому\n"
-        "🚶 Движение — прогулки/фокус, позже добавим тренировки/вес\n"
+        "🏋️ Спорт — прогулки/фокус, позже добавим тренировки/вес\n"
         "⚙ Настройки — тон, вода/еда, фокус, щадящий режим, профиль, время рутин\n"
         "🤱 Спросить маму — диалоги по быту\n\n"
         "Продвинутые команды:\n"

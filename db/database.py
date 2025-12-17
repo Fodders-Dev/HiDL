@@ -654,11 +654,13 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
             "title": "Утро",
             "default_time": "07:30",
             "items": [
+                "Стакан воды (можно прямо у кровати)",
                 "Умыться и почистить зубы",
-                "Заправить кровать и открыть окно",
-                "Выпить воды",
-                "Съесть что-то простое (хотя бы 5 минут)",
-                "Проверь, что с собой ключи/кошелёк/телефон (и зарядка, если нужно)",
+                "Заправить кровать и открыть окно на 2–5 минут",
+                "Зарядка 2–5 минут (шея/плечи/спина)",
+                "Завтрак/перекус (без идеала, просто чтобы было топливо)",
+                "Выбери 1 главное дело на сегодня (остальное — бонус)",
+                "Проверь, что с собой ключи/телефон/карта (и зарядка, если нужно)",
             ],
         },
         {
@@ -666,10 +668,11 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
             "title": "День",
             "default_time": "13:00",
             "items": [
-                "Поесть нормально (без идеала)",
-                "Выпить воды",
-                "Выйти на улицу хотя бы на 15 минут",
-                "Разобрать посуду/кружки со стола",
+                "Поесть нормально (хоть на 10 минут, без идеала)",
+                "Стакан воды",
+                "Чуть подвигаться: 10–15 минут на улице или пройтись по дому",
+                "Один маленький шаг по главному делу (5–10 минут)",
+                "Мини‑порядок 2 минуты (стол/раковина/мусор)",
             ],
         },
         {
@@ -677,10 +680,11 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
             "title": "Вечер",
             "default_time": "21:30",
             "items": [
-                "Помыть посуду",
-                "Сложить вещи по местам",
-                "Короткий душ и гигиена",
-                "Подготовить одежду на завтра",
+                "Лёгкий ужин/перекус (чтобы не ложиться на пустой желудок)",
+                "Гигиена: умыться и зубы",
+                "5 минут на дом: посуда/поверхность/мусор",
+                "Собрать на завтра: ключи/зарядка/документы",
+                "Тёплый душ или растяжка 3 минуты (снять напряжение)",
                 "Проветрить комнату перед сном",
             ],
         },
@@ -706,7 +710,39 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
             await conn.execute(
                 "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
                 (
+                    "Стакан воды (можно прямо у кровати)",
+                    routine_id,
+                    "Выпить воды",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Заправить кровать и открыть окно на 2–5 минут",
+                    routine_id,
+                    "Заправить кровать и открыть окно",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Завтрак/перекус (без идеала, просто чтобы было топливо)",
+                    routine_id,
+                    "Съесть что-то простое (хотя бы 5 минут)",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Проверь, что с собой ключи/телефон/карта (и зарядка, если нужно)",
+                    routine_id,
                     "Проверь, что с собой ключи/кошелёк/телефон (и зарядка, если нужно)",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Проверь, что с собой ключи/телефон/карта (и зарядка, если нужно)",
                     routine_id,
                     "Проверь, что есть чистые вещи на день",
                 ),
@@ -714,7 +750,7 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
             await conn.execute(
                 "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
                 (
-                    "Съесть что-то простое (хотя бы 5 минут)",
+                    "Завтрак/перекус (без идеала, просто чтобы было топливо)",
                     routine_id,
                     "Позавтракать чем угодно, не кофе",
                 ),
@@ -723,9 +759,66 @@ async def seed_routines(conn: aiosqlite.Connection) -> None:
             await conn.execute(
                 "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
                 (
-                    "Поесть нормально (без идеала)",
+                    "Поесть нормально (хоть на 10 минут, без идеала)",
                     routine_id,
                     "Пообедать без фастфуда",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Стакан воды",
+                    routine_id,
+                    "Выпить воды",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Чуть подвигаться: 10–15 минут на улице или пройтись по дому",
+                    routine_id,
+                    "Выйти на улицу хотя бы на 15 минут",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Мини‑порядок 2 минуты (стол/раковина/мусор)",
+                    routine_id,
+                    "Разобрать посуду/кружки со стола",
+                ),
+            )
+        if routine["routine_key"] == "evening":
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Гигиена: умыться и зубы",
+                    routine_id,
+                    "Короткий душ и гигиена",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "5 минут на дом: посуда/поверхность/мусор",
+                    routine_id,
+                    "Помыть посуду",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Собрать на завтра: ключи/зарядка/документы",
+                    routine_id,
+                    "Подготовить одежду на завтра",
+                ),
+            )
+            await conn.execute(
+                "UPDATE routine_items SET title = ? WHERE routine_id = ? AND title = ?",
+                (
+                    "Собрать на завтра: ключи/зарядка/документы",
+                    routine_id,
+                    "Сложить вещи по местам",
                 ),
             )
 

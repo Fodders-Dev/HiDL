@@ -80,3 +80,34 @@ def phrase(user: Dict[str, Any], key: str) -> str:
     forms = PHRASES[key]
     
     return forms.get(gender, forms.get("neutral", forms.get("male", key)))
+
+
+def done_button_label(user: Dict[str, Any]) -> str:
+    """
+    Короткая подпись для кнопки подтверждения (без "Сделал(а)").
+
+    - female -> "Сделала ✅"
+    - male -> "Сделал ✅"
+    - neutral/unknown -> "Готово ✅"
+    """
+    gender = user.get("gender", "neutral") if user else "neutral"
+    if gender == "female":
+        return "Сделала ✅"
+    if gender == "male":
+        return "Сделал ✅"
+    return "Готово ✅"
+
+
+def button_label(
+    user: Dict[str, Any],
+    male: str,
+    female: str,
+    neutral: str = "Готово ✅",
+) -> str:
+    """Короткая подпись для кнопок с учётом пола (без скобок по умолчанию)."""
+    gender = user.get("gender", "neutral") if user else "neutral"
+    if gender == "female":
+        return female
+    if gender == "male":
+        return male
+    return neutral

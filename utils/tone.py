@@ -14,16 +14,16 @@ def tone_message(tone: Tone, base: str) -> str:
 
 def tone_short_ack(tone: Tone, action: str) -> str:
     if tone == "soft":
-        return f"Супер, ты закрыл(а) {action}. Продолжай в своём темпе."
+        return f"Супер, закрыто: {action}. Продолжай в своём темпе."
     if tone == "pushy":
-        return f"Отметил {action}. Не сбавляй темп."
-    return f"Отметил {action}."
+        return f"Отмечено: {action}. Не сбавляй темп."
+    return f"Отмечено: {action}."
 
 
 def tone_ack(tone: Tone, text: str) -> str:
     """Женский тон короткого подтверждения."""
     if tone == "soft":
-        return f"Сделала: {text}. Ты умница, можно выдохнуть."
+        return f"Готово: {text}. Можно выдохнуть."
     if tone == "pushy":
         return f"Готово: {text}. Дальше по плану!"
     return f"Готово: {text}."

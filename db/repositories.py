@@ -40,26 +40,48 @@ async def create_user(
     sleep_time: str,
     goals: str = "",
     strictness: str = "neutral",
+    gender: str = "neutral",
 ) -> int:
     now = utc_now_str()
-    cursor = await conn.execute(
-        """
-        INSERT INTO users
-        (telegram_id, name, timezone, wake_up_time, sleep_time, strictness, goals, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            telegram_id,
-            name,
-            timezone,
-            wake_up_time,
-            sleep_time,
-            strictness,
-            goals,
-            now,
-            now,
-        ),
-    )
+    try:
+        cursor = await conn.execute(
+            """
+            INSERT INTO users
+            (telegram_id, name, timezone, wake_up_time, sleep_time, strictness, goals, gender, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                name,
+                timezone,
+                wake_up_time,
+                sleep_time,
+                strictness,
+                goals,
+                gender,
+                now,
+                now,
+            ),
+        )
+    except Exception:
+        cursor = await conn.execute(
+            """
+            INSERT INTO users
+            (telegram_id, name, timezone, wake_up_time, sleep_time, strictness, goals, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                name,
+                timezone,
+                wake_up_time,
+                sleep_time,
+                strictness,
+                goals,
+                now,
+                now,
+            ),
+        )
     await conn.commit()
     return cursor.lastrowid
 
@@ -852,6 +874,7 @@ async def ensure_routine_steps(conn: aiosqlite.Connection, user_id: int) -> None
     )
     row = await cursor.fetchone()
     if row and row["cnt"] > 0:
+        await _migrate_routine_steps(conn, user_id)
         return
     routines = await list_routines(conn)
     now = utc_now_str()
@@ -871,6 +894,7 @@ async def ensure_routine_steps(conn: aiosqlite.Connection, user_id: int) -> None
             )
             order += 1
     await conn.commit()
+    await _migrate_routine_steps(conn, user_id)
 
 
 async def list_routine_steps_for_routine(
@@ -901,6 +925,89 @@ async def list_routine_steps_for_routine(
             (user_id, routine_type),
         )
     return await cursor.fetchall()
+
+
+async def _migrate_routine_steps(conn: aiosqlite.Connection, user_id: int) -> None:
+    """
+    Лёгкая миграция пользовательских шагов рутин:
+    - правим устаревшие формулировки (без удаления пользовательских пунктов);
+    - добавляем недостающие базовые пункты (идемпотентно).
+    """
+    now = utc_now_str()
+    recommended: dict[str, list[str]] = {
+        "morning": [
+            "Стакан воды (можно прямо у кровати)",
+            "Умыться и почистить зубы",
+            "Заправить кровать и открыть окно на 2–5 минут",
+            "Зарядка 2–5 минут (шея/плечи/спина)",
+            "Завтрак/перекус (без идеала, просто чтобы было топливо)",
+            "Выбери 1 главное дело на сегодня (остальное — бонус)",
+            "Проверь, что с собой ключи/телефон/карта (и зарядка, если нужно)",
+        ],
+        "day": [
+            "Поесть нормально (хоть на 10 минут, без идеала)",
+            "Стакан воды",
+            "Чуть подвигаться: 10–15 минут на улице или пройтись по дому",
+            "Один маленький шаг по главному делу (5–10 минут)",
+            "Мини‑порядок 2 минуты (стол/раковина/мусор)",
+        ],
+        "evening": [
+            "Лёгкий ужин/перекус (чтобы не ложиться на пустой желудок)",
+            "Гигиена: умыться и зубы",
+            "5 минут на дом: посуда/поверхность/мусор",
+            "Собрать на завтра: ключи/зарядка/документы",
+            "Тёплый душ или растяжка 3 минуты (снять напряжение)",
+            "Проветрить комнату перед сном",
+        ],
+    }
+
+    replacements: list[tuple[str, str]] = [
+        ("Выпить воды", "Стакан воды (можно прямо у кровати)"),
+        ("Заправить кровать и открыть окно", "Заправить кровать и открыть окно на 2–5 минут"),
+        ("Съесть что-то простое (хотя бы 5 минут)", "Завтрак/перекус (без идеала, просто чтобы было топливо)"),
+        ("Позавтракать чем угодно, не кофе", "Завтрак/перекус (без идеала, просто чтобы было топливо)"),
+        ("Проверь, что есть чистые вещи на день", "Проверь, что с собой ключи/телефон/карта (и зарядка, если нужно)"),
+        ("Проверь, что с собой ключи/кошелёк/телефон (и зарядка, если нужно)", "Проверь, что с собой ключи/телефон/карта (и зарядка, если нужно)"),
+        ("Пообедать без фастфуда", "Поесть нормально (хоть на 10 минут, без идеала)"),
+        ("Выйти на улицу хотя бы на 15 минут", "Чуть подвигаться: 10–15 минут на улице или пройтись по дому"),
+        ("Разобрать посуду/кружки со стола", "Мини‑порядок 2 минуты (стол/раковина/мусор)"),
+        ("Короткий душ и гигиена", "Гигиена: умыться и зубы"),
+        ("Помыть посуду", "5 минут на дом: посуда/поверхность/мусор"),
+        ("Подготовить одежду на завтра", "Собрать на завтра: ключи/зарядка/документы"),
+        ("Сложить вещи по местам", "Собрать на завтра: ключи/зарядка/документы"),
+    ]
+
+    for routine_type in ("morning", "day", "evening"):
+        for old, new in replacements:
+            await conn.execute(
+                """
+                UPDATE routine_steps
+                SET title = ?, updated_at = ?
+                WHERE user_id = ? AND routine_type = ? AND title = ?
+                """,
+                (new, now, user_id, routine_type, old),
+            )
+
+        existing_rows = await conn.execute_fetchall(
+            "SELECT title, order_index FROM routine_steps WHERE user_id = ? AND routine_type = ?",
+            (user_id, routine_type),
+        )
+        existing_titles = {row["title"] for row in existing_rows}
+        order_index = max([row["order_index"] for row in existing_rows], default=0)
+        for title in recommended.get(routine_type, []):
+            if title in existing_titles:
+                continue
+            order_index += 1
+            await conn.execute(
+                """
+                INSERT INTO routine_steps
+                (user_id, routine_type, title, order_index, points, is_active, trigger_after_step_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, 1, NULL, ?, ?)
+                """,
+                (user_id, routine_type, title, order_index, now, now),
+            )
+
+    await conn.commit()
 
 
 async def toggle_routine_step(

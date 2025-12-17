@@ -1,6 +1,6 @@
 def ack(text: str) -> str:
     """Мягкое подтверждение действия."""
-    return f"Сделала: {text}"
+    return f"Готово: {text}"
 
 
 def error(text: str) -> str:

@@ -15,6 +15,8 @@ from utils.tone import tone_short_ack
 from utils.nlp import match_simple_intent, parse_when
 from utils.nl_parser import parse_command
 from utils.texts import register_text, ack
+from utils import texts
+from utils.gender import done_button_label
 from utils.sender import safe_edit
 from utils.logger import log_debug
 
@@ -386,8 +388,6 @@ async def add_reminder_time(message: types.Message, state: FSMContext, db) -> No
     else:
         hhmm_norm = text
         if not parse_hhmm(hhmm_norm):
-            from utils import texts
-
             await message.answer(
                 texts.error("не распознала время. Формат HH:MM или «через 2 часа»."),
             )
@@ -986,8 +986,12 @@ async def _remind_later(bot, db, user, reminder_id: int, local_date: str, title:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Сделал(а) ✔",
+                    text=done_button_label(user),
                     callback_data=f"custom:{reminder_id}:{local_date}:done",
+                ),
+                InlineKeyboardButton(
+                    text="Позже",
+                    callback_data=f"custom:{reminder_id}:{local_date}:later",
                 ),
                 InlineKeyboardButton(
                     text="Пропустить",

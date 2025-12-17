@@ -149,7 +149,7 @@ async def save_weight(message: types.Message, state: FSMContext, db) -> None:
         arrow = "⬇️" if diff < 0 else "⬆️" if diff > 0 else "⇨"
         change_text = f"\nИзменение за {len(history)} записей: {arrow} {diff:.1f} кг"
     await message.answer(
-        f"Записала вес: {val:.1f} кг.{change_text}\nДля тренировки жми в разделе Движение.",
+        f"Записала вес: {val:.1f} кг.{change_text}\nДля тренировки жми в разделе Спорт.",
         reply_markup=main_menu_keyboard(),
     )
     await state.clear()
