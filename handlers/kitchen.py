@@ -391,7 +391,7 @@ async def show_recipes(callback: types.CallbackQuery, db):
 
 @router.callback_query(lambda c: c.data and c.data.startswith("kitchen:recipes_cat:"))
 async def show_recipes_category(callback: types.CallbackQuery, db):
-    _, _, _, category, page_s = callback.data.split(":")
+    _, _, category, page_s = callback.data.split(":")
     page = _safe_int(page_s, 0)
 
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)

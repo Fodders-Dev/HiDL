@@ -86,8 +86,13 @@ async def settings_entry(message: types.Message, state: FSMContext, db) -> None:
     await message.answer(_settings_main_text(user), reply_markup=settings_keyboard())
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("settings:"))
-async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+@router.callback_query(
+    lambda c: c.data
+    and c.data.startswith("settings:")
+    and not c.data.startswith("settings:mealprof:set:")
+    and not c.data.startswith("settings:affirm:set:")
+)
+async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, skip_answer: bool = False) -> None:
     parts = callback.data.split(":")
     if len(parts) < 2:
         await callback.answer()
@@ -597,9 +602,6 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
             "Введи целое число от 1 до 30, например 3 или 5.",
         )
     elif action == "mealprof":
-        if len(parts) >= 3 and parts[2] == "set":
-            await callback.answer()
-            return
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -633,31 +635,21 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db) 
         await callback.message.answer(
             f"Новое время для {routine_key} (HH:MM, например 07:30)."
         )
-    await callback.answer()
+    if not skip_answer:
+        await callback.answer()
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("settings:mealprof:set:"))
-async def settings_meal_profile(callback: types.CallbackQuery, db) -> None:
-    _, _, _, profile = callback.data.split(":")
-    from utils.user import ensure_user
+async def settings_meal_profile(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+    parts = callback.data.split(":")
+    profile = parts[3] if len(parts) > 3 else "omnivore"
+    if profile not in {"omnivore", "vegetarian", "vegan"}:
+        await callback.answer("Не поняла профиль.", show_alert=True)
+        return
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     await repo.upsert_wellness(db, user["id"], meal_profile=profile)
-    label = {"omnivore": "Обычный", "vegetarian": "Вегетарианец", "vegan": "Веган"}.get(profile, profile)
-    label = {"omnivore": "Обычный", "vegetarian": "Вегетарианец", "vegan": "Веган"}.get(profile, profile)
-    
-    # Refresh profile menu
-    callback.data = "settings:profile" 
-    # Use recursion by calling settings_select with new data? 
-    # Or just edit text manually to avoid recursion issues if arguments differ.
-    # Simpler: call settings_select.
-    # But wait, logic above for gender calls settings_select? No, it edits text. 
-    # I'll just edit text to confirm and show Back button.
-    
-    await callback.message.answer(f"✅ Профиль питания обновлён: {label}", reply_markup=main_menu_keyboard())
-    # Or better return to profile menu?
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👤 К профилю", callback_data="settings:profile")]])
-    await callback.message.answer(f"Сохранила: {label}", reply_markup=kb)
     await callback.answer("Сохранено")
+    await settings_select(callback.replace(data="settings:profile"), state, db, skip_answer=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("settings:affirm:set:"))
