@@ -2,6 +2,7 @@ import datetime
 import json
 import logging
 import os
+import math
 from typing import Tuple, List, Optional
 
 from aiogram import Router, types, F
@@ -22,6 +23,25 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 RECIPES_FILE = "data/knowledge/recipes_core.json"
+
+DIET_TAGS = {
+    "omnivore": None,
+    "vegetarian": {"vegetarian", "vegan"},
+    "vegan": {"vegan"},
+}
+
+RECIPE_CATEGORIES = [
+    ("all", "📚 Все"),
+    ("breakfast", "🥣 Завтрак"),
+    ("lunch", "🍲 Обед"),
+    ("dinner", "🍽 Ужин"),
+    ("snack", "🥪 Перекус"),
+    ("salad", "🥗 Салаты"),
+    ("fast", "⚡ Быстро до 15 мин"),
+    ("budget", "💸 Бюджетно"),
+    ("comfort_food", "🧡 Комфорт"),
+    ("healthy", "🫶 Полезно"),
+]
 
 # --- STATES ---
 class PantryAddState(StatesGroup):
@@ -59,6 +79,117 @@ def get_recipe(rid: str) -> Optional[dict]:
         if r["id"] == rid:
             return r
     return None
+
+
+async def _get_meal_profile(db, user_id: int) -> str:
+    wellness = await repo.get_wellness(db, user_id)
+    profile = (dict(wellness) if wellness else {}).get("meal_profile", "omnivore")
+    return profile if profile in {"omnivore", "vegetarian", "vegan"} else "omnivore"
+
+
+def _diet_label(profile: str) -> str:
+    return {"omnivore": "🥩 обычный", "vegetarian": "🥗 вегетарианец", "vegan": "🌱 веган"}.get(profile, "🥩 обычный")
+
+
+def _recipe_allowed_for_profile(recipe: dict, profile: str) -> bool:
+    tags = set(recipe.get("tags") or [])
+    allowed = DIET_TAGS.get(profile)
+    if allowed is None:
+        return True
+    return bool(tags.intersection(allowed))
+
+
+def _recipe_in_category(recipe: dict, category: str) -> bool:
+    if category == "all":
+        return True
+    tags = set(recipe.get("tags") or [])
+    if category in {"breakfast", "lunch", "dinner", "salad"}:
+        return category in tags
+    if category == "snack":
+        return "snack" in tags or "breakfast" in tags
+    if category == "fast":
+        return "fast" in tags or int(recipe.get("time_minutes") or 0) <= 15
+    if category in {"budget", "comfort_food", "healthy"}:
+        return category in tags
+    return False
+
+
+def _safe_int(value: str, default: int = 1) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _scale_qty(qty: float, factor: float, unit: str) -> float:
+    val = float(qty) * float(factor)
+    unit_l = (unit or "").lower()
+    if unit_l in {"г", "g", "гр", "мл", "ml"}:
+        return float(int(round(val)))
+    if unit_l in {"кг", "kg", "л", "l"}:
+        return round(val, 2)
+    if unit_l in {"шт", "piece", "pieces"}:
+        return float(int(math.ceil(val - 1e-9)))
+    return round(val, 2)
+
+
+def _unit_kind(unit: str) -> str:
+    u = (unit or "").strip().lower()
+    if u in {"г", "гр", "g", "kg", "кг"}:
+        return "weight"
+    if u in {"мл", "ml", "л", "l"}:
+        return "volume"
+    if u in {"шт", "piece", "pieces"}:
+        return "count"
+    return "other"
+
+
+def _to_base(amount: float, unit: str) -> tuple[float, str]:
+    kind = _unit_kind(unit)
+    u = (unit or "").strip().lower()
+    val = float(amount)
+    if kind == "weight":
+        if u in {"kg", "кг"}:
+            return val * 1000.0, kind
+        return val, kind  # g
+    if kind == "volume":
+        if u in {"л", "l"}:
+            return val * 1000.0, kind
+        return val, kind  # ml
+    if kind == "count":
+        return val, kind
+    return val, kind
+
+
+def _from_base(amount_base: float, unit: str) -> float:
+    kind = _unit_kind(unit)
+    u = (unit or "").strip().lower()
+    val = float(amount_base)
+    if kind == "weight":
+        if u in {"kg", "кг"}:
+            return val / 1000.0
+        return val
+    if kind == "volume":
+        if u in {"л", "l"}:
+            return val / 1000.0
+        return val
+    if kind == "count":
+        return val
+    return val
+
+
+def _format_ing_line(name: str, qty: float, unit: str) -> str:
+    q = f"{qty:g}"
+    u = (unit or "").strip()
+    if not u:
+        return f"• {name}: {q}"
+    return f"• {name}: {q} {u}"
+
+
+def _recipe_button_text(recipe: dict) -> str:
+    title = recipe.get("title", "Рецепт")
+    t = int(recipe.get("time_minutes") or 0)
+    return f"{title} · {t}м" if t else title
 
 def _parse_amount_unit(text: str) -> Tuple[float, str]:
     raw = (text or "").strip().replace(",", ".")
@@ -105,8 +236,37 @@ def kitchen_main_keyboard() -> InlineKeyboardMarkup:
 def recipes_list_keyboard(recipes: List[dict]) -> InlineKeyboardMarkup:
     rows = []
     for r in recipes:
-        rows.append([InlineKeyboardButton(text=r["title"], callback_data=f"kitchen:cook_view:{r['id']}")])
+        rows.append([InlineKeyboardButton(text=_recipe_button_text(r), callback_data=f"kitchen:cook_view:{r['id']}:1:all:0")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="kitchen:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def recipes_categories_keyboard(profile: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(RECIPE_CATEGORIES), 2):
+        pair = RECIPE_CATEGORIES[i : i + 2]
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"kitchen:recipes_cat:{key}:0") for key, label in pair])
+    rows.append([InlineKeyboardButton(text=f"Питание: {_diet_label(profile)}", callback_data="settings:mealprof")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def recipes_paged_keyboard(items: List[dict], category: str, page: int, page_size: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    start = page * page_size
+    chunk = items[start : start + page_size]
+    for r in chunk:
+        rows.append([InlineKeyboardButton(text=_recipe_button_text(r), callback_data=f"kitchen:cook_view:{r['id']}:1:{category}:{page}")])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"kitchen:recipes_cat:{category}:{page-1}"))
+    if start + page_size < len(items):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"kitchen:recipes_cat:{category}:{page+1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="kitchen:recipes")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def shopping_list_keyboard(items: List[dict]) -> InlineKeyboardMarkup:
@@ -149,6 +309,20 @@ async def show_shoplist(callback: types.CallbackQuery, db):
     
     await callback.message.edit_text(text, reply_markup=shopping_list_keyboard(items), parse_mode="HTML")
     await callback.answer()
+
+
+async def send_shoplist(message: types.Message, db) -> None:
+    """Открыть список покупок из обычного сообщения (reply-кнопки)."""
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    rows = await repo.list_shopping_items(db, user["id"])
+    items = rows_to_dicts(rows)
+    text = "<b>🛒 Список покупок</b>\n"
+    if not items:
+        text += "Пока пусто. Можно добавить продукты вручную или из рецептов."
+    else:
+        bought_cnt = sum(1 for i in items if i["is_bought"])
+        text += f"Всего: {len(items)}, куплено: {bought_cnt}"
+    await message.answer(text, reply_markup=shopping_list_keyboard(items), parse_mode="HTML")
 
 @router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shop_toggle:"))
 async def toggle_shop_item(callback: types.CallbackQuery, db):
@@ -202,81 +376,154 @@ async def add_shop_amount(message: types.Message, state: FSMContext, db):
 
 # --- HANDLERS: RECIPES ---
 @router.callback_query(lambda c: c.data == "kitchen:recipes")
-async def show_recipes(callback: types.CallbackQuery):
-    recipes = load_recipes()
-    await callback.message.edit_text("📖 <b>Книга рецептов</b>\nВыбери блюдо:", reply_markup=recipes_list_keyboard(recipes), parse_mode="HTML")
+async def show_recipes(callback: types.CallbackQuery, db):
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    profile = await _get_meal_profile(db, user["id"])
+    await callback.message.edit_text(
+        "📖 <b>Книга рецептов</b>\n"
+        f"Фильтр питания: <b>{_diet_label(profile)}</b>\n\n"
+        "Выбери категорию:",
+        reply_markup=recipes_categories_keyboard(profile),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:recipes_cat:"))
+async def show_recipes_category(callback: types.CallbackQuery, db):
+    _, _, _, category, page_s = callback.data.split(":")
+    page = _safe_int(page_s, 0)
+
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    profile = await _get_meal_profile(db, user["id"])
+
+    all_recipes = [r for r in load_recipes() if _recipe_allowed_for_profile(r, profile)]
+    items = [r for r in all_recipes if _recipe_in_category(r, category)]
+
+    title = dict(RECIPE_CATEGORIES).get(category, "Рецепты")
+    if not items:
+        await callback.message.edit_text(
+            f"{title}\n\nПока нет рецептов под твой фильтр питания. Можно сменить профиль в настройках.",
+            reply_markup=recipes_categories_keyboard(profile),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    page_size = 6
+    max_page = max(0, (len(items) - 1) // page_size)
+    page = max(0, min(page, max_page))
+
+    await callback.message.edit_text(
+        f"{title}\n"
+        f"Питание: <b>{_diet_label(profile)}</b>\n"
+        f"Страница {page+1}/{max_page+1}",
+        reply_markup=recipes_paged_keyboard(items, category, page, page_size),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 @router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_view:"))
 async def view_recipe(callback: types.CallbackQuery):
-    rid = callback.data.split(":")[2]
+    parts = callback.data.split(":")
+    rid = parts[2] if len(parts) > 2 else ""
+    servings = _safe_int(parts[3], 1) if len(parts) > 3 else 1
+    category = parts[4] if len(parts) > 4 else "all"
+    page = _safe_int(parts[5], 0) if len(parts) > 5 else 0
     recipe = get_recipe(rid)
     if not recipe:
         await callback.answer("Рецепт не найден", show_alert=True)
         return
     
-    text = f"<b>{recipe['title']}</b>\n{recipe['desc']}\n\n"
-    text += f"⏱ Время: {recipe.get('time_minutes', 15)} мин\n"
-    text += "📝 Ингредиенты (на 1 порцию):\n"
-    for ing in recipe["ingredients"]:
-        text += f"• {ing['name']}: {ing['qty']} {ing['unit']}\n"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🍳 Готовить!", callback_data=f"kitchen:cook_start:{rid}")],
-        [InlineKeyboardButton(text="🔙 К рецептам", callback_data="kitchen:recipes")]
-    ])
+    base = int(recipe.get("base_servings") or 1) or 1
+    servings = max(1, servings)
+    factor = servings / base
+
+    text = f"<b>{recipe.get('title','Рецепт')}</b>\n{recipe.get('desc','')}\n\n"
+    text += f"⏱ {int(recipe.get('time_minutes', 15))} мин • 🍽 {servings} порц.\n\n"
+    text += f"🧾 <b>Ингредиенты</b> (на {servings} порц.):\n"
+    for ing in recipe.get("ingredients") or []:
+        qty = _scale_qty(ing.get("qty", 0), factor, ing.get("unit", ""))
+        text += _format_ing_line(ing.get("name", "ингредиент"), qty, ing.get("unit", "")) + "\n"
+
+    steps = recipe.get("steps") or []
+    if steps:
+        text += "\n👩‍🍳 <b>Шаги</b>:\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps[:12])])
+        if len(steps) > 12:
+            text += "\n…"
+
+    serv_row = [
+        InlineKeyboardButton(text=str(i), callback_data=f"kitchen:cook_view:{rid}:{i}:{category}:{page}")
+        for i in range(1, 6)
+    ]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            serv_row,
+            [InlineKeyboardButton(text="✅ Проверить продукты", callback_data=f"kitchen:cook_check:{rid}:{servings}:{category}:{page}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"kitchen:recipes_cat:{category}:{page}")],
+        ]
+    )
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
 
-@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_start:"))
-async def cook_start_servings(callback: types.CallbackQuery, state: FSMContext):
-    rid = callback.data.split(":")[2]
-    await state.set_state(CookingState.servings)
-    await state.update_data(recipe_id=rid)
-    
-    # Servings keyboard
-    btns = []
-    for i in range(1, 6):
-        btns.append(InlineKeyboardButton(text=str(i), callback_data=f"kitchen:cook_serv:{i}"))
-    kb = InlineKeyboardMarkup(inline_keyboard=[btns, [InlineKeyboardButton(text="Отмена", callback_data="kitchen:recipes")]])
-    
-    await callback.message.edit_text("На сколько персон готовим?", reply_markup=kb)
-
-@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_serv:"))
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_check:"))
 async def cook_check_ingredients(callback: types.CallbackQuery, state: FSMContext, db):
-    servings = int(callback.data.split(":")[2])
-    data = await state.get_data()
-    rid = data["recipe_id"]
+    parts = callback.data.split(":")
+    rid = parts[2] if len(parts) > 2 else ""
+    servings = _safe_int(parts[3], 1) if len(parts) > 3 else 1
+    category = parts[4] if len(parts) > 4 else "all"
+    page = _safe_int(parts[5], 0) if len(parts) > 5 else 0
     recipe = get_recipe(rid)
+    if not recipe:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
     
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     pantry_rows = await repo.list_pantry_items(db, user["id"])
     pantry = rows_to_dicts(pantry_rows)
     
-    text = f"👩‍🍳 <b>Готовим: {recipe['title']}</b> ({servings} чел.)\n\nПроверка продуктов:\n"
+    base = int(recipe.get("base_servings") or 1) or 1
+    servings = max(1, servings)
+    factor = servings / base
+
+    text = f"🧑‍🍳 <b>Готовим: {recipe['title']}</b> ({servings} порц.)\n\nПроверка продуктов:\n"
     missing = []
     
-    for ing in recipe["ingredients"]:
-        needed = ing["qty"] * servings
+    for ing in recipe.get("ingredients") or []:
+        needed = _scale_qty(ing.get("qty", 0), factor, ing.get("unit", ""))
         # Find in pantry (rough matching)
         found = next((p for p in pantry if ing["name"].lower() in p["name"].lower()), None)
-        have = found["amount"] if found else 0
-        unit = ing["unit"]
+        have = float(found["amount"]) if found and found.get("amount") is not None else 0.0
+        unit = ing.get("unit", "")
+        have_unit = (found.get("unit") if found else "") or unit
         
         status = "✅"
-        if have < needed:
-            status = "⚠️ Мало" if have > 0 else "❌ Нет"
-            missing.append({"name": ing["name"], "qty": needed - have, "unit": unit})
+        if not found:
+            status = "❌ Нет"
+            missing.append({"name": ing["name"], "qty": needed, "unit": unit})
+        else:
+            need_base, kind_n = _to_base(needed, unit)
+            have_base, kind_h = _to_base(have, have_unit)
+            if kind_n == kind_h and kind_n != "other":
+                if have_base < need_base:
+                    status = "⚠️ Мало" if have_base > 0 else "❌ Нет"
+                    miss_base = max(0.0, need_base - have_base)
+                    miss_qty = _from_base(miss_base, unit)
+                    missing.append({"name": ing["name"], "qty": miss_qty, "unit": unit})
+            else:
+                status = "❔"
         
-        text += f"{status} {ing['name']}: надо {needed:g}{unit}, (есть {have:g})\n"
+        text += f"{status} {ing['name']}: надо {needed:g} {unit}, (есть {have:g} {have_unit})\n"
         
     text += "\nНачинаем готовить?"
     
     # Store missing for shopping list logic
-    await state.update_data(missing=missing, servings=servings)
+    await state.set_state(CookingState.confirm)
+    await state.update_data(missing=missing, servings=servings, recipe_id=rid, back_category=category, back_page=page)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Приготовил! (-продукты)", callback_data="kitchen:cook_done")],
-        [InlineKeyboardButton(text="Отмена", callback_data=f"kitchen:cook_view:{rid}")]
+        [InlineKeyboardButton(text="Отмена", callback_data=f"kitchen:cook_view:{rid}:{servings}:{category}:{page}")],
     ])
     
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -284,20 +531,30 @@ async def cook_check_ingredients(callback: types.CallbackQuery, state: FSMContex
 @router.callback_query(lambda c: c.data == "kitchen:cook_done")
 async def cook_commit(callback: types.CallbackQuery, state: FSMContext, db):
     data = await state.get_data()
-    rid = data["recipe_id"]
-    servings = data["servings"]
+    rid = data.get("recipe_id")
+    servings = int(data.get("servings") or 1)
+    category = data.get("back_category", "all")
+    page = int(data.get("back_page") or 0)
     recipe = get_recipe(rid)
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     pantry_rows = await repo.list_pantry_items(db, user["id"])
     pantry = rows_to_dicts(pantry_rows) # refresh
+
+    base = int(recipe.get("base_servings") or 1) or 1
+    factor = max(1, servings) / base
     
     # Deduct Logic
-    for ing in recipe["ingredients"]:
-        needed = ing["qty"] * servings
+    for ing in recipe.get("ingredients") or []:
+        needed = _scale_qty(ing.get("qty", 0), factor, ing.get("unit", ""))
         found = next((p for p in pantry if ing["name"].lower() in p["name"].lower()), None)
         if found:
-            new_amount = max(0, found["amount"] - needed)
-            await repo.update_pantry_item(db, user["id"], found["id"], amount=new_amount)
+            have_unit = found.get("unit") or ing.get("unit", "")
+            need_base, kind_n = _to_base(needed, ing.get("unit", ""))
+            have_base, kind_h = _to_base(float(found.get("amount") or 0), have_unit)
+            if kind_n == kind_h and kind_n != "other":
+                need_in_have_unit = _from_base(need_base, have_unit)
+                new_amount = max(0.0, float(found.get("amount") or 0) - need_in_have_unit)
+                await repo.update_pantry_item(db, user["id"], found["id"], amount=new_amount)
     
     await callback.answer("Приятного аппетита! Продукты списаны.", show_alert=True)
     
@@ -310,7 +567,7 @@ async def cook_commit(callback: types.CallbackQuery, state: FSMContext, db):
             
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Да, добавить", callback_data="kitchen:shop_auto_add")],
-            [InlineKeyboardButton(text="Нет, спасибо", callback_data="kitchen:main")]
+            [InlineKeyboardButton(text="Нет, спасибо", callback_data=f"kitchen:cook_view:{rid}:{servings}:{category}:{page}")],
         ])
         await callback.message.edit_text(text, reply_markup=kb)
     else:
@@ -339,7 +596,10 @@ async def fridge_view(callback: types.CallbackQuery, db):
     
     text = "<b>❄️ Мой холодильник</b>\n"
     if not items:
-        text += "Пусто. Добавь что-нибудь."
+        text += (
+            "Пока пусто.\n\n"
+            "Если не хочется думать — я могу собрать базовый минимум в список покупок."
+        )
     else:
         # Group by category
         cats = {}
@@ -357,9 +617,57 @@ async def fridge_view(callback: types.CallbackQuery, db):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить продукт", callback_data="kitchen:fridge_add")],
         [InlineKeyboardButton(text="🗑 Удалить что-то", callback_data="kitchen:fridge_del_view")],
+        [InlineKeyboardButton(text="🧺 Базовый минимум в покупки", callback_data="kitchen:shop_min:add")],
         [InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")]
     ])
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "kitchen:shop_min:add")
+async def add_minimum_shoplist(callback: types.CallbackQuery, db):
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    profile = await _get_meal_profile(db, user["id"])
+
+    if profile == "vegan":
+        items = [
+            ("овсянка", 500, "г"),
+            ("рис", 1, "кг"),
+            ("чечевица", 500, "г"),
+            ("нут", 500, "г"),
+            ("овощи (на салат)", 1, "набор"),
+            ("фрукты", 1, "кг"),
+            ("растительное масло", 1, "шт"),
+            ("соевый соус", 1, "шт"),
+        ]
+    elif profile == "vegetarian":
+        items = [
+            ("овсянка", 500, "г"),
+            ("рис", 1, "кг"),
+            ("яйца", 10, "шт"),
+            ("сыр", 200, "г"),
+            ("йогурт", 2, "шт"),
+            ("овощи (на салат)", 1, "набор"),
+            ("фрукты", 1, "кг"),
+            ("оливковое масло", 1, "шт"),
+        ]
+    else:
+        items = [
+            ("овсянка", 500, "г"),
+            ("рис", 1, "кг"),
+            ("яйца", 10, "шт"),
+            ("курица/индейка", 700, "г"),
+            ("овощи (на салат)", 1, "набор"),
+            ("фрукты", 1, "кг"),
+            ("масло", 1, "шт"),
+            ("хлеб", 1, "шт"),
+        ]
+
+    for name, qty, unit in items:
+        await repo.create_shopping_item(db, user["id"], name, qty, unit, category="минимум")
+
+    await callback.answer("Добавила базовый минимум 🛒", show_alert=True)
+    await show_shoplist(callback, db)
 
 @router.callback_query(lambda c: c.data == "kitchen:fridge_add")
 async def fridge_add_start(callback: types.CallbackQuery, state: FSMContext):

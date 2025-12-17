@@ -67,6 +67,13 @@ async def food_menu(message: types.Message) -> None:
     )
 
 
+@router.message(lambda m: m.text and ("покуп" in m.text.lower() or "🛒" in m.text))
+async def shopping_menu(message: types.Message, db) -> None:
+    from handlers import kitchen
+
+    await kitchen.send_shoplist(message, db)
+
+
 
 @router.message(lambda m: m.text and "дом" in m.text.lower())
 async def home_menu(message: types.Message, db) -> None:
