@@ -64,15 +64,29 @@ def parse_expense(text: str) -> Optional[ParsedCommand]:
 
 def parse_reminder(text: str) -> Optional[ParsedCommand]:
     txt = text.lower().strip()
-    if "напом" not in txt and "напиши" not in txt:
+    # Support copy-paste from Telegram exports:
+    # "Name, [17.12.2025 9:01]\nНапомни ..."
+    export_prefix = r"^[^\n]*,\s*\[\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}\]\s*\n?"
+    txt = re.sub(export_prefix, "", txt).strip()
+    title_src = re.sub(export_prefix, "", text).strip()
+
+    # intent keywords
+    if not any(k in txt for k in ("напом", "напиши", "напомин", "напоминалк")):
         return None
+
+    explicit_repeat = bool(re.search(r"(кажд\w+|ежеднев|еженед|раз\s+в\s+нед|по\s+будням|по\s+выходн)", txt))
 
     def _extract_time(src: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
         """Return (hhmm, rel_hours, rel_minutes)."""
         m = re.search(r"\b(\d{1,2})[:.](\d{2})\b", src)
         if m:
             return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}", None, None
-        m = re.search(r"\bв\s*(\d{1,2})(?!\d)", src)
+        # "в 10", "в 10 часов"
+        m = re.search(r"\bв\s*(\d{1,2})(?:\s*час\w*)?(?!\d)", src)
+        if m:
+            return f"{int(m.group(1)):02d}:00", None, None
+        # "на 10" (часто пишут так же, как "в 10")
+        m = re.search(r"\bна\s*(\d{1,2})(?:\s*час\w*)?(?!\d)", src)
         if m:
             return f"{int(m.group(1)):02d}:00", None, None
         m = re.search(r"через\s+(\d+)\s*(час|ч)", src)
@@ -122,6 +136,8 @@ def parse_reminder(text: str) -> Optional[ParsedCommand]:
                 pass
         if re.search(r"раз\s+в\s+нед", src) or "еженед" in src:
             return 7, False
+        if re.search(r"по\s+будням", src):
+            return 1, False
         if target_wd is not None and ("кажд" in src or "по " in src):
             return 7, False
         return None, once
@@ -130,10 +146,17 @@ def parse_reminder(text: str) -> Optional[ParsedCommand]:
     day_offset = _extract_day_offset(txt)
     target_weekday = _extract_weekday(txt)
     freq_days, once_flag = _extract_freq(txt, target_weekday)
+    if not explicit_repeat and freq_days is None:
+        # safer default: if the user didn't say "every day/week/…", treat as one-time
+        once_flag = True
 
     cleanup_patterns = [
         r"(?i)\bнапомни( мне)?\b",
         r"(?i)\bнапиши\b",
+        r"(?i)\bсделай\s+напоминани\w*\b",
+        r"(?i)\bсделай\s+напоминалк\w*\b",
+        r"(?i)\bсоздай\s+напоминани\w*\b",
+        r"(?i)\bсоздай\s+напоминалк\w*\b",
         r"(?i)\bпоставь\s+напоминание\b",
         r"(?i)\bзавтра\b",
         r"(?i)\bпослезавтра\b",
@@ -142,10 +165,19 @@ def parse_reminder(text: str) -> Optional[ParsedCommand]:
         r"(?i)\bкажд\w+\b",
         r"(?i)\bеженед\w*\b",
         r"(?i)\bежеднев\w*\b",
-        r"(?i)\bчерез\s+\d+\s*(час|ч|мин|минут|дн|день|дня)\b",
+        r"(?i)\bчерез\s+\d+\s*(час\w*|ч|мин\w*|дн\w*)\b",
     ]
-    title_src = text
     if hhmm:
+        try:
+            hh, mm = hhmm.split(":")
+            hh_i = int(hh)
+            mm_i = int(mm)
+        except Exception:
+            hh_i, mm_i = None, None
+        if hh_i is not None and mm_i is not None:
+            cleanup_patterns.append(rf"(?i)\b(?:в|на)\s*{hh_i}\s*[:.]\s*{mm_i:02d}\b")
+            if mm_i == 0:
+                cleanup_patterns.append(rf"(?i)\b(?:в|на)\s*{hh_i}(?:\s*час\w*)?\b")
         cleanup_patterns.append(re.escape(hhmm))
     for pat in cleanup_patterns:
         title_src = re.sub(pat, " ", title_src)
@@ -197,7 +229,10 @@ def parse_ask(text: str) -> Optional[ParsedCommand]:
 
 
 def parse_command(text: str) -> Optional[ParsedCommand]:
-    for parser in (parse_expense, parse_reminder, parse_home, parse_ask):
+    txt = (text or "").lower()
+    reminder_first = any(k in txt for k in ("напом", "напомин", "напоминалк"))
+    parsers = (parse_reminder, parse_expense, parse_home, parse_ask) if reminder_first else (parse_expense, parse_reminder, parse_home, parse_ask)
+    for parser in parsers:
         res = parser(text)
         if res:
             return res

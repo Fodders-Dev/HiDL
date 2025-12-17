@@ -1,5 +1,6 @@
 import datetime
 import re
+import datetime
 
 from aiogram import Router, types
 
@@ -37,6 +38,9 @@ def _extract_time(text: str):
 async def natural_handler(message: types.Message, db) -> None:
     text_original = message.text or ""
     text = text_original.lower()
+    # Напоминания обрабатываются в handlers/custom_reminders.py (с подтверждением).
+    if "напом" in text:
+        return
     # быстрые намерения: сделал/позже/пропусти
     intent = match_simple_intent(text)
     if intent:
@@ -136,59 +140,6 @@ async def natural_handler(message: types.Message, db) -> None:
         await message.answer(f"Записала трату: {amount:.0f} ₽ ({category}).", reply_markup=main_menu_keyboard())
         return
 
-    # напоминание
-    if "напомни" in text:
-        title = message.text.strip()
-        hhmm = _extract_time(text) or "09:00"
-        user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-        today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-        freq = 1
-        target_weekday = None
-        if "каждый день" in text:
-            freq = 1
-        elif "каждую неделю" in text or "раз в неделю" in text:
-            freq = 7
-            # если указали день недели
-            days_map = {"пн":0,"пон":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6}
-            for key,val in days_map.items():
-                if key in text:
-                    target_weekday = val
-                    break
-        elif "месяц" in text:
-            freq = 30
-        last_sent = None
-        if "завтра" in text:
-            last_sent = today
-        if "через" in text:
-            m = re.search(r"через\s+(\d+)\s*час", text)
-            if m:
-                hours = int(m.group(1))
-                future = datetime.datetime.utcnow() + datetime.timedelta(hours=hours)
-                hhmm = format_time_local(future, user["timezone"])
-        if "отложи" in text or "перенеси" in text:
-            last_sent = today
-            if "недел" in text:
-                freq = 7
-            days_map = {"пн":0,"пон":0,"вт":1,"ср":2,"чт":3,"пт":4,"сб":5,"вс":6}
-            for key,val in days_map.items():
-                if key in text:
-                    target_weekday = val
-                    break
-        rid = await repo.create_custom_reminder(
-            db,
-            user_id=user["id"],
-            title=title.replace("напомни", "").strip() or "Напоминание",
-            reminder_time=hhmm,
-            frequency_days=freq,
-            target_weekday=target_weekday,
-        )
-        if last_sent:
-            await repo.set_custom_reminder_sent(db, rid, last_sent)
-        await message.answer(
-            f"Я поставила напоминание «{title}» на {hhmm} (каждые {freq} д.).",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
     # если не распознали запрос — мягко подсказать про основные разделы
     await message.answer(
         "Я читаю это как обычное сообщение и не очень поняла, что сделать.\n\n"

@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import re
 
 from aiogram import Router, types
 from aiogram.filters import Command
@@ -122,7 +123,8 @@ def _compute_last_sent(freq: int, day_offset: int, tz: str) -> str | None:
 def _render_pending_summary(pending: dict, tz: str) -> str:
     lines = ["Так сохраню напоминание:"]
     lines.append(f"• Текст: {pending.get('title', 'Напоминание')}")
-    lines.append(f"• Время: {pending.get('reminder_time', '--:--')}")
+    rt = pending.get("reminder_time")
+    lines.append(f"• Время: {rt if rt else 'не указано'}")
     if pending.get("day_offset"):
         try:
             base = datetime.date.fromisoformat(local_date_str(datetime.datetime.utcnow(), tz))
@@ -229,11 +231,11 @@ def _build_pending_from_payload(payload: dict, user: dict, base: dict | None = N
         hhmm = format_time_local(datetime.datetime.utcnow() + delta, tz)
         if payload.get("time") is None and day_offset:
             day_offset = 0
-    if not hhmm or not parse_hhmm(hhmm):
-        hhmm = "09:00"
-    else:
+    if hhmm and parse_hhmm(hhmm):
         parts = hhmm.split(":")
         hhmm = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    else:
+        hhmm = None
 
     target_weekday = payload.get("target_weekday")
     if target_weekday is None and base is not None:
@@ -249,7 +251,8 @@ def _build_pending_from_payload(payload: dict, user: dict, base: dict | None = N
         elif target_weekday is not None:
             freq = 7
         else:
-            freq = 1
+            # safer default: one-time unless user explicitly asked to repeat
+            freq = 9999
     if once_flag and freq < 9999:
         freq = 9999
 
@@ -269,12 +272,17 @@ def _build_pending_from_payload(payload: dict, user: dict, base: dict | None = N
 
 
 async def _persist_parsed_reminder(message: types.Message, state: FSMContext, db, user: dict, pending: dict):
+    reminder_time = pending.get("reminder_time")
+    if not reminder_time or not parse_hhmm(reminder_time):
+        await message.answer("Нужно указать время. Например: <в 10>, <в 09:30> или <завтра в 14:00>.", reply_markup=main_menu_keyboard())
+        return
+    freq = pending.get("frequency_days") or 9999
     reminder_id = await repo.create_custom_reminder(
         db,
         user_id=user["id"],
         title=pending.get("title", "Напоминание"),
-        reminder_time=pending.get("reminder_time", "09:00"),
-        frequency_days=pending.get("frequency_days", 1),
+        reminder_time=reminder_time,
+        frequency_days=freq,
         target_weekday=pending.get("target_weekday"),
     )
     if pending.get("last_sent"):
@@ -282,8 +290,8 @@ async def _persist_parsed_reminder(message: types.Message, state: FSMContext, db
     await state.clear()
     await message.answer(
         ack(
-            f"{pending.get('title','Напоминание')} в {pending.get('reminder_time','09:00')} "
-            f"({_freq_label(pending.get('frequency_days'))})"
+            f"{pending.get('title','Напоминание')} в {reminder_time} "
+            f"({_freq_label(freq)})"
         ),
         reply_markup=main_menu_keyboard(),
     )
@@ -818,6 +826,11 @@ async def reminder_parsed_callbacks(callback: types.CallbackQuery, state: FSMCon
     action = parts[1] if len(parts) > 1 else ""
 
     if action == "save":
+        if not pending.get("reminder_time"):
+            await callback.answer("Нужно время", show_alert=True)
+            await state.set_state(CustomReminderState.parsed_edit_time)
+            await callback.message.answer("На когда? Например: <в 10>, <завтра в 14:00> или <через 2 часа>.")
+            return
         await _persist_parsed_reminder(callback.message, state, db, user, pending)
         await callback.answer("Сохранила.")
         return
@@ -907,9 +920,15 @@ async def reminder_parsed_edit_time(message: types.Message, state: FSMContext, d
         await state.clear()
         return
     user = row_to_dict(urow)
-    parsed = parse_command(f"напомни {message.text}")
-    payload = parsed.payload if parsed and parsed.type == "reminder" else {"time": message.text.strip()}
-    payload.setdefault("title", pending.get("title"))
+    raw = (message.text or "").strip()
+    # Часто отвечают просто "10" вместо "в 10".
+    m = re.match(r"^\s*(\d{1,2})\s*$", raw)
+    if m:
+        raw = f"{int(m.group(1)):02d}:00"
+    parsed = parse_command(f"напомни {raw}")
+    payload = parsed.payload if parsed and parsed.type == "reminder" else {"time": raw}
+    # В этом шаге редактируем "когда", поэтому не перетираем title.
+    payload["title"] = pending.get("title")
     new_pending = _build_pending_from_payload(payload, user, base=pending)
     await state.set_state(CustomReminderState.parsed_confirm)
     await _update_preview_from_pending(message, state, user, new_pending)
