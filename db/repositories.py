@@ -2385,6 +2385,79 @@ async def complete_shopping_trip(conn: aiosqlite.Connection, user_id: int, scope
     return count
 
 
+# --- Schedule (daily planner) ---
+
+
+async def create_schedule_block(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    title: str,
+    start_time: str,
+    end_time: str,
+    weekdays: str,
+    location: str = "",
+) -> int:
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO schedule_blocks
+        (user_id, title, start_time, end_time, weekdays, location, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, title.strip(), start_time, end_time, weekdays, location.strip(), now, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def list_schedule_blocks(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
+    cursor = await conn.execute(
+        "SELECT * FROM schedule_blocks WHERE user_id = ? ORDER BY start_time",
+        (user_id,),
+    )
+    return await cursor.fetchall()
+
+
+async def delete_schedule_block(conn: aiosqlite.Connection, user_id: int, block_id: int) -> None:
+    await conn.execute("DELETE FROM schedule_blocks WHERE id = ? AND user_id = ?", (block_id, user_id))
+    await conn.commit()
+
+
+async def create_schedule_event(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    event_date: str,
+    start_time: str,
+    end_time: str,
+    title: str,
+    category: str = "misc",
+    source: str = "manual",
+) -> int:
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO schedule_events
+        (user_id, event_date, start_time, end_time, title, category, source, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, event_date, start_time, end_time, title.strip(), category, source, now, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def list_schedule_events(conn: aiosqlite.Connection, user_id: int, event_date: str) -> List[aiosqlite.Row]:
+    cursor = await conn.execute(
+        "SELECT * FROM schedule_events WHERE user_id = ? AND event_date = ? ORDER BY start_time",
+        (user_id, event_date),
+    )
+    return await cursor.fetchall()
+
+
+async def delete_schedule_event(conn: aiosqlite.Connection, user_id: int, event_id: int) -> None:
+    await conn.execute("DELETE FROM schedule_events WHERE id = ? AND user_id = ?", (event_id, user_id))
+    await conn.commit()
+
 # Cleaning Session Logic
 
 async def create_cleaning_session(

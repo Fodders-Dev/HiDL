@@ -17,6 +17,7 @@ from handlers import (
     donate,
     knowledge,
     menu,
+    schedule,
     finance,
     guides,
     home_tasks,
@@ -90,6 +91,7 @@ async def create_app(test_mode: bool = False) -> AppContext:
     # роутеры
     dp.include_router(start.router)
     dp.include_router(menu.router)
+    dp.include_router(schedule.router)
     dp.include_router(knowledge.router)
     dp.include_router(routines.router)
     dp.include_router(settings_handler.router)
