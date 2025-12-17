@@ -351,6 +351,9 @@ class ReminderScheduler:
                 reminder_date=local_date,
                 status="pending",
             )
+            # One-time reminders: hide from list after first send.
+            if int(reminder.get("frequency_days") or 1) >= 9999:
+                await repo.archive_custom_reminder(self.conn, user["id"], reminder["id"])
 
     async def _send_routine(
         self, user: dict, routine: dict, local_date: str

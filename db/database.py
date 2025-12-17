@@ -176,6 +176,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             frequency_days INTEGER DEFAULT 1,
             target_weekday INTEGER,
             last_sent_date TEXT,
+            is_active INTEGER DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -386,6 +387,11 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         if "target_weekday" not in reminders_cols:
             try:
                 await conn.execute("ALTER TABLE custom_reminders ADD COLUMN target_weekday INTEGER;")
+            except Exception:
+                pass
+        if "is_active" not in reminders_cols:
+            try:
+                await conn.execute("ALTER TABLE custom_reminders ADD COLUMN is_active INTEGER DEFAULT 1;")
             except Exception:
                 pass
 

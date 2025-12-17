@@ -1196,12 +1196,29 @@ async def list_custom_reminders(conn: aiosqlite.Connection, user_id: int) -> Lis
     cursor = await conn.execute(
         """
         SELECT * FROM custom_reminders
-        WHERE user_id = ?
+        WHERE user_id = ? AND (is_active IS NULL OR is_active = 1)
         ORDER BY id DESC
         """,
         (user_id,),
     )
     return await cursor.fetchall()
+
+
+async def get_custom_reminder(conn: aiosqlite.Connection, user_id: int, reminder_id: int) -> Optional[aiosqlite.Row]:
+    cursor = await conn.execute(
+        "SELECT * FROM custom_reminders WHERE id = ? AND user_id = ?",
+        (reminder_id, user_id),
+    )
+    return await cursor.fetchone()
+
+
+async def archive_custom_reminder(conn: aiosqlite.Connection, user_id: int, reminder_id: int) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE custom_reminders SET is_active = 0, updated_at = ? WHERE id = ? AND user_id = ?",
+        (now, reminder_id, user_id),
+    )
+    await conn.commit()
 
 
 async def delete_custom_reminder(conn: aiosqlite.Connection, user_id: int, reminder_id: int) -> None:

@@ -1029,11 +1029,11 @@ async def custom_action(callback: types.CallbackQuery, db) -> None:
     reminder_id = int(reminder_id)
     from utils.user import ensure_user
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    reminder_list = await repo.list_custom_reminders(db, user["id"])
-    target = next((r for r in reminder_list if r["id"] == reminder_id), None)
+    target = await repo.get_custom_reminder(db, user["id"], reminder_id)
     if not target:
         await callback.answer("Напоминание не найдено", show_alert=True)
         return
+    target = dict(target)
 
     tone = "neutral"
     wellness_row = await repo.get_wellness(db, user["id"])
