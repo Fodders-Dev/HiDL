@@ -47,19 +47,21 @@ def _meds_menu_keyboard(meds_rows) -> InlineKeyboardMarkup:
             ]
         )
     rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="med:add")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.message(Command("meds"))
-async def meds_menu(message: types.Message, db) -> None:
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def _render_meds_menu(message: types.Message, db, user: dict) -> None:
     meds_rows = await repo.list_meds(db, user["id"], active_only=False)
     if not meds_rows:
         await message.answer(
             "Забота о себе — это база. Давай настроим напоминания о витаминах и лекарствах, без давления.\n\n"
             "Пока ничего нет. Нажми «Добавить», чтобы я напоминала о чём-то конкретном.",
             reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить", callback_data="med:add")]]
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ Добавить", callback_data="med:add")],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
+                ]
             ),
         )
         return
@@ -71,6 +73,12 @@ async def meds_menu(message: types.Message, db) -> None:
         dose = row.get("dose_text", "")
         lines.append(f"• {row.get('name')} — {dose}, в {times} ({status})")
     await message.answer("\n".join(lines), reply_markup=_meds_menu_keyboard(meds_rows))
+
+
+@router.message(Command("meds"))
+async def meds_menu(message: types.Message, db) -> None:
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    await _render_meds_menu(message, db, user)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("med:"))
@@ -116,6 +124,7 @@ async def meds_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -
                 [
                     InlineKeyboardButton(text="🕒 Поменять время", callback_data=f"med:retime:{med_id}"),
                 ],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="med:back")],
             ]
         )
         await callback.message.answer(
@@ -123,6 +132,10 @@ async def meds_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -
             "Я напоминаю, но не ставлю диагнозы и не заменяю назначения врача.",
             reply_markup=kb,
         )
+        await callback.answer()
+        return
+    if action == "back":
+        await _render_meds_menu(callback.message, db, user)
         await callback.answer()
         return
     await callback.answer()

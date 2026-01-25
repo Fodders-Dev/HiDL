@@ -81,7 +81,8 @@ async def spent_week(message: types.Message, db) -> None:
     text = await _compose_spent_week(db, user)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")]
+            [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
+            [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
         ]
     )
     await message.answer(text, reply_markup=kb)
@@ -256,6 +257,7 @@ async def money_menu_entry(message: types.Message, state: FSMContext, db) -> Non
             [types.InlineKeyboardButton(text="⏳ До зарплаты", callback_data="money:payday")],
             [types.InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
             [types.InlineKeyboardButton(text="💡 Советы", callback_data="money:tips")],
+            [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
         ]
     )
     await message.answer(
@@ -285,6 +287,7 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
                 [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
                 [types.InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
                 [types.InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
+                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
             ]
         )
         await callback.message.answer(text, reply_markup=kb)
@@ -296,6 +299,7 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
                 [types.InlineKeyboardButton(text="Жильё", callback_data="limit:cat:жильё")],
                 [types.InlineKeyboardButton(text="Развлечения", callback_data="limit:cat:развлечения")],
                 [types.InlineKeyboardButton(text="Другое", callback_data="limit:cat:другое")],
+                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
             ]
         )
         await callback.message.answer("Выбери категорию лимита:", reply_markup=kb)
@@ -490,6 +494,7 @@ async def bills_menu(message: types.Message, state: FSMContext, db) -> None:
             ]
         )
     kb_rows.append([types.InlineKeyboardButton(text="➕ Добавить счёт", callback_data="bill:add")])
+    kb_rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await message.answer(text, reply_markup=kb)
 

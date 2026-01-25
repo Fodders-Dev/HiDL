@@ -83,6 +83,7 @@ def list_keyboard(reminders, with_add: bool = True) -> InlineKeyboardMarkup:
         )
     if not buttons:
         buttons = [[InlineKeyboardButton(text="➕ Добавить", callback_data="rem:add")]]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1107,7 +1108,10 @@ async def reminder_menu_callbacks(callback: types.CallbackQuery, state: FSMConte
             await callback.message.answer(
                 "Пока нет своих напоминаний. Нажми «Добавить», чтобы создать первое.",
                 reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить", callback_data="rem:add")]]
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="➕ Добавить", callback_data="rem:add")],
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
+                    ]
                 ),
             )
         else:
