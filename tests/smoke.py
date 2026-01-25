@@ -23,6 +23,7 @@ MODULES = [
     "handlers.custom_reminders",
     "handlers.home_tasks",
     "handlers.ask_mom",
+    "handlers.focus_cafe",
     "handlers.routine_items",
     "handlers.talk",
     "utils.today",

@@ -8,7 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import repositories as repo
-from utils.time import local_date_str, should_trigger, tzinfo_from_string
+from utils.time import format_date_display, local_date_str, should_trigger, tzinfo_from_string
 from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
 
@@ -34,6 +34,7 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_day_plan_evening, "interval", minutes=15, id="day_plan_evening")
         self.scheduler.add_job(self._tick_meds, "interval", seconds=60, id="meds_tick")
         self.scheduler.add_job(self._tick_affirmations, "interval", minutes=5, id="affirmations_tick")
+        self.scheduler.add_job(self._tick_focus, "interval", seconds=60, id="focus_tick")
         self.scheduler.start()
 
     async def _safe_send_message(
@@ -90,6 +91,9 @@ class ReminderScheduler:
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 log_debug(f"[tick] skip user={user['id']} pause_until={user['pause_until']}")
                 continue
+            if user.get("quiet_mode"):
+                await self._tick_custom(user, now_utc, local_date)
+                continue
             await repo.ensure_user_routines(self.conn, user["id"])
             routines = await repo.list_user_routines(self.conn, user["id"])
             for routine in routines:
@@ -124,6 +128,8 @@ class ReminderScheduler:
             user = dict(user_row)
             local_date = local_date_str(now_utc, user["timezone"])
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            if user.get("quiet_mode"):
                 continue
             plan = await repo.get_day_plan(self.conn, user["id"], local_date)
             if not plan:
@@ -180,6 +186,8 @@ class ReminderScheduler:
             # Проверки паузы
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
+            if user.get("quiet_mode"):
+                continue
 
             # Определяем целевое время (сон - 1 час, дефолт 22:00)
             sleep_time = user.get("sleep_time") or "23:00"
@@ -235,6 +243,8 @@ class ReminderScheduler:
             user = dict(user_row)
             local_date = local_date_str(now_utc, user["timezone"])
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            if user.get("quiet_mode"):
                 continue
             meds = await repo.list_meds(self.conn, user["id"], active_only=True)
             if not meds:
@@ -452,6 +462,8 @@ class ReminderScheduler:
             local_date = local_date_str(now_utc, user["timezone"])
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
+            if user.get("quiet_mode"):
+                continue
             wellness_row = await repo.get_wellness(self.conn, user["id"])
             if not wellness_row:
                 continue
@@ -551,6 +563,8 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
+            if user.get("quiet_mode"):
+                continue
             bills = await repo.bills_due_soon(self.conn, user["id"], local_date, days_ahead=3)
             if not bills:
                 continue
@@ -564,6 +578,8 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            if user.get("quiet_mode"):
+                continue
             tzinfo = tzinfo_from_string(user["timezone"])
             local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
             # воскресенье локально
@@ -609,6 +625,8 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
+            if user.get("quiet_mode"):
+                continue
             today = datetime.date.fromisoformat(local_date)
             care_items = [
                 ("last_care_dentist", 180, "🦷 Давно не было стоматолога? Запишись на осмотр/чистку."),
@@ -643,6 +661,8 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
+            if user.get("quiet_mode"):
+                continue
             last = user.get("last_weight_prompt") or ""
             due = True
             if last:
@@ -671,6 +691,8 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            if user.get("quiet_mode"):
+                continue
             tzinfo = tzinfo_from_string(user["timezone"])
             local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
             if local_dt.weekday() != 6:
@@ -699,6 +721,8 @@ class ReminderScheduler:
             
             # Проверяем паузу
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            if user.get("quiet_mode"):
                 continue
             
             # Получаем настройки wellness
@@ -768,3 +792,85 @@ class ReminderScheduler:
             log_debug(
                 f"[affirmations] sent to user={user['id']} hour={current_hour} date={local_date}"
             )
+
+    async def _tick_focus(self) -> None:
+        now_utc = datetime.datetime.utcnow()
+        sessions = await repo.list_active_focus_sessions(self.conn)
+        if not sessions:
+            return
+        for session in sessions:
+            user_row = await repo.get_user(self.conn, session["user_id"])
+            if not user_row:
+                continue
+            user = dict(user_row)
+            local_date = local_date_str(now_utc, user["timezone"])
+            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            try:
+                checkin_ts = datetime.datetime.fromisoformat(session["checkin_ts"])
+                end_ts = datetime.datetime.fromisoformat(session["end_ts"])
+            except Exception:
+                continue
+
+            if not session.get("checkin_sent") and now_utc >= checkin_ts:
+                text = f"Середина сессии «{session['task_title']}». Ты в плане?"
+                keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=button_label(user, "✅ В плане", "✅ В плане", "✅ В плане"),
+                                callback_data=f"cafe:checkin:ok:{session['id']}",
+                            ),
+                            InlineKeyboardButton(
+                                text=button_label(user, "⚠️ Сбился", "⚠️ Сбилась", "⚠️ Сбился(ась)"),
+                                callback_data=f"cafe:checkin:off:{session['id']}",
+                            ),
+                        ]
+                    ]
+                )
+                sent = await self._safe_send_message(
+                    user, local_date, text, reply_markup=keyboard
+                )
+                if sent:
+                    await repo.mark_focus_checkin_sent(self.conn, session["id"])
+
+            if not session.get("end_sent") and now_utc >= end_ts:
+                text = f"Время вышло. Как итог по «{session['task_title']}»?"
+                keyboard = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=done_button_label(user),
+                                callback_data=f"cafe:finish:done:{session['id']}",
+                            ),
+                            InlineKeyboardButton(
+                                text=button_label(user, "🟡 Частично", "🟡 Частично", "🟡 Частично"),
+                                callback_data=f"cafe:finish:partial:{session['id']}",
+                            ),
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text=button_label(user, "❌ Не сделал", "❌ Не сделала", "❌ Не сделал(а)"),
+                                callback_data=f"cafe:finish:fail:{session['id']}",
+                            )
+                        ],
+                    ]
+                )
+                sent = await self._safe_send_message(
+                    user, local_date, text, reply_markup=keyboard
+                )
+                if sent:
+                    await repo.mark_focus_end_sent(self.conn, session["id"])
+
+            if session.get("end_sent") and not session.get("result"):
+                grace = end_ts + datetime.timedelta(minutes=30)
+                if now_utc >= grace:
+                    await repo.complete_focus_session(self.conn, session["id"], "missed")
+                    strikes = await repo.update_focus_strikes(self.conn, user["id"], 1)
+                    if strikes >= 2:
+                        cooldown_until = (
+                            now_utc + datetime.timedelta(hours=6)
+                        ).isoformat()
+                        await repo.set_focus_cooldown(
+                            self.conn, user["id"], cooldown_until
+                        )

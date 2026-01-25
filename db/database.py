@@ -94,6 +94,9 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             strictness TEXT DEFAULT 'neutral',
             goals TEXT DEFAULT '',
             pause_until TEXT,
+            quiet_mode INTEGER DEFAULT 0,
+            focus_strikes INTEGER DEFAULT 0,
+            focus_cooldown_until TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -390,6 +393,23 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS focus_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            task_title TEXT NOT NULL,
+            duration_min INTEGER NOT NULL,
+            start_ts TEXT NOT NULL,
+            checkin_ts TEXT NOT NULL,
+            checkin_sent INTEGER DEFAULT 0,
+            checkin_response TEXT DEFAULT '',
+            end_ts TEXT NOT NULL,
+            end_sent INTEGER DEFAULT 0,
+            result TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
     await ensure_columns(conn)
@@ -404,6 +424,12 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
     user_cols = {row["name"] for row in users_info}
     if "pause_until" not in user_cols:
         await conn.execute("ALTER TABLE users ADD COLUMN pause_until TEXT;")
+    if "quiet_mode" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN quiet_mode INTEGER DEFAULT 0;")
+    if "focus_strikes" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN focus_strikes INTEGER DEFAULT 0;")
+    if "focus_cooldown_until" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN focus_cooldown_until TEXT;")
 
     articles_info = await conn.execute_fetchall("PRAGMA table_info(knowledge_articles);")
     article_cols = {row["name"] for row in articles_info}

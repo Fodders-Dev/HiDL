@@ -804,6 +804,40 @@ async def clear_user_pause(conn: aiosqlite.Connection, user_id: int) -> None:
     await conn.commit()
 
 
+async def set_quiet_mode(conn: aiosqlite.Connection, user_id: int, enabled: bool) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET quiet_mode = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_focus_strikes(conn: aiosqlite.Connection, user_id: int, delta: int) -> int:
+    now = utc_now_str()
+    cursor = await conn.execute(
+        "SELECT focus_strikes FROM users WHERE id = ?", (user_id,)
+    )
+    row = await cursor.fetchone()
+    current = row["focus_strikes"] if row and row["focus_strikes"] is not None else 0
+    new_val = max(0, current + delta)
+    await conn.execute(
+        "UPDATE users SET focus_strikes = ?, updated_at = ? WHERE id = ?",
+        (new_val, now, user_id),
+    )
+    await conn.commit()
+    return new_val
+
+
+async def set_focus_cooldown(conn: aiosqlite.Connection, user_id: int, until_ts: str | None) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET focus_cooldown_until = ?, updated_at = ? WHERE id = ?",
+        (until_ts, now, user_id),
+    )
+    await conn.commit()
+
+
 async def toggle_adhd(conn: aiosqlite.Connection, user_id: int, enabled: bool) -> None:
     now = utc_now_str()
     await conn.execute(
@@ -2182,6 +2216,90 @@ async def home_stats_since(conn: aiosqlite.Connection, user_id: int, since_date:
     )
     row = await cursor.fetchone()
     return (row["cnt"] if row else 0, row["pts"] if row else 0)
+
+
+# Focus cafe sessions
+async def create_focus_session(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    task_title: str,
+    duration_min: int,
+    start_ts: str,
+    checkin_ts: str,
+    end_ts: str,
+) -> int:
+    now = utc_now_str()
+    cursor = await conn.execute(
+        """
+        INSERT INTO focus_sessions (
+            user_id, task_title, duration_min, start_ts, checkin_ts, end_ts,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, task_title, duration_min, start_ts, checkin_ts, end_ts, now, now),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def get_active_focus_session(conn: aiosqlite.Connection, user_id: int) -> Optional[Dict[str, Any]]:
+    cursor = await conn.execute(
+        """
+        SELECT * FROM focus_sessions
+        WHERE user_id = ? AND result = ''
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def list_active_focus_sessions(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM focus_sessions WHERE result = ''"
+    )
+    return [dict(r) for r in rows] if rows else []
+
+
+async def mark_focus_checkin_sent(conn: aiosqlite.Connection, session_id: int) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE focus_sessions SET checkin_sent = 1, updated_at = ? WHERE id = ?",
+        (now, session_id),
+    )
+    await conn.commit()
+
+
+async def mark_focus_checkin_response(
+    conn: aiosqlite.Connection, session_id: int, response: str
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE focus_sessions SET checkin_response = ?, updated_at = ? WHERE id = ?",
+        (response, now, session_id),
+    )
+    await conn.commit()
+
+
+async def mark_focus_end_sent(conn: aiosqlite.Connection, session_id: int) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE focus_sessions SET end_sent = 1, updated_at = ? WHERE id = ?",
+        (now, session_id),
+    )
+    await conn.commit()
+
+
+async def complete_focus_session(conn: aiosqlite.Connection, session_id: int, result: str) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE focus_sessions SET result = ?, updated_at = ? WHERE id = ?",
+        (result, now, session_id),
+    )
+    await conn.commit()
 
 
 async def reset_month_points(conn: aiosqlite.Connection, current_month: str) -> None:

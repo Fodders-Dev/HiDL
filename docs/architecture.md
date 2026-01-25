@@ -67,6 +67,11 @@
 - Сценарии: разминка 5/10/20, домашняя тренировка, прогулки (короткая/длиннее), фокус-таймер 20/10, вес/цели.
 - Хранилище: wellness (tone, meal_profile, reminders вода/еда, фокус интервалы).
 
+### Кафе фокуса
+- Вход: команда `/cafe` или кнопка “☕ Кафе фокуса”.
+- Сценарий: короткая фокус‑сессия с серединным чек‑ином и финальным итогом.
+- Хранилище: `focus_sessions`, у пользователя — `focus_strikes`, `focus_cooldown_until`.
+
 ### Напоминания
 - Вход: кнопка “Напоминания”, /add_reminder, текст “напомин”.
 - Диалог (`handlers/custom_reminders.py`):
@@ -99,6 +104,7 @@
 - Wellness: `wellness_settings` — вода/еда/фокус, тон, meal_profile.
 - Витамины/таблетки: `meds` и `med_logs`.
 - Кладовка: `pantry_items` (запасы и сроки годности) и `receipt_photos` (заглушка под OCR чеков).
+- Фокус‑сессии: `focus_sessions` (задача, длительность, check‑in/end).
 
 ## Планировщик
 - APScheduler в `scheduler/reminder.py`, джобы:
@@ -107,6 +113,7 @@
   - _tick_bills (счета)
   - _tick_weekly_finance (отчёт)
   - _weekly_home_plan (план по дому пуш)
+  - _tick_focus (чек‑ины и итоги фокус‑сессий)
   - _reset_points_month, _tick_care, _tick_weight_prompt
 - Все джобы запускаются в `main.py` при старте.
 

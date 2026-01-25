@@ -19,6 +19,7 @@ from handlers import (
     menu,
     schedule,
     finance,
+    focus_cafe,
     guides,
     home_tasks,
     home_supplies,
@@ -100,6 +101,7 @@ async def create_app(test_mode: bool = False) -> AppContext:
     dp.include_router(custom_reminders.router)
     dp.include_router(ask_mom.router)
     dp.include_router(finance.router)
+    dp.include_router(focus_cafe.router)
     dp.include_router(guides.router)
     dp.include_router(home_tasks.router)
     dp.include_router(home_supplies.router)

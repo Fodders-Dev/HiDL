@@ -338,16 +338,19 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
         meal_enabled = w.get("meal_enabled", 1)
         water_enabled = w.get("water_enabled", 0)
         affirm_enabled = w.get("affirm_enabled", 0)
+        quiet_enabled = user.get("quiet_mode", 0)
         
         meal_icon = "✅" if meal_enabled else "❌"
         water_icon = "✅" if water_enabled else "❌"
         affirm_icon = "✅" if affirm_enabled else "❌"
+        quiet_icon = "✅" if quiet_enabled else "❌"
         
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")],
                 [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
                 [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
+                [InlineKeyboardButton(text=f"🔕 Тихий режим {quiet_icon}", callback_data="settings:quiet")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
             ]
         )
@@ -357,6 +360,13 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
             "Включай и выключай напоминания по категориям:",
             reply_markup=kb,
         )
+    elif action == "quiet":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        current = user.get("quiet_mode", 0)
+        new_val = 0 if current else 1
+        await repo.set_quiet_mode(db, user["id"], new_val)
+        await callback.answer("Тихий режим: " + ("вкл" if new_val else "выкл"))
+        await settings_select(callback.replace(data="settings:notifications"), state, db, skip_answer=True)
     elif action == "notify" and len(parts) >= 3:
         notify_type = parts[2]
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
@@ -474,12 +484,15 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
         meal_icon = "✅" if w.get("meal_enabled", 1) else "❌"
         water_icon = "✅" if w.get("water_enabled", 0) else "❌"
         affirm_icon = "✅" if w.get("affirm_enabled", 0) else "❌"
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        quiet_icon = "✅" if user.get("quiet_mode", 0) else "❌"
         
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")],
                 [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
                 [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
+                [InlineKeyboardButton(text=f"🔕 Тихий режим {quiet_icon}", callback_data="settings:quiet")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
             ]
         )

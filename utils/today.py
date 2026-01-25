@@ -125,6 +125,10 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     if user.get("pause_until") and user["pause_until"] >= local_date:
         pause_note = "🧘 Сейчас включён щадящий режим: уведомлений меньше, можно вернуть /resume.\n\n"
 
+    quiet_note = ""
+    if user.get("quiet_mode"):
+        quiet_note = "🔕 Тихий режим: шлёт только твои напоминания. Отключить в ⚙ Настройки.\n\n"
+
     bills_lines = []
     bills = await repo.bills_due_soon(db, user["id"], local_date, days_ahead=3)
     if bills:
@@ -256,7 +260,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             if thought:
                 affirm_line = f"💬 Мысль дня: «{thought}»"
                 summary_lines.append(affirm_line)
-    blocks = [f"{pause_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
+    blocks = [f"{pause_note}{quiet_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
     if routine_lines:
         blocks.append("<b>🌞 Рутины:</b>\n" + "\n".join(routine_lines))
     if custom_lines:
