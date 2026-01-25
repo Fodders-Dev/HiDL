@@ -59,6 +59,38 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+async def _render_notifications_menu(callback: types.CallbackQuery, db) -> None:
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    wellness = await repo.get_wellness(db, user["id"])
+    w = dict(wellness) if wellness else {}
+
+    meal_enabled = w.get("meal_enabled", 1)
+    water_enabled = w.get("water_enabled", 0)
+    affirm_enabled = w.get("affirm_enabled", 0)
+    quiet_enabled = user.get("quiet_mode", 0)
+
+    meal_icon = "✅" if meal_enabled else "❌"
+    water_icon = "✅" if water_enabled else "❌"
+    affirm_icon = "✅" if affirm_enabled else "❌"
+    quiet_icon = "✅" if quiet_enabled else "❌"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")],
+            [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
+            [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
+            [InlineKeyboardButton(text=f"🔕 Тихий режим {quiet_icon}", callback_data="settings:quiet")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
+        ]
+    )
+    await safe_edit(
+        callback.message,
+        "🔔 Настройки уведомлений\n\n"
+        "Включай и выключай напоминания по категориям:",
+        reply_markup=kb,
+    )
+
+
 def _affirm_keyboard(current_mode: str) -> InlineKeyboardMarkup:
     """Собрать клавиатуру выбора режима аффирмаций с подсветкой текущего выбора и кнопкой Назад."""
     def label(mode: str, text: str) -> str:
@@ -331,42 +363,14 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
              await callback.answer()
     # --- Уведомления ---
     elif action == "notifications":
-        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-        wellness = await repo.get_wellness(db, user["id"])
-        w = dict(wellness) if wellness else {}
-        
-        meal_enabled = w.get("meal_enabled", 1)
-        water_enabled = w.get("water_enabled", 0)
-        affirm_enabled = w.get("affirm_enabled", 0)
-        quiet_enabled = user.get("quiet_mode", 0)
-        
-        meal_icon = "✅" if meal_enabled else "❌"
-        water_icon = "✅" if water_enabled else "❌"
-        affirm_icon = "✅" if affirm_enabled else "❌"
-        quiet_icon = "✅" if quiet_enabled else "❌"
-        
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")],
-                [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
-                [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
-                [InlineKeyboardButton(text=f"🔕 Тихий режим {quiet_icon}", callback_data="settings:quiet")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
-            ]
-        )
-        await safe_edit(
-            callback.message,
-            "🔔 Настройки уведомлений\n\n"
-            "Включай и выключай напоминания по категориям:",
-            reply_markup=kb,
-        )
+        await _render_notifications_menu(callback, db)
     elif action == "quiet":
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         current = user.get("quiet_mode", 0)
         new_val = 0 if current else 1
         await repo.set_quiet_mode(db, user["id"], new_val)
         await callback.answer("Тихий режим: " + ("вкл" if new_val else "выкл"))
-        await settings_select(callback.replace(data="settings:notifications"), state, db, skip_answer=True)
+        await _render_notifications_menu(callback, db)
     elif action == "notify" and len(parts) >= 3:
         notify_type = parts[2]
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)

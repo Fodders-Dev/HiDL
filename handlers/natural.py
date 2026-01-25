@@ -3,6 +3,7 @@ import re
 import datetime
 
 from aiogram import Router, types
+from aiogram.fsm.context import FSMContext
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
@@ -35,7 +36,9 @@ def _extract_time(text: str):
 
 
 @router.message(lambda m: m.text and not m.text.startswith("/"))
-async def natural_handler(message: types.Message, db) -> None:
+async def natural_handler(message: types.Message, db, state: FSMContext) -> None:
+    if await state.get_state():
+        return
     text_original = message.text or ""
     text = text_original.lower()
     # Напоминания обрабатываются в handlers/custom_reminders.py (с подтверждением).

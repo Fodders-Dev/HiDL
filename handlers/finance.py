@@ -327,7 +327,9 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
 
 # Свободный ввод для трат (натуральные команды)
 @router.message(lambda m: m.text and any(ch.isdigit() for ch in m.text))
-async def money_free_parse(message: types.Message, db) -> None:
+async def money_free_parse(message: types.Message, db, state: FSMContext) -> None:
+    if await state.get_state():
+        return
     parsed = parse_command(message.text)
     if not parsed or parsed.type != "expense":
         return
