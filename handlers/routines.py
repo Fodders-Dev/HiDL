@@ -5,10 +5,8 @@ from aiogram import Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
-from keyboards.common import main_menu_keyboard
 from utils.tone import tone_short_ack
 from utils.user import ensure_user
-from utils.affirmations import random_affirmation_text
 from utils.gender import done_button_label
 
 router = Router()
@@ -165,20 +163,6 @@ async def routine_action(callback: CallbackQuery, db) -> None:
 
     if action == "done":
         await callback.answer("Готово. Рутину закрыли — очки по отмеченным пунктам.")
-        # по желанию пользователя можно добавить мягкую аффирмацию после рутины
-        r_key = routine.get("routine_key")
-        want_morning = affirm_mode in {"morning", "both"} and r_key == "morning"
-        want_evening = affirm_mode in {"evening", "both"} and r_key == "evening"
-        if want_morning or want_evening:
-            extra = random_affirmation_text()
-            if extra:
-                try:
-                    await callback.message.answer(
-                        f"💬 Немного поддержки после рутины:\n\n<i>{extra}</i>",
-                        reply_markup=main_menu_keyboard(),
-                    )
-                except Exception:
-                    pass
     elif action == "skip":
         await callback.answer("Ок, пропустим. Завтра попробуем снова.")
     elif action == "later":

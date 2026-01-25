@@ -25,13 +25,12 @@ def _duration_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="15 мин", callback_data="cafe:duration:15"),
                 InlineKeyboardButton(text="25 мин", callback_data="cafe:duration:25"),
                 InlineKeyboardButton(text="50 мин", callback_data="cafe:duration:50"),
             ],
             [
-                InlineKeyboardButton(text="90 мин", callback_data="cafe:duration:90"),
-                InlineKeyboardButton(text="Своя", callback_data="cafe:duration:custom"),
+                InlineKeyboardButton(text="15 мин", callback_data="cafe:duration:15"),
+                InlineKeyboardButton(text="Своя длительность", callback_data="cafe:duration:custom"),
             ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="cafe:cancel")],
         ]
@@ -108,7 +107,7 @@ async def cafe_start(message: types.Message, state: FSMContext, db) -> None:
 
     await state.set_state(FocusCafeState.task)
     await message.answer(
-        "Что берём в работу? Одной фразой — чтобы не перегружать голову.",
+        "Что берём в работу? Одной фразой, без деталей.",
         reply_markup=_task_keyboard(),
     )
 
@@ -200,7 +199,7 @@ async def _start_session(event, state: FSMContext, db, minutes: int) -> None:
     tzinfo = tzinfo_from_string(user["timezone"])
     end_local = end_ts.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
     text = (
-        f"Старт. Работаем над «{task}» {minutes} мин.\n"
+        f"Старт. «{task}» на {minutes} мин.\n"
         f"Напишу в середине и в конце. Финиш примерно в {end_local.strftime('%H:%M')}."
     )
     kb = InlineKeyboardMarkup(
@@ -262,6 +261,17 @@ async def cafe_finish(callback: types.CallbackQuery, db) -> None:
                 now_utc + datetime.timedelta(hours=6)
             ).isoformat()
             await repo.set_focus_cooldown(db, user["id"], cooldown_until)
+            tzinfo = tzinfo_from_string(user["timezone"])
+            until_local = (
+                datetime.datetime.fromisoformat(cooldown_until)
+                .replace(tzinfo=datetime.timezone.utc)
+                .astimezone(tzinfo)
+            )
+            cooldown_note = f"\nПауза по фокусу до {until_local.strftime('%H:%M')}."
+        else:
+            cooldown_note = ""
+    if result != "fail":
+        cooldown_note = ""
 
     if points:
         await repo.add_points(db, user["id"], points, local_date=local_date)
@@ -271,6 +281,7 @@ async def cafe_finish(callback: types.CallbackQuery, db) -> None:
         "partial": f"Отметила. +{points} очк. Всё равно сдвиг.",
         "fail": "Принято. Без давления — вернёмся, когда будет ресурс.",
     }.get(result, "Принято.")
+    text += cooldown_note
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="☕ Ещё сессию", callback_data="cafe:restart")],

@@ -659,8 +659,9 @@ async def list_reminders_button(message: types.Message, db) -> None:
 
 
 @router.callback_query(lambda c: c.data and c.data == "rem:list")
-async def reminders_from_today(callback: types.CallbackQuery, db) -> None:
+async def reminders_from_today(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     """Показ списка напоминаний из /today кнопки."""
+    await state.clear()
     urow = await repo.get_user_by_telegram_id(db, callback.from_user.id)
     user = row_to_dict(urow) if urow else None
     if not user:
@@ -700,6 +701,7 @@ async def reminder_edit(callback: types.CallbackQuery, state: FSMContext, db) ->
                 InlineKeyboardButton(text="↻ Частота", callback_data="rem:edit_freq"),
             ],
             [InlineKeyboardButton(text="День недели (для еженед.)", callback_data="rem:edit_wd")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="rem:list")],
         ]
     )
     await callback.message.answer("Что меняем в напоминании?", reply_markup=kb)
@@ -733,6 +735,7 @@ async def reminder_edit_choice(callback: types.CallbackQuery, state: FSMContext)
                     InlineKeyboardButton(text="Сб", callback_data="rem:wdset:5"),
                     InlineKeyboardButton(text="Вс", callback_data="rem:wdset:6"),
                 ]
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="rem:list")],
             ]
         )
         await callback.message.answer("Выбери день недели для напоминания:", reply_markup=kb)
@@ -1081,13 +1084,7 @@ async def custom_action(callback: types.CallbackQuery, db) -> None:
     else:
         await callback.answer("Обновлено")
 
-    # Вместо полной сводки — короткое подтверждение
-    if action == "done":
-        from utils.tone import tone_ack
-
-        await callback.message.answer(tone_ack(tone, "напоминание"), reply_markup=main_menu_keyboard())
-    elif action == "skip":
-        await callback.message.answer("⏭ Пропустила напоминание.", reply_markup=main_menu_keyboard())
+    # Без лишних сообщений — подтверждаем тостом.
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("rem:"))

@@ -95,6 +95,15 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             goals TEXT DEFAULT '',
             pause_until TEXT,
             quiet_mode INTEGER DEFAULT 0,
+            sleep_mode_enabled INTEGER DEFAULT 0,
+            sleep_target_sleep TEXT,
+            sleep_target_wake TEXT,
+            sleep_shift_step INTEGER DEFAULT 30,
+            sleep_shift_every INTEGER DEFAULT 2,
+            sleep_last_shift_date TEXT,
+            sleep_last_evening_date TEXT,
+            sleep_last_morning_date TEXT,
+            daily_brief_last_date TEXT,
             focus_strikes INTEGER DEFAULT 0,
             focus_cooldown_until TEXT,
             created_at TEXT NOT NULL,
@@ -426,6 +435,24 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE users ADD COLUMN pause_until TEXT;")
     if "quiet_mode" not in user_cols:
         await conn.execute("ALTER TABLE users ADD COLUMN quiet_mode INTEGER DEFAULT 0;")
+    if "sleep_mode_enabled" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_mode_enabled INTEGER DEFAULT 0;")
+    if "sleep_target_sleep" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_target_sleep TEXT;")
+    if "sleep_target_wake" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_target_wake TEXT;")
+    if "sleep_shift_step" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_shift_step INTEGER DEFAULT 30;")
+    if "sleep_shift_every" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_shift_every INTEGER DEFAULT 2;")
+    if "sleep_last_shift_date" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_last_shift_date TEXT;")
+    if "sleep_last_evening_date" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_last_evening_date TEXT;")
+    if "sleep_last_morning_date" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN sleep_last_morning_date TEXT;")
+    if "daily_brief_last_date" not in user_cols:
+        await conn.execute("ALTER TABLE users ADD COLUMN daily_brief_last_date TEXT;")
     if "focus_strikes" not in user_cols:
         await conn.execute("ALTER TABLE users ADD COLUMN focus_strikes INTEGER DEFAULT 0;")
     if "focus_cooldown_until" not in user_cols:

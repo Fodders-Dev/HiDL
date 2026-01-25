@@ -13,6 +13,47 @@ from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
 
 
+def _hhmm_to_min(hhmm: str) -> Optional[int]:
+    try:
+        dt = datetime.datetime.strptime(hhmm, "%H:%M")
+    except Exception:
+        return None
+    return dt.hour * 60 + dt.minute
+
+
+def _min_to_hhmm(minutes: int) -> str:
+    m = int(minutes) % (24 * 60)
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _delta_minutes(current: int, target: int) -> int:
+    diff = target - current
+    if diff > 720:
+        diff -= 1440
+    if diff < -720:
+        diff += 1440
+    return diff
+
+
+def _sleep_window_active(user: dict, now_utc: datetime.datetime) -> bool:
+    if not user.get("sleep_mode_enabled"):
+        return False
+    sleep_start = user.get("sleep_target_sleep") or user.get("sleep_time") or "23:00"
+    sleep_end = user.get("sleep_target_wake") or user.get("wake_up_time") or "08:00"
+    start_min = _hhmm_to_min(sleep_start)
+    end_min = _hhmm_to_min(sleep_end)
+    if start_min is None or end_min is None:
+        return False
+    tzinfo = tzinfo_from_string(user.get("timezone", "UTC"))
+    local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
+    local_min = local_dt.hour * 60 + local_dt.minute
+    if start_min == end_min:
+        return True
+    if start_min < end_min:
+        return start_min <= local_min < end_min
+    return local_min >= start_min or local_min < end_min
+
+
 class ReminderScheduler:
     """APS-based reminder scheduler for routine check-ins."""
 
@@ -35,6 +76,8 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_meds, "interval", seconds=60, id="meds_tick")
         self.scheduler.add_job(self._tick_affirmations, "interval", minutes=5, id="affirmations_tick")
         self.scheduler.add_job(self._tick_focus, "interval", seconds=60, id="focus_tick")
+        self.scheduler.add_job(self._tick_sleep_mode, "interval", minutes=5, id="sleep_mode_tick")
+        self.scheduler.add_job(self._tick_daily_brief, "interval", minutes=5, id="daily_brief_tick")
         self.scheduler.start()
 
     async def _safe_send_message(
@@ -94,6 +137,9 @@ class ReminderScheduler:
             if user.get("quiet_mode"):
                 await self._tick_custom(user, now_utc, local_date)
                 continue
+            if _sleep_window_active(user, now_utc):
+                await self._tick_custom(user, now_utc, local_date)
+                continue
             await repo.ensure_user_routines(self.conn, user["id"])
             routines = await repo.list_user_routines(self.conn, user["id"])
             for routine in routines:
@@ -130,6 +176,10 @@ class ReminderScheduler:
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
             if user.get("quiet_mode"):
+                continue
+            if _sleep_window_active(user, now_utc):
+                continue
+            if _sleep_window_active(user, now_utc):
                 continue
             plan = await repo.get_day_plan(self.conn, user["id"], local_date)
             if not plan:
@@ -187,6 +237,8 @@ class ReminderScheduler:
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
             if user.get("quiet_mode"):
+                continue
+            if _sleep_window_active(user, now_utc):
                 continue
 
             # Определяем целевое время (сон - 1 час, дефолт 22:00)
@@ -464,6 +516,8 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
+            if _sleep_window_active(user, now_utc):
+                continue
             wellness_row = await repo.get_wellness(self.conn, user["id"])
             if not wellness_row:
                 continue
@@ -565,6 +619,8 @@ class ReminderScheduler:
             local_date = local_date_str(now_utc, user["timezone"])
             if user.get("quiet_mode"):
                 continue
+            if _sleep_window_active(user, now_utc):
+                continue
             bills = await repo.bills_due_soon(self.conn, user["id"], local_date, days_ahead=3)
             if not bills:
                 continue
@@ -579,6 +635,8 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             if user.get("quiet_mode"):
+                continue
+            if _sleep_window_active(user, now_utc):
                 continue
             tzinfo = tzinfo_from_string(user["timezone"])
             local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
@@ -627,6 +685,8 @@ class ReminderScheduler:
             local_date = local_date_str(now_utc, user["timezone"])
             if user.get("quiet_mode"):
                 continue
+            if _sleep_window_active(user, now_utc):
+                continue
             today = datetime.date.fromisoformat(local_date)
             care_items = [
                 ("last_care_dentist", 180, "🦷 Давно не было стоматолога? Запишись на осмотр/чистку."),
@@ -662,6 +722,8 @@ class ReminderScheduler:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
             if user.get("quiet_mode"):
+                continue
+            if _sleep_window_active(user, now_utc):
                 continue
             last = user.get("last_weight_prompt") or ""
             due = True
@@ -874,3 +936,152 @@ class ReminderScheduler:
                         await repo.set_focus_cooldown(
                             self.conn, user["id"], cooldown_until
                         )
+
+    async def _maybe_shift_sleep(self, user: dict, local_date: str) -> None:
+        target_sleep = user.get("sleep_target_sleep")
+        target_wake = user.get("sleep_target_wake")
+        if not target_sleep or not target_wake:
+            return
+        shift_step = int(user.get("sleep_shift_step") or 30)
+        shift_every = max(1, int(user.get("sleep_shift_every") or 2))
+        last_shift = user.get("sleep_last_shift_date") or ""
+        if last_shift:
+            try:
+                last_dt = datetime.date.fromisoformat(last_shift)
+                current_dt = datetime.date.fromisoformat(local_date)
+                if (current_dt - last_dt).days < shift_every:
+                    return
+            except Exception:
+                pass
+
+        current_sleep = user.get("sleep_time") or target_sleep
+        current_wake = user.get("wake_up_time") or target_wake
+        cur_sleep_min = _hhmm_to_min(current_sleep)
+        cur_wake_min = _hhmm_to_min(current_wake)
+        tgt_sleep_min = _hhmm_to_min(target_sleep)
+        tgt_wake_min = _hhmm_to_min(target_wake)
+        if None in (cur_sleep_min, cur_wake_min, tgt_sleep_min, tgt_wake_min):
+            return
+
+        delta_sleep = _delta_minutes(cur_sleep_min, tgt_sleep_min)
+        delta_wake = _delta_minutes(cur_wake_min, tgt_wake_min)
+        if delta_sleep == 0 and delta_wake == 0:
+            return
+
+        step_sleep = max(-shift_step, min(shift_step, delta_sleep))
+        step_wake = max(-shift_step, min(shift_step, delta_wake))
+        new_sleep = _min_to_hhmm(cur_sleep_min + step_sleep)
+        new_wake = _min_to_hhmm(cur_wake_min + step_wake)
+
+        await repo.update_user_schedule(self.conn, user["id"], new_wake, new_sleep)
+        await repo.update_sleep_last_shift(self.conn, user["id"], local_date)
+
+    async def _tick_sleep_mode(self) -> None:
+        now_utc = datetime.datetime.utcnow()
+        users = await repo.list_users(self.conn)
+        for user_row in users:
+            user = dict(user_row)
+            if not user.get("sleep_mode_enabled"):
+                continue
+            local_date = local_date_str(now_utc, user["timezone"])
+            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            if user.get("quiet_mode"):
+                continue
+
+            await self._maybe_shift_sleep(user, local_date)
+
+            target_sleep = user.get("sleep_target_sleep") or user.get("sleep_time") or "23:00"
+            target_wake = user.get("sleep_target_wake") or user.get("wake_up_time") or "08:00"
+
+            evening_sent = user.get("sleep_last_evening_date") == local_date
+            if not evening_sent:
+                try:
+                    dt_sleep = datetime.datetime.strptime(target_sleep, "%H:%M")
+                    dt_target = dt_sleep - datetime.timedelta(minutes=75)
+                    target_time = dt_target.strftime("%H:%M")
+                except Exception:
+                    target_time = "21:30"
+                if should_trigger(now_utc, user["timezone"], target_time, window_minutes=10):
+                    text = "🌙 Время замедляться. Давай мягко свернем день, чтобы уснуть вовремя."
+                    kb = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(text="Ок, начинаю", callback_data="sleep:evening:ok"),
+                                InlineKeyboardButton(text="Сегодня позже", callback_data="sleep:evening:later"),
+                            ]
+                        ]
+                    )
+                    sent = await self._safe_send_message(user, local_date, text, reply_markup=kb)
+                    if sent:
+                        await repo.update_sleep_ping(self.conn, user["id"], "evening", local_date)
+
+            morning_sent = user.get("sleep_last_morning_date") == local_date
+            if not morning_sent and should_trigger(now_utc, user["timezone"], target_wake, window_minutes=15):
+                text = "☀️ Доброе утро. Мягкий старт: вода + свет/движение 2 минуты."
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="Я встал(а)", callback_data="sleep:morning:up"),
+                            InlineKeyboardButton(text="Ещё 10 мин", callback_data="sleep:morning:snooze"),
+                        ]
+                    ]
+                )
+                sent = await self._safe_send_message(user, local_date, text, reply_markup=kb)
+                if sent:
+                    await repo.update_sleep_ping(self.conn, user["id"], "morning", local_date)
+
+    async def _tick_daily_brief(self) -> None:
+        now_utc = datetime.datetime.utcnow()
+        users = await repo.list_users(self.conn)
+        for user_row in users:
+            user = dict(user_row)
+            local_date = local_date_str(now_utc, user["timezone"])
+            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+                continue
+            if user.get("quiet_mode"):
+                continue
+            if _sleep_window_active(user, now_utc):
+                continue
+            if user.get("daily_brief_last_date") == local_date:
+                continue
+
+            wake_time = user.get("wake_up_time") or "08:00"
+            if not should_trigger(now_utc, user["timezone"], wake_time, window_minutes=30):
+                continue
+
+            plan = await repo.get_day_plan(self.conn, user["id"], local_date)
+            if plan:
+                # если у пользователя уже есть план, он получит отдельный утренний пинг
+                continue
+
+            morning = await repo.get_routine_by_key(self.conn, "morning")
+            steps = []
+            if morning:
+                steps_rows = await repo.list_routine_steps_for_routine(
+                    self.conn, user["id"], morning["id"]
+                )
+                steps = [dict(r).get("title") for r in steps_rows if dict(r).get("title")]
+            if not steps:
+                steps = [
+                    "Стакан воды",
+                    "Открыть окно на 2–5 минут",
+                    "Выбрать 1 главное дело на сегодня",
+                ]
+
+            focus_steps = steps[:3]
+            micro = focus_steps[0] if focus_steps else "Сделать один маленький шаг"
+            lines = ["☀️ Коротко на сегодня:"]
+            for item in focus_steps:
+                lines.append(f"• {item}")
+            lines.append(f"Микро‑шаг: {micro}")
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📅 Сегодня", callback_data="today:menu")],
+                ]
+            )
+
+            sent = await self._safe_send_message(user, local_date, "\n".join(lines), reply_markup=kb)
+            if sent:
+                await repo.update_daily_brief_sent(self.conn, user["id"], local_date)

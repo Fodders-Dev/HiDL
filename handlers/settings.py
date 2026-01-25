@@ -50,11 +50,13 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="👤 Мой профиль", callback_data="settings:profile")],
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
+            [InlineKeyboardButton(text="😴 Режим сна", callback_data="settings:sleep_mode")],
             [InlineKeyboardButton(text="Время и режим дня", callback_data="settings:time_menu")],
             [InlineKeyboardButton(text="Рутины (шаги и время)", callback_data="settings:routines_menu")],
             [InlineKeyboardButton(text="Срок «скоро истечёт»", callback_data="settings:expiry")],
             [InlineKeyboardButton(text="ADHD-режим", callback_data="settings:adhd")],
             [InlineKeyboardButton(text="Общий дом", callback_data="settings:household")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
         ]
     )
 
@@ -364,6 +366,12 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
     # --- Уведомления ---
     elif action == "notifications":
         await _render_notifications_menu(callback, db)
+    elif action == "sleep_mode":
+        from handlers import sleep_mode as sleep_handler
+
+        await sleep_handler._render_sleep_menu(callback.message, db, origin="settings")  # noqa: SLF001
+        await callback.answer()
+        return
     elif action == "quiet":
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         current = user.get("quiet_mode", 0)

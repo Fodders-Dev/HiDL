@@ -237,6 +237,7 @@ def kitchen_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
         [InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes")],
         [InlineKeyboardButton(text="🛒 Список покупок", callback_data="kitchen:shoplist")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
     ])
 
 def recipes_list_keyboard(recipes: List[dict]) -> InlineKeyboardMarkup:

@@ -33,6 +33,8 @@ from handlers import (
     stats,
     natural,
     wellness,
+    sleep_mode,
+    help_now,
     zones,
     routine_items,
     routine_steps,
@@ -112,6 +114,8 @@ async def create_app(test_mode: bool = False) -> AppContext:
     dp.include_router(stats.router)
     dp.include_router(natural.router)
     dp.include_router(wellness.router)
+    dp.include_router(sleep_mode.router)
+    dp.include_router(help_now.router)
     dp.include_router(zones.router)
     dp.include_router(routine_items.router)
     dp.include_router(routine_steps.router)

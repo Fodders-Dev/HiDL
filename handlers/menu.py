@@ -22,14 +22,16 @@ from utils.today import render_today
 router = Router()
 
 @router.callback_query(lambda c: c.data and c.data == "main:menu")
-async def main_menu_callback(callback: types.CallbackQuery) -> None:
+async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
 @router.message(Command("menu"))
 @router.message(lambda m: m.text and "меню" in m.text.lower())
-async def show_menu(message: types.Message) -> None:
+async def show_menu(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer("Главное меню:", reply_markup=main_menu_keyboard())
 
 

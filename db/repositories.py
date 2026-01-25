@@ -133,6 +133,98 @@ async def update_user_sleep(
     await conn.commit()
 
 
+async def update_sleep_mode(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    enabled: bool,
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET sleep_mode_enabled = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_sleep_targets(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    target_sleep: str,
+    target_wake: str,
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE users
+        SET sleep_target_sleep = ?, sleep_target_wake = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (target_sleep, target_wake, now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_sleep_shift_settings(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    shift_step: int,
+    shift_every: int,
+    last_shift_date: str | None = None,
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE users
+        SET sleep_shift_step = ?, sleep_shift_every = ?, sleep_last_shift_date = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (shift_step, shift_every, last_shift_date, now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_sleep_ping(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    kind: str,
+    local_date: str,
+) -> None:
+    now = utc_now_str()
+    if kind == "evening":
+        field = "sleep_last_evening_date"
+    elif kind == "morning":
+        field = "sleep_last_morning_date"
+    else:
+        return
+    await conn.execute(
+        f"UPDATE users SET {field} = ?, updated_at = ? WHERE id = ?",
+        (local_date, now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_sleep_last_shift(
+    conn: aiosqlite.Connection, user_id: int, local_date: str
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET sleep_last_shift_date = ?, updated_at = ? WHERE id = ?",
+        (local_date, now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_daily_brief_sent(
+    conn: aiosqlite.Connection, user_id: int, local_date: str
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET daily_brief_last_date = ?, updated_at = ? WHERE id = ?",
+        (local_date, now, user_id),
+    )
+    await conn.commit()
+
+
 async def update_user_goals(
     conn: aiosqlite.Connection, user_id: int, goals: str
 ) -> None:
