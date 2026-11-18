@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.gender import done_button_label, button_label, g
+from utils.menu_match import match_menu_label
 from utils.time import local_date_str, tzinfo_from_string
 from utils.user import ensure_user
 
@@ -69,7 +70,7 @@ def _cooldown_text(user: dict, now_utc: datetime.datetime) -> str | None:
 
 
 @router.message(Command("cafe"))
-@router.message(lambda m: m.text and "кафе" in m.text.lower())
+@router.message(lambda m: match_menu_label(m.text, {"кафе фокуса", "кафе"}))
 async def cafe_start(message: types.Message, state: FSMContext, db) -> None:
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await state.clear()

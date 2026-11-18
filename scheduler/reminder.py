@@ -634,6 +634,7 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            local_date = local_date_str(now_utc, user["timezone"])
             if user.get("quiet_mode"):
                 continue
             if _sleep_window_active(user, now_utc):

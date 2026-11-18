@@ -3,13 +3,14 @@ import datetime
 import re
 
 from aiogram import Router, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils.menu_match import is_single_clause_reminder
 from utils.rows import row_to_dict
 from utils.time import parse_hhmm, local_date_str, format_time_local
 from utils.tone import tone_short_ack
@@ -309,9 +310,14 @@ async def _update_preview_from_pending(message: types.Message, state: FSMContext
     )
 
 
-@router.message(Command("add_reminder"))
-async def add_reminder_start(message: types.Message, state: FSMContext, db) -> None:
-    user = await _ensure_user(message, db, message.from_user.id, message.from_user.full_name)
+async def _start_add_reminder(
+    message: types.Message,
+    state: FSMContext,
+    db,
+    tg_user_id: int,
+    tg_full_name: str,
+) -> None:
+    user = await _ensure_user(db, tg_user_id, tg_full_name)
     await state.update_data(user_id=user["id"], user_tz=user["timezone"])
     await state.set_state(CustomReminderState.title)
     pause_note = ""
@@ -322,6 +328,17 @@ async def add_reminder_start(message: types.Message, state: FSMContext, db) -> N
             "Сними паузу в настройках или через кнопку «Щадящий режим», если хочешь получить это напоминание."
         )
     await message.answer("О чём напомнить? Коротко, без лишнего." + pause_note, reply_markup=main_menu_keyboard())
+
+
+@router.message(Command("add_reminder"))
+async def add_reminder_start(message: types.Message, state: FSMContext, db) -> None:
+    await _start_add_reminder(
+        message,
+        state,
+        db,
+        message.from_user.id,
+        message.from_user.full_name,
+    )
 
 
 @router.message(CustomReminderState.title)
@@ -682,7 +699,13 @@ async def reminders_from_today(callback: types.CallbackQuery, state: FSMContext,
 @router.callback_query(lambda c: c.data and c.data == "rem:add")
 async def reminders_add_from_today(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     await callback.answer()
-    await add_reminder_start(callback.message, state, db)
+    await _start_add_reminder(
+        callback.message,
+        state,
+        db,
+        callback.from_user.id,
+        callback.from_user.full_name,
+    )
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("customedit:"))
@@ -734,7 +757,7 @@ async def reminder_edit_choice(callback: types.CallbackQuery, state: FSMContext)
                     InlineKeyboardButton(text="Пт", callback_data="rem:wdset:4"),
                     InlineKeyboardButton(text="Сб", callback_data="rem:wdset:5"),
                     InlineKeyboardButton(text="Вс", callback_data="rem:wdset:6"),
-                ]
+                ],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="rem:list")],
             ]
         )
@@ -750,18 +773,18 @@ async def reminder_edit_time(message: types.Message, state: FSMContext, db) -> N
         await message.answer("Не нашла напоминание. Попробуй снова.")
         await state.clear()
         return
+    user = await _ensure_user(message, db, message.from_user.id, message.from_user.full_name)
     abs_time, plus_hours, weekday = parse_when(message.text)
     if abs_time:
         hhmm = abs_time
     elif plus_hours is not None:
         from utils.time import format_time_local
-        user = await repo.get_user_by_telegram_id(db, message.from_user.id)
         tz = user["timezone"] if user else "UTC"
         now_utc = datetime.datetime.utcnow()
         hhmm = format_time_local(now_utc + datetime.timedelta(hours=plus_hours), tz)
     else:
         hhmm = message.text.strip()
-    await repo.update_custom_reminder_time(db, message.from_user.id, reminder_id, hhmm)
+    await repo.update_custom_reminder_time(db, user["id"], reminder_id, hhmm)
     await state.clear()
     await message.answer(ack(f"Время обновлено: {hhmm}"), reply_markup=main_menu_keyboard())
 
@@ -785,7 +808,8 @@ async def reminder_edit_freq(message: types.Message, state: FSMContext, db) -> N
             texts.error("нужно число дней, минимум 1."),
         )
         return
-    await repo.update_custom_reminder_freq(db, message.from_user.id, reminder_id, freq)
+    user = await _ensure_user(message, db, message.from_user.id, message.from_user.full_name)
+    await repo.update_custom_reminder_freq(db, user["id"], reminder_id, freq)
     await state.clear()
     await message.answer(ack(f"Частота обновлена: каждые {freq} д."), reply_markup=main_menu_keyboard())
 
@@ -798,13 +822,17 @@ async def reminder_edit_weekday(callback: types.CallbackQuery, state: FSMContext
         await callback.answer()
         return
     weekday = int(callback.data.split(":")[2])
-    await repo.update_custom_reminder_freq(db, callback.from_user.id, reminder_id, frequency_days=7, target_weekday=weekday)
+    user = await _ensure_user(callback.message, db, callback.from_user.id, callback.from_user.full_name)
+    await repo.update_custom_reminder_freq(db, user["id"], reminder_id, frequency_days=7, target_weekday=weekday)
     await state.clear()
     await callback.message.answer("День недели обновлен.", reply_markup=main_menu_keyboard())
     await callback.answer("Сохранила")
 
 # Свободный ввод для напоминаний (натуральные команды)
-@router.message(lambda m: m.text and "напом" in m.text.lower())
+@router.message(
+    StateFilter(None, CustomReminderState.parsed_confirm),
+    lambda m: m.text and "напом" in m.text.lower() and is_single_clause_reminder(m.text),
+)
 async def reminder_free_parse(message: types.Message, db, state: FSMContext) -> None:
     if message.text and message.text.lower().strip() in {"напоминания", "напоминание", "⏰ напоминания", "напоминания!"}:
         # Пусть короткое слово ведёт в список, а не создаёт новое.

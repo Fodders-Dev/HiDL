@@ -1,8 +1,9 @@
 from aiogram import Router, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils.menu_match import match_menu_label
 from utils.tone import tone_message
 
 router = Router()
@@ -21,7 +22,7 @@ BASE_DONATE_TEXT = (
 
 
 @router.message(Command("donate"))
-@router.message(lambda m: m.text and "поддерж" in m.text.lower())
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"поддержать", "донат", "поддержка проекта"}))
 async def donate(message: types.Message, db) -> None:
     tone = "neutral"
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)

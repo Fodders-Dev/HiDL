@@ -70,13 +70,18 @@ def _maybe_bootstrap_sqlite_db(path: str) -> None:
 
 
 async def connect(database_url: str) -> aiosqlite.Connection:
-    """Open SQLite connection with row factory."""
+    """Open SQLite connection with row factory and WAL/timeout pragmas."""
     path = _sqlite_path(database_url)
     _maybe_bootstrap_sqlite_db(path)
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
     conn = await aiosqlite.connect(path)
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys=ON;")
+    await conn.execute("PRAGMA busy_timeout=5000;")
+    is_memory = path == ":memory:" or path.startswith("file::memory:")
+    if not is_memory:
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 
@@ -419,6 +424,65 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS inbox_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            telegram_message_id INTEGER,
+            source TEXT NOT NULL,
+            telegram_file_id TEXT,
+            telegram_file_unique_id TEXT,
+            duration_sec INTEGER,
+            raw_text TEXT,
+            stt_provider TEXT DEFAULT '',
+            stt_error TEXT DEFAULT '',
+            llm_provider TEXT DEFAULT '',
+            llm_model TEXT DEFAULT '',
+            llm_raw_json TEXT DEFAULT '',
+            llm_error TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'received',
+            local_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(user_id, chat_id, telegram_message_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS journal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            inbox_message_id INTEGER,
+            entry_type TEXT NOT NULL,
+            entry_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'text',
+            user_text TEXT NOT NULL,
+            title TEXT NOT NULL,
+            model_note TEXT DEFAULT '',
+            tags_json TEXT DEFAULT '[]',
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (inbox_message_id) REFERENCES inbox_messages(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS inbox_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            inbox_message_id INTEGER NOT NULL,
+            item_kind TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            target_id INTEGER,
+            title TEXT NOT NULL,
+            source_quote TEXT NOT NULL,
+            payload_json TEXT DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (inbox_message_id) REFERENCES inbox_messages(id) ON DELETE CASCADE
+        );
         """
     )
     await ensure_columns(conn)
@@ -756,6 +820,69 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             await conn.execute("ALTER TABLE budgets ADD COLUMN food_budget REAL DEFAULT 0;")
         except Exception:
             pass
+
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS inbox_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            telegram_message_id INTEGER,
+            source TEXT NOT NULL,
+            telegram_file_id TEXT,
+            telegram_file_unique_id TEXT,
+            duration_sec INTEGER,
+            raw_text TEXT,
+            stt_provider TEXT DEFAULT '',
+            stt_error TEXT DEFAULT '',
+            llm_provider TEXT DEFAULT '',
+            llm_model TEXT DEFAULT '',
+            llm_raw_json TEXT DEFAULT '',
+            llm_error TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'received',
+            local_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(user_id, chat_id, telegram_message_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS journal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            inbox_message_id INTEGER,
+            entry_type TEXT NOT NULL,
+            entry_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'text',
+            user_text TEXT NOT NULL,
+            title TEXT NOT NULL,
+            model_note TEXT DEFAULT '',
+            tags_json TEXT DEFAULT '[]',
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (inbox_message_id) REFERENCES inbox_messages(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS inbox_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            inbox_message_id INTEGER NOT NULL,
+            item_kind TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            target_id INTEGER,
+            title TEXT NOT NULL,
+            source_quote TEXT NOT NULL,
+            payload_json TEXT DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (inbox_message_id) REFERENCES inbox_messages(id) ON DELETE CASCADE
+        );
+        """
+    )
 
 
 async def seed_routines(conn: aiosqlite.Connection) -> None:

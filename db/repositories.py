@@ -1,7 +1,10 @@
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
+
+from utils.rows import row_to_dict, rows_to_dicts
 
 
 def utc_now_str() -> str:
@@ -428,7 +431,7 @@ async def add_day_plan_item(
     title: str,
     category: str = "misc",
     is_important: bool = False,
-) -> None:
+) -> int:
     """Добавить пункт в план дня, создавая план при необходимости."""
     now = utc_now_str()
     plan = await get_day_plan(conn, user_id, plan_date)
@@ -447,7 +450,7 @@ async def add_day_plan_item(
             (user_id, plan_date, now, now),
         )
         plan_id = cursor.lastrowid
-    await conn.execute(
+    cursor = await conn.execute(
         """
         INSERT INTO day_plan_items
         (plan_id, user_id, title, category, is_important, done, synced_to_today, created_at, updated_at)
@@ -462,6 +465,29 @@ async def add_day_plan_item(
             now,
             now,
         ),
+    )
+    await conn.commit()
+    return int(cursor.lastrowid)
+
+
+async def get_day_plan_item(
+    conn: aiosqlite.Connection, user_id: int, item_id: int
+) -> Optional[Dict[str, Any]]:
+    cursor = await conn.execute(
+        "SELECT * FROM day_plan_items WHERE id = ? AND user_id = ?",
+        (item_id, user_id),
+    )
+    row = await cursor.fetchone()
+    return row_to_dict(row) if row else None
+
+
+async def update_day_plan_item_title(
+    conn: aiosqlite.Connection, user_id: int, item_id: int, title: str
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE day_plan_items SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        (title.strip(), now, item_id, user_id),
     )
     await conn.commit()
 
@@ -1362,6 +1388,17 @@ async def update_custom_reminder_time(
     await conn.execute(
         "UPDATE custom_reminders SET reminder_time = ?, updated_at = ? WHERE id = ? AND user_id = ?",
         (reminder_time, now, reminder_id, user_id),
+    )
+    await conn.commit()
+
+
+async def update_custom_reminder_title(
+    conn: aiosqlite.Connection, user_id: int, reminder_id: int, title: str
+) -> None:
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE custom_reminders SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        (title.strip(), now, reminder_id, user_id),
     )
     await conn.commit()
 
@@ -2530,6 +2567,29 @@ async def delete_shopping_item(conn: aiosqlite.Connection, user_id: int, item_id
     )
     await conn.commit()
 
+
+async def update_shopping_item_name(
+    conn: aiosqlite.Connection, user_id: int, item_id: int, name: str, scope: str = "household"
+) -> None:
+    scope = scope if scope in {"household", "personal"} else "household"
+    household_id = None
+    if scope == "household":
+        household_id = await get_or_create_household(conn, user_id)
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE shopping_list
+        SET item_name = ?, updated_at = ?
+        WHERE id = ?
+          AND (
+            ((scope IS NULL OR scope = '' OR scope = 'household') AND (household_id = ? OR (household_id IS NULL AND user_id = ?)))
+            OR (scope = 'personal' AND user_id = ?)
+          )
+        """,
+        (name.strip(), now, item_id, household_id, user_id, user_id),
+    )
+    await conn.commit()
+
 async def complete_shopping_trip(conn: aiosqlite.Connection, user_id: int, scope: str = "household") -> int:
     """Move bought items from shopping list to pantry."""
     scope = scope if scope in {"household", "personal"} else "household"
@@ -2714,3 +2774,425 @@ async def complete_session(conn: aiosqlite.Connection, session_id: int) -> None:
 async def delete_session(conn: aiosqlite.Connection, session_id: int) -> None:
     await conn.execute("DELETE FROM cleaning_sessions WHERE id = ?", (session_id,))
     await conn.commit()
+
+
+# --- Inbox messages, Journal / Diary & Personal Data ---
+
+_INBOX_MESSAGE_FIELDS = {
+    "source",
+    "telegram_file_id",
+    "telegram_file_unique_id",
+    "duration_sec",
+    "raw_text",
+    "stt_provider",
+    "stt_error",
+    "llm_provider",
+    "llm_model",
+    "llm_raw_json",
+    "llm_error",
+    "status",
+    "local_date",
+}
+
+_JOURNAL_ENTRY_FIELDS = {
+    "entry_type",
+    "entry_date",
+    "source",
+    "user_text",
+    "title",
+    "model_note",
+    "tags_json",
+    "is_deleted",
+}
+
+_INBOX_ACTION_FIELDS = {
+    "item_kind",
+    "target_table",
+    "target_id",
+    "title",
+    "source_quote",
+    "payload_json",
+    "status",
+}
+
+
+async def create_inbox_message_if_new(
+    conn: aiosqlite.Connection,
+    *,
+    user_id: int,
+    chat_id: int,
+    telegram_message_id: Optional[int],
+    source: str,
+    local_date: str,
+    raw_text: Optional[str] = None,
+    telegram_file_id: Optional[str] = None,
+    telegram_file_unique_id: Optional[str] = None,
+    duration_sec: Optional[int] = None,
+    status: str = "received",
+) -> Tuple[Dict[str, Any], bool]:
+    """Сохранить входящее сообщение до обращения к STT/LLM, идемпотентно по Telegram message_id."""
+    now = utc_now_str()
+    if telegram_message_id is not None:
+        cursor = await conn.execute(
+            """
+            INSERT OR IGNORE INTO inbox_messages
+            (user_id, chat_id, telegram_message_id, source, telegram_file_id, telegram_file_unique_id,
+             duration_sec, raw_text, status, local_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                chat_id,
+                telegram_message_id,
+                source,
+                telegram_file_id,
+                telegram_file_unique_id,
+                duration_sec,
+                raw_text,
+                status,
+                local_date,
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+        created = cursor.rowcount == 1
+        if created:
+            row = await get_inbox_message(conn, user_id, int(cursor.lastrowid))
+            return row or {}, True
+        existing_cur = await conn.execute(
+            """
+            SELECT * FROM inbox_messages
+            WHERE user_id = ? AND chat_id = ? AND telegram_message_id = ?
+            """,
+            (user_id, chat_id, telegram_message_id),
+        )
+        existing_row = await existing_cur.fetchone()
+        return (row_to_dict(existing_row) if existing_row else {}), False
+
+    cursor = await conn.execute(
+        """
+        INSERT INTO inbox_messages
+        (user_id, chat_id, telegram_message_id, source, telegram_file_id, telegram_file_unique_id,
+         duration_sec, raw_text, status, local_date, created_at, updated_at)
+        VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            chat_id,
+            source,
+            telegram_file_id,
+            telegram_file_unique_id,
+            duration_sec,
+            raw_text,
+            status,
+            local_date,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    row = await get_inbox_message(conn, user_id, int(cursor.lastrowid))
+    return row or {}, True
+
+
+async def get_inbox_message(
+    conn: aiosqlite.Connection, user_id: int, inbox_id: int
+) -> Optional[Dict[str, Any]]:
+    cursor = await conn.execute(
+        "SELECT * FROM inbox_messages WHERE id = ? AND user_id = ?",
+        (inbox_id, user_id),
+    )
+    row = await cursor.fetchone()
+    return row_to_dict(row) if row else None
+
+
+async def update_inbox_message(
+    conn: aiosqlite.Connection, inbox_id: int, **fields: Any
+) -> None:
+    filtered = {k: v for k, v in fields.items() if k in _INBOX_MESSAGE_FIELDS}
+    if not filtered:
+        return
+    filtered["updated_at"] = utc_now_str()
+    cols = ", ".join(f"{k} = ?" for k in filtered)
+    vals = list(filtered.values()) + [inbox_id]
+    await conn.execute(f"UPDATE inbox_messages SET {cols} WHERE id = ?", vals)
+    await conn.commit()
+
+
+async def list_inbox_messages(
+    conn: aiosqlite.Connection, user_id: int, limit: int = 20
+) -> List[Dict[str, Any]]:
+    cursor = await conn.execute(
+        "SELECT * FROM inbox_messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    )
+    return rows_to_dicts(await cursor.fetchall())
+
+
+async def create_journal_entry(
+    conn: aiosqlite.Connection,
+    *,
+    user_id: int,
+    entry_type: str,
+    entry_date: str,
+    source: str,
+    user_text: str,
+    title: str,
+    model_note: str = "",
+    tags: Optional[List[str]] = None,
+    inbox_message_id: Optional[int] = None,
+) -> int:
+    now = utc_now_str()
+    tags_json = json.dumps(tags or [], ensure_ascii=False)
+    cursor = await conn.execute(
+        """
+        INSERT INTO journal_entries
+        (user_id, inbox_message_id, entry_type, entry_date, source, user_text, title, model_note, tags_json, is_deleted, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        """,
+        (
+            user_id,
+            inbox_message_id,
+            entry_type,
+            entry_date,
+            source,
+            user_text.strip(),
+            title.strip(),
+            (model_note or "").strip(),
+            tags_json,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    return int(cursor.lastrowid)
+
+
+async def get_journal_entry(
+    conn: aiosqlite.Connection, user_id: int, entry_id: int
+) -> Optional[Dict[str, Any]]:
+    cursor = await conn.execute(
+        "SELECT * FROM journal_entries WHERE id = ? AND user_id = ? AND is_deleted = 0",
+        (entry_id, user_id),
+    )
+    row = await cursor.fetchone()
+    return row_to_dict(row) if row else None
+
+
+async def list_journal_entries(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    entry_type: Optional[str] = None,
+    limit: int = 15,
+) -> List[Dict[str, Any]]:
+    if entry_type:
+        cursor = await conn.execute(
+            """
+            SELECT * FROM journal_entries
+            WHERE user_id = ? AND is_deleted = 0 AND entry_type = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (user_id, entry_type, limit),
+        )
+    else:
+        cursor = await conn.execute(
+            """
+            SELECT * FROM journal_entries
+            WHERE user_id = ? AND is_deleted = 0
+            ORDER BY id DESC LIMIT ?
+            """,
+            (user_id, limit),
+        )
+    return rows_to_dicts(await cursor.fetchall())
+
+
+async def search_journal_entries(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    query: str,
+    limit: int = 15,
+) -> List[Dict[str, Any]]:
+    needle = (query or "").strip().casefold()
+    if not needle:
+        return await list_journal_entries(conn, user_id, limit=limit)
+    cursor = await conn.execute(
+        "SELECT * FROM journal_entries WHERE user_id = ? AND is_deleted = 0 ORDER BY id DESC",
+        (user_id,),
+    )
+    all_rows = rows_to_dicts(await cursor.fetchall())
+    matches: List[Dict[str, Any]] = []
+    for row in all_rows:
+        haystack = " ".join(
+            [
+                str(row.get("user_text") or ""),
+                str(row.get("title") or ""),
+                str(row.get("model_note") or ""),
+                str(row.get("tags_json") or ""),
+            ]
+        ).casefold()
+        if needle in haystack:
+            matches.append(row)
+            if len(matches) >= limit:
+                break
+    return matches
+
+
+async def update_journal_entry(
+    conn: aiosqlite.Connection, user_id: int, entry_id: int, **fields: Any
+) -> None:
+    filtered = {k: v for k, v in fields.items() if k in _JOURNAL_ENTRY_FIELDS}
+    if not filtered:
+        return
+    filtered["updated_at"] = utc_now_str()
+    cols = ", ".join(f"{k} = ?" for k in filtered)
+    vals = list(filtered.values()) + [entry_id, user_id]
+    await conn.execute(
+        f"UPDATE journal_entries SET {cols} WHERE id = ? AND user_id = ?",
+        vals,
+    )
+    await conn.commit()
+
+
+async def delete_journal_entry(
+    conn: aiosqlite.Connection, user_id: int, entry_id: int, hard: bool = False
+) -> None:
+    if hard:
+        await conn.execute(
+            "DELETE FROM journal_entries WHERE id = ? AND user_id = ?",
+            (entry_id, user_id),
+        )
+    else:
+        await conn.execute(
+            "UPDATE journal_entries SET is_deleted = 1, updated_at = ? WHERE id = ? AND user_id = ?",
+            (utc_now_str(), entry_id, user_id),
+        )
+    await conn.commit()
+
+
+async def create_inbox_action(
+    conn: aiosqlite.Connection,
+    *,
+    user_id: int,
+    inbox_message_id: int,
+    item_kind: str,
+    target_table: str,
+    target_id: Optional[int],
+    title: str,
+    source_quote: str,
+    payload: Optional[Dict[str, Any]] = None,
+    status: str = "active",
+) -> int:
+    now = utc_now_str()
+    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    cursor = await conn.execute(
+        """
+        INSERT INTO inbox_actions
+        (user_id, inbox_message_id, item_kind, target_table, target_id, title, source_quote, payload_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            inbox_message_id,
+            item_kind,
+            target_table,
+            target_id,
+            title.strip(),
+            source_quote.strip(),
+            payload_json,
+            status,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    return int(cursor.lastrowid)
+
+
+async def get_inbox_action(
+    conn: aiosqlite.Connection, user_id: int, action_id: int
+) -> Optional[Dict[str, Any]]:
+    cursor = await conn.execute(
+        "SELECT * FROM inbox_actions WHERE id = ? AND user_id = ?",
+        (action_id, user_id),
+    )
+    row = await cursor.fetchone()
+    return row_to_dict(row) if row else None
+
+
+async def list_inbox_actions(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    inbox_message_id: int,
+    include_undone: bool = False,
+) -> List[Dict[str, Any]]:
+    if include_undone:
+        cursor = await conn.execute(
+            "SELECT * FROM inbox_actions WHERE user_id = ? AND inbox_message_id = ? ORDER BY id ASC",
+            (user_id, inbox_message_id),
+        )
+    else:
+        cursor = await conn.execute(
+            """
+            SELECT * FROM inbox_actions
+            WHERE user_id = ? AND inbox_message_id = ? AND status != 'undone'
+            ORDER BY id ASC
+            """,
+            (user_id, inbox_message_id),
+        )
+    return rows_to_dicts(await cursor.fetchall())
+
+
+async def update_inbox_action(
+    conn: aiosqlite.Connection, user_id: int, action_id: int, **fields: Any
+) -> None:
+    filtered = {k: v for k, v in fields.items() if k in _INBOX_ACTION_FIELDS}
+    if not filtered:
+        return
+    filtered["updated_at"] = utc_now_str()
+    cols = ", ".join(f"{k} = ?" for k in filtered)
+    vals = list(filtered.values()) + [action_id, user_id]
+    await conn.execute(
+        f"UPDATE inbox_actions SET {cols} WHERE id = ? AND user_id = ?",
+        vals,
+    )
+    await conn.commit()
+
+
+async def export_user_personal_data(
+    conn: aiosqlite.Connection, user_id: int
+) -> Dict[str, Any]:
+    """Экспорт личных записей пользователя (без токенов и данных других пользователей)."""
+    inbox_cur = await conn.execute(
+        "SELECT * FROM inbox_messages WHERE user_id = ? ORDER BY id ASC",
+        (user_id,),
+    )
+    journal_cur = await conn.execute(
+        "SELECT * FROM journal_entries WHERE user_id = ? AND is_deleted = 0 ORDER BY id ASC",
+        (user_id,),
+    )
+    actions_cur = await conn.execute(
+        "SELECT * FROM inbox_actions WHERE user_id = ? ORDER BY id ASC",
+        (user_id,),
+    )
+    return {
+        "exported_at": utc_now_str(),
+        "inbox_messages": rows_to_dicts(await inbox_cur.fetchall()),
+        "journal_entries": rows_to_dicts(await journal_cur.fetchall()),
+        "inbox_actions": rows_to_dicts(await actions_cur.fetchall()),
+    }
+
+
+async def delete_user_personal_data(
+    conn: aiosqlite.Connection, user_id: int
+) -> Dict[str, int]:
+    """Удалить все личные дневниковые записи, действия и сырые входящие сообщения пользователя."""
+    c1 = await conn.execute("DELETE FROM inbox_actions WHERE user_id = ?", (user_id,))
+    c2 = await conn.execute("DELETE FROM journal_entries WHERE user_id = ?", (user_id,))
+    c3 = await conn.execute("DELETE FROM inbox_messages WHERE user_id = ?", (user_id,))
+    await conn.commit()
+    return {
+        "inbox_actions": int(c1.rowcount or 0),
+        "journal_entries": int(c2.rowcount or 0),
+        "inbox_messages": int(c3.rowcount or 0),
+    }

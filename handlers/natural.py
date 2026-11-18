@@ -1,13 +1,15 @@
 import datetime
 import re
-import datetime
 
 from aiogram import Router, types
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 
 from db import repositories as repo
+from handlers.inbox import handle_free_text_inbox
 from keyboards.common import main_menu_keyboard
-from utils.time import parse_hhmm, local_date_str, format_time_local
+from utils.menu_match import is_single_clause_reminder, looks_like_expense
+from utils.time import local_date_str
 from utils.user import ensure_user
 from utils.nlp import match_simple_intent
 
@@ -35,14 +37,14 @@ def _extract_time(text: str):
     return f"{hh:02d}:{mm:02d}"
 
 
-@router.message(lambda m: m.text and not m.text.startswith("/"))
+@router.message(StateFilter(None), lambda m: m.text and not m.text.startswith("/"))
 async def natural_handler(message: types.Message, db, state: FSMContext) -> None:
     if await state.get_state():
         return
     text_original = message.text or ""
     text = text_original.lower()
-    # Напоминания обрабатываются в handlers/custom_reminders.py (с подтверждением).
-    if "напом" in text:
+    # Простые односоставные напоминания уже обработаны в handlers/custom_reminders.py.
+    if is_single_clause_reminder(text_original):
         return
     # быстрые намерения: сделал/позже/пропусти
     intent = match_simple_intent(text)
@@ -88,9 +90,14 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         )
         return
 
-    # Кладовка: естественный язык для добавления продуктов
+    # Кладовка: короткий бытовой ввод вида "купила яблоки и бананы"
     pantry_patterns = [r"купил[аи]?", r"взял[аи]?", r"принес(?:ла)?", r"добавь в кладовку", r"закупил[аи]?"]
-    pantry_match = any(re.search(p, text) for p in pantry_patterns)
+    is_single_sentence = (
+        "\n" not in text_original
+        and len([p for p in re.split(r"[.!?;]+", text_original) if p.strip()]) <= 1
+        and not any(k in text for k in ("напом", "устал", "придумал", "иде", "надо", "нужно", "?"))
+    )
+    pantry_match = is_single_sentence and any(re.search(p, text) for p in pantry_patterns)
     if pantry_match:
         # Извлекаем продукты из текста
         cleaned = text
@@ -116,9 +123,10 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
             return
 
     # траты
-    if "потрат" in text or "запиши трату" in text or "стоило" in text:
+    if looks_like_expense(text_original):
         amount = _extract_amount(text)
         if amount is None:
+            await handle_free_text_inbox(message, db)
             return
         
         # Извлекаем категорию: ищем слово после "на" 
@@ -143,10 +151,5 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         await message.answer(f"Записала трату: {amount:.0f} ₽ ({category}).", reply_markup=main_menu_keyboard())
         return
 
-    # если не распознали запрос — мягко подсказать про основные разделы
-    await message.answer(
-        "Я читаю это как обычное сообщение и не очень поняла, что сделать.\n\n"
-        "Можешь спросить про еду, уборку, стирку, деньги или режим дня — или выбрать раздел кнопками снизу:\n"
-        "Сегодня • Еда • Дом • Спорт • Покупки.",
-        reply_markup=main_menu_keyboard(),
-    )
+    # Все остальные свободные сообщения разбираем через единый голосовой/текстовый inbox
+    await handle_free_text_inbox(message, db)

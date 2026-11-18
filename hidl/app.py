@@ -38,6 +38,7 @@ from handlers import (
     zones,
     routine_items,
     routine_steps,
+    inbox,
     talk,
 )
 from middlewares.db import DbSessionMiddleware
@@ -63,7 +64,7 @@ async def create_app(test_mode: bool = False) -> AppContext:
 
     test_mode=True — отдельная БД и фейковый токен для симулятора.
     """
-    settings = get_settings()
+    settings = get_settings(require_bot_token=not test_mode)
     database_url = settings.database_url
     if test_mode:
         # отдельная БД для симуляций, чтобы не трогать боевые данные.
@@ -92,33 +93,45 @@ async def create_app(test_mode: bool = False) -> AppContext:
         log_debug("[setup] DebugLogMiddleware enabled")
 
     # роутеры
-    dp.include_router(start.router)
-    dp.include_router(menu.router)
-    dp.include_router(schedule.router)
-    dp.include_router(knowledge.router)
-    dp.include_router(routines.router)
-    dp.include_router(settings_handler.router)
-    dp.include_router(affirmations.router)
-    dp.include_router(day_plan.router)
-    dp.include_router(custom_reminders.router)
-    dp.include_router(ask_mom.router)
-    dp.include_router(finance.router)
-    dp.include_router(focus_cafe.router)
-    dp.include_router(guides.router)
-    dp.include_router(home_tasks.router)
-    dp.include_router(home_supplies.router)
-    dp.include_router(movement.router)
-    dp.include_router(meds.router)
-    dp.include_router(kitchen.router)
-    dp.include_router(donate.router)
-    dp.include_router(stats.router)
-    dp.include_router(natural.router)
-    dp.include_router(wellness.router)
-    dp.include_router(sleep_mode.router)
-    dp.include_router(help_now.router)
-    dp.include_router(zones.router)
-    dp.include_router(routine_items.router)
-    dp.include_router(routine_steps.router)
-    dp.include_router(talk.router)
+    routers = (
+        start.router,
+        menu.router,
+        schedule.router,
+        knowledge.router,
+        routines.router,
+        settings_handler.router,
+        affirmations.router,
+        day_plan.router,
+        custom_reminders.router,
+        ask_mom.router,
+        finance.router,
+        focus_cafe.router,
+        guides.router,
+        home_tasks.router,
+        home_supplies.router,
+        movement.router,
+        meds.router,
+        kitchen.router,
+        donate.router,
+        stats.router,
+        inbox.router,
+        natural.router,
+        wellness.router,
+        sleep_mode.router,
+        help_now.router,
+        zones.router,
+        routine_items.router,
+        routine_steps.router,
+        talk.router,
+    )
+    try:
+        for router in routers:
+            if test_mode and router.parent_router is not None:
+                router._parent_router = None  # noqa: SLF001
+            dp.include_router(router)
+    except Exception:
+        await conn.close()
+        await bot.session.close()
+        raise
 
     return AppContext(bot=bot, dp=dp, db_conn=conn)

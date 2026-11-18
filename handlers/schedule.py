@@ -10,6 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils.menu_match import match_menu_label
 from utils.time import local_date_str, parse_hhmm
 from utils.user import ensure_user
 from utils.rows import rows_to_dicts
@@ -30,9 +31,19 @@ class Interval:
     kind: str  # sleep | block | event | suggestion
 
 
-def _to_min(hhmm: str) -> int:
-    hh, mm = map(int, hhmm.split(":"))
+def _to_min(hhmm: str | datetime.time) -> int:
+    if isinstance(hhmm, datetime.time):
+        return hhmm.hour * 60 + hhmm.minute
+    hh, mm = map(int, str(hhmm).split(":"))
     return hh * 60 + mm
+
+
+def _hhmm_str(value: str | datetime.time | None, default: str = "") -> str:
+    if isinstance(value, datetime.time):
+        return value.strftime("%H:%M")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
 
 
 def _from_min(m: int) -> str:
@@ -145,8 +156,8 @@ async def _render_schedule_text(db, user: dict, local_date: str) -> tuple[str, l
     blocks = rows_to_dicts(await repo.list_schedule_blocks(db, user["id"]))
     events = rows_to_dicts(await repo.list_schedule_events(db, user["id"], local_date))
 
-    wake = parse_hhmm(user.get("wake_up_time") or "08:00") or "08:00"
-    sleep = parse_hhmm(user.get("sleep_time") or "23:00") or "23:00"
+    wake = _hhmm_str(parse_hhmm(user.get("wake_up_time") or "08:00"), "08:00")
+    sleep = _hhmm_str(parse_hhmm(user.get("sleep_time") or "23:00"), "23:00")
     wake_min = _to_min(wake)
     sleep_min = _to_min(sleep)
 
@@ -227,7 +238,7 @@ async def _render_schedule_text(db, user: dict, local_date: str) -> tuple[str, l
 
 
 @router.message(Command("schedule"))
-@router.message(lambda m: m.text and ("распис" in m.text.lower() or "🗓" in m.text))
+@router.message(lambda m: match_menu_label(m.text, {"расписание"}))
 async def schedule_today(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -315,7 +326,7 @@ async def schedule_add_block(message: types.Message, state: FSMContext, db) -> N
         await message.answer("Время должно быть HH:MM.", reply_markup=main_menu_keyboard())
         return
     weekdays = _parse_weekdays(parts[2] if len(parts) > 2 else "пн-пт") or "0,1,2,3,4"
-    await repo.create_schedule_block(db, user["id"], title, st, en, weekdays)
+    await repo.create_schedule_block(db, user["id"], title, _hhmm_str(st), _hhmm_str(en), weekdays)
     await state.clear()
     await message.answer("✅ Сохранила блок.", reply_markup=main_menu_keyboard())
 
@@ -339,6 +350,6 @@ async def schedule_add_event(message: types.Message, state: FSMContext, db) -> N
     if not st or not en:
         await message.answer("Время должно быть HH:MM.", reply_markup=main_menu_keyboard())
         return
-    await repo.create_schedule_event(db, user["id"], local_date, st, en, title, category="manual", source="manual")
+    await repo.create_schedule_event(db, user["id"], local_date, _hhmm_str(st), _hhmm_str(en), title, category="manual", source="manual")
     await state.clear()
     await message.answer("✅ Добавила событие.", reply_markup=main_menu_keyboard())

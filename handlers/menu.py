@@ -14,6 +14,7 @@ from keyboards.common import (
     movement_menu_keyboard,
     settings_menu_keyboard,
 )
+from utils.menu_match import match_menu_label
 from utils.time import format_time_local, local_date_str
 from utils.tone import tone_message, tone_short_ack
 from utils.user import ensure_user
@@ -29,15 +30,16 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext) -
 
 
 @router.message(Command("menu"))
-@router.message(lambda m: m.text and "меню" in m.text.lower())
+@router.message(lambda m: match_menu_label(m.text, {"меню", "главное меню"}))
 async def show_menu(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Главное меню:", reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("today"))
-@router.message(lambda m: m.text and "сегодня" in m.text.lower())
-async def cmd_today(message: types.Message, db) -> None:
+@router.message(lambda m: match_menu_label(m.text, {"сегодня"}))
+async def cmd_today(message: types.Message, db, state: FSMContext) -> None:
+    await state.clear()
     user_row = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     user = dict(user_row)
     text, kb = await render_today(db, user)
@@ -61,28 +63,31 @@ async def settings_info(message: types.Message, db) -> None:
     )
 
 
-@router.message(lambda m: m.text and "еда" in m.text.lower())
-async def food_menu(message: types.Message) -> None:
+@router.message(lambda m: match_menu_label(m.text, {"еда"}))
+async def food_menu(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer(
         "Еда — это топливо и радость. Я помогу не ломать голову над вопросом «что приготовить» и следить за запасами.",
         reply_markup=food_menu_keyboard(),
     )
 
 
-@router.message(lambda m: m.text and ("покуп" in m.text.lower() or "🛒" in m.text))
-async def shopping_menu(message: types.Message, db) -> None:
+@router.message(lambda m: match_menu_label(m.text, {"покупки", "список покупок"}))
+async def shopping_menu(message: types.Message, db, state: FSMContext) -> None:
     from handlers import kitchen
 
+    await state.clear()
     await kitchen.send_shoplist(message, db)
 
 
 
-@router.message(lambda m: m.text and "дом" in m.text.lower())
-async def home_menu(message: types.Message, db) -> None:
+@router.message(lambda m: match_menu_label(m.text, {"дом"}))
+async def home_menu(message: types.Message, db, state: FSMContext) -> None:
     from utils.user import ensure_user
     from utils.time import local_date_str
     import datetime
 
+    await state.clear()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     # гарантируем наличие базовой регулярки
@@ -93,15 +98,17 @@ async def home_menu(message: types.Message, db) -> None:
     )
 
 
-@router.message(lambda m: m.text and ("спорт" in m.text.lower() or "движ" in m.text.lower()))
-async def move_menu(message: types.Message) -> None:
+@router.message(lambda m: match_menu_label(m.text, {"спорт", "движение"}))
+async def move_menu(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer("Спорт: чуть подвигаться, чтобы стало легче в голове и теле.", reply_markup=movement_menu_keyboard())
 
 
-@router.message(lambda m: m.text and ("поговор" in m.text.lower() or "болта" in m.text.lower()))
-async def talk_menu(message: types.Message) -> None:
+@router.message(lambda m: match_menu_label(m.text, {"поговорить", "поболтать"}))
+async def talk_menu(message: types.Message, state: FSMContext) -> None:
     from handlers import talk
 
+    await state.clear()
     await talk.talk_placeholder(message)
 
 
@@ -115,17 +122,19 @@ async def today_menu(callback: types.CallbackQuery, db) -> None:
     await callback.answer()
 
 
-@router.message(lambda m: m.text and ("⚙" in m.text or "настрой" in m.text.lower()))
+@router.message(lambda m: match_menu_label(m.text, {"настройки"}))
 async def settings_menu(message: types.Message, db, state: FSMContext) -> None:
     from handlers import settings as settings_handler
 
+    await state.clear()
     await settings_handler.settings_entry(message, state=state, db=db)
 
 
-@router.message(lambda m: m.text and "очк" in m.text.lower())
-async def points_menu(message: types.Message, db) -> None:
+@router.message(lambda m: match_menu_label(m.text, {"очки", "мои очки"}))
+async def points_menu(message: types.Message, db, state: FSMContext) -> None:
     from handlers import stats
 
+    await state.clear()
     await stats.stats(message, db)
 
 

@@ -56,8 +56,16 @@ def _sleep_menu_keyboard(enabled: bool, origin: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _render_sleep_menu(message: types.Message, db, origin: str) -> None:
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def _render_sleep_menu(
+    message: types.Message,
+    db,
+    origin: str,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
+    uid = tg_user_id if tg_user_id is not None else message.from_user.id
+    fname = tg_full_name if tg_full_name is not None else message.from_user.full_name
+    user = await ensure_user(db, uid, fname)
     text = _sleep_menu_text(user)
     kb = _sleep_menu_keyboard(bool(user.get("sleep_mode_enabled")), origin)
     await safe_edit(message, text, reply_markup=kb)
@@ -66,7 +74,13 @@ async def _render_sleep_menu(message: types.Message, db, origin: str) -> None:
 @router.message(Command("sleep"))
 async def sleep_menu_command(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
-    await _render_sleep_menu(message, db, origin="main")
+    await _render_sleep_menu(
+        message,
+        db,
+        origin="main",
+        tg_user_id=message.from_user.id,
+        tg_full_name=message.from_user.full_name,
+    )
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("sleep:menu"))
@@ -74,7 +88,13 @@ async def sleep_menu_callback(callback: types.CallbackQuery, state: FSMContext, 
     await state.clear()
     parts = callback.data.split(":")
     origin = parts[2] if len(parts) > 2 else "main"
-    await _render_sleep_menu(callback.message, db, origin=origin)
+    await _render_sleep_menu(
+        callback.message,
+        db,
+        origin=origin,
+        tg_user_id=callback.from_user.id,
+        tg_full_name=callback.from_user.full_name,
+    )
     await callback.answer()
 
 
@@ -110,7 +130,13 @@ async def sleep_toggle_callback(callback: types.CallbackQuery, state: FSMContext
     else:
         await repo.update_sleep_mode(db, user["id"], False)
         await callback.answer("Режим сна выключен.")
-    await _render_sleep_menu(callback.message, db, origin=origin)
+    await _render_sleep_menu(
+        callback.message,
+        db,
+        origin=origin,
+        tg_user_id=callback.from_user.id,
+        tg_full_name=callback.from_user.full_name,
+    )
 
 
 @router.message(SleepModeState.target_sleep)

@@ -1,8 +1,10 @@
 from aiogram import Router, types
+from aiogram.filters import StateFilter
 from aiogram.types import CallbackQuery
 
 from db import repositories as repo
 from keyboards.common import knowledge_keyboard, main_menu_keyboard
+from utils.menu_match import match_menu_label
 
 router = Router()
 
@@ -17,17 +19,17 @@ async def _send_category(message: types.Message, category: str, db) -> None:
     )
 
 
-@router.message(lambda m: m.text and "кухн" in m.text.lower())
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"кухня"}))
 async def kitchen(message: types.Message, db) -> None:
     await _send_category(message, "Кухня", db)
 
 
-@router.message(lambda m: m.text and "стир" in m.text.lower())
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"стирка"}))
 async def laundry(message: types.Message, db) -> None:
     await _send_category(message, "Стирка", db)
 
 
-@router.message(lambda m: m.text and "уборк" in m.text.lower())
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"уборка"}))
 async def cleaning(message: types.Message, db) -> None:
     await _send_category(message, "Уборка", db)
 

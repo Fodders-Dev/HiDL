@@ -1,11 +1,12 @@
 import datetime
 
 from aiogram import Router, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from utils.menu_match import match_menu_label
 from utils.mom_tips import pick_tip, find_tip_by_tag, get_tip
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
@@ -118,7 +119,7 @@ async def start_cook_flow(message: types.Message, state: FSMContext) -> None:
 
 
 @router.message(Command("ask_mom"))
-@router.message(lambda m: m.text and "спроси" in m.text.lower())
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"спросить маму", "спроси маму"}))
 async def ask_mom_entry(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     # попробовать разобрать как естественную команду (NL)

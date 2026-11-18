@@ -72,6 +72,15 @@
 - Сценарий: короткая фокус‑сессия с серединным чек‑ином и финальным итогом.
 - Хранилище: `focus_sessions`, у пользователя — `focus_strikes`, `focus_cooldown_until`.
 
+### Голосовой и текстовый inbox и дневник (`/diary`)
+- Вход: любые голосовые (`F.voice`) и свободные текстовые сообщения без префикса команд (`handlers/natural.py` → `handlers/inbox.py`), а также `/diary` (`/diary <поиск>`).
+- Сервисы:
+  - `services/stt.py`: скачивание голосового из Telegram и транскрибация через настраиваемые провайдеры (`custom`, `groq`, `openai`, `qwen`) с runtime failover.
+  - `llm_client.py`: настраиваемый OpenAI/OpenAI-compatible/DeepSeek/Qwen клиент с ретраями, прокси и failover + извлечение JSON.
+  - `services/inbox_parser.py`: гибридный разбор на элементы (`task`, `reminder`, `shopping`, `diary`, `idea`, `done`), вычисление дат/времени строго по таймзоне пользователя (`resolve_temporal_expression`), guardrails (мечты/мысли/чувства не становятся обязательствами) и детерминированный offline fallback.
+  - `services/inbox_service.py`: идемпотентное сохранение сырого сообщения до вызова STT/LLM (`inbox_messages`), запись результатов в целевые таблицы, короткая сводка, уточнение неоднозначного времени/даты, исправление (смена типа/текста/удаление) и отмена (`undo`).
+- Фильтрация меню: `utils/menu_match.py` гарантирует точное совпадение reply-кнопок меню без перехвата обычного свободного текста.
+
 ### Напоминания
 - Вход: кнопка “Напоминания”, /add_reminder, текст “напомин”.
 - Диалог (`handlers/custom_reminders.py`):
@@ -105,6 +114,7 @@
 - Витамины/таблетки: `meds` и `med_logs`.
 - Кладовка: `pantry_items` (запасы и сроки годности) и `receipt_photos` (заглушка под OCR чеков).
 - Фокус‑сессии: `focus_sessions` (задача, длительность, check‑in/end).
+- Входящие и дневник: `inbox_messages` (сырые голосовые/текстовые с ключом идемпотентности `(user_id, chat_id, telegram_message_id)`), `journal_entries` (`diary`/`idea`/`done`, раздельное хранение `user_text` и `model_note`), `inbox_actions` (связь извлечённых пунктов с целевыми таблицами для правки и отмены).
 
 ## Планировщик
 - APScheduler в `scheduler/reminder.py`, джобы:

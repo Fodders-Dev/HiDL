@@ -2,12 +2,13 @@ import asyncio
 import datetime
 
 from aiogram import Router, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils import texts
+from utils.menu_match import match_menu_label
 from utils.texts import register_text
 from utils.time import local_date_str, parse_hhmm
 from utils.user import ensure_user
@@ -92,7 +93,7 @@ async def focus_edit_input(message: types.Message, db) -> None:
     )
 
 
-@router.message(lambda m: m.text and "щад" in m.text.lower())
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"щадящий", "щадящий режим"}))
 async def gentle_button(message: types.Message, db) -> None:
     # Redirect to gentle handler behavior
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)

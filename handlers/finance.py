@@ -3,12 +3,13 @@ from collections import defaultdict
 
 from aiogram import Router, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from utils.menu_match import looks_like_expense, match_menu_label
 from utils.rows import row_to_dict
 from utils.time import local_date_str
 from utils.tone import tone_message
@@ -245,7 +246,7 @@ async def tone_select(message: types.Message, db) -> None:
             ]
         ),
     )
-@router.message(lambda m: m.text and "деньг" in m.text.lower())
+@router.message(lambda m: match_menu_label(m.text, {"деньги", "финансы"}))
 async def money_menu_entry(message: types.Message, state: FSMContext, db) -> None:
     await _ensure_user(db, message.from_user.id, message.from_user.full_name)
     await state.clear()
@@ -330,7 +331,7 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
 
 
 # Свободный ввод для трат (натуральные команды)
-@router.message(lambda m: m.text and any(ch.isdigit() for ch in m.text))
+@router.message(StateFilter(None), lambda m: looks_like_expense(m.text))
 async def money_free_parse(message: types.Message, db, state: FSMContext) -> None:
     if await state.get_state():
         return

@@ -1,0 +1,28 @@
+[Unit]
+Description=HiDL Personal Telegram Assistant (single polling instance)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=hidl
+Group=hidl
+WorkingDirectory=/opt/hidl/app
+EnvironmentFile=/etc/hidl/hidl.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/hidl/.venv/bin/python /opt/hidl/app/main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Hardening (DB lives outside code root in /var/lib/hidl)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hidl
+
+[Install]
+WantedBy=multi-user.target
