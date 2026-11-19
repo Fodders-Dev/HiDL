@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from llm_client import LLMClient, client as default_llm_client
-from utils.time import format_date_display, tzinfo_from_string
+from utils.time import format_date_display, parse_hhmm, tzinfo_from_string
 
 VALID_KINDS = {
     "task",
@@ -24,9 +24,14 @@ VALID_KINDS = {
     "diary",
     "idea",
     "done",
+    "pantry_add",
+    "pantry_remove",
+    "pulse_log",
+    "rollover_tasks",
+    "shift_bedtime",
 }
 VALID_INTENTS = {"capture", "query", "chat", "support"}
-VALID_QUERY_TYPES = {"none", "today", "shopping", "food", "diary"}
+VALID_QUERY_TYPES = {"none", "today", "shopping", "food", "diary", "karma", "pantry", "advice"}
 
 WEEKDAY_STEMS = {
     "понедель": 0,
@@ -146,12 +151,20 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "shopping": список покупок / что купить.
 - "food": что приготовить / поесть / на ужин, обед, завтрак.
 - "diary": поиск в записях дневника/входящих (в query_term укажи ключевую тему, например "папа").
+- "karma": уровень кармы, долги по сферам, статус режима.
+- "pantry": что сейчас есть в холодильнике/кладовке дома.
+- "advice": запрос совета по текущей ситуации ("что мне сейчас делать", "дай совет").
 
 Допустимые типы элементов (kind):
 - "task": конкретное дело/задача с явным намерением сделать.
 - "reminder": поручение напомнить к дате/времени.
 - "shopping": что нужно купить или что закончилось дома.
 - "shopping_remove": убрать товар из списка покупок ("гречка нашлась, убери из покупок" -> title="Гречка").
+- "pantry_add": купленный или имеющийся дома продукт в холодильник ("купил тофу" -> title="Тофу"). Не используй для будущих покупок ("надо купить") или трат с суммой.
+- "pantry_remove": продукт съели/доели/просят убрать из холодильника ("съел огурцы", "убери молоко из холодильника" -> title="Огурцы").
+- "pulse_log": отметка режима Пульса дня (category: "wake"|"lunch"|"dinner"|"water"|"teeth"|"bedtime", например "я поел" -> category="lunch", "выпил воды" -> category="water", "почистил зубы" -> category="teeth", "ложусь спать/убрал телефон" -> category="bedtime").
+- "rollover_tasks": перенести незавершённые дела/хвосты дня на завтра ("перенеси хвосты на завтра").
+- "shift_bedtime": перенести время отбоя сегодня на час HH:MM (time_hint="HH:MM", например "ложусь в 00:30").
 - "expense": денежная трата ("потратил 450 на кофе" -> amount=450, category="кофе", title="Кофе").
 - "diary": мысли, переживания, усталость, самочувствие, события дня без поручения.
 - "idea": задумки, мечты, "хочу когда-нибудь...", проекты на будущее.
@@ -159,22 +172,23 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 
 Строгие правила:
 1. Приветствия / "спасибо" / "ок" -> intent="chat", items=[], query_type="none", тёплый короткий reply (1-2 предложения по-русски в женском роде).
-2. Вопросы о плане на сегодня / списке покупок / что приготовить / заметках в дневнике -> intent="query", соответствующий query_type (и query_term для diary), items=[] (НЕ создавай пустую запись в дневнике!).
-3. Тревога / бессонница / усталость без явной задачи или напоминания -> intent="support", тёплый поддерживающий reply (1-2 предложения без мед. диагнозов) И один элемент kind="diary", чтобы бережно сохранить мысль.
-4. Чистые мечты и задумки ("хочу когда-нибудь...") -> только kind="idea", НИКОГДА "task" или "reminder".
-5. Сохраняй "source_quote" дословным фрагментом исходного текста. В "model_note" пиши только пометку-гипотезу, не выдумывай факты.
-6. Для "shopping" и "shopping_remove" в "title" пиши чистое название товара (например "Гречка", "Овсяное молоко").
-7. Для "reminder" передай "date_hint" ("завтра", "19.11.2026") и "time_hint" ("12:00", "в 8", "утром") без вычисления дат.
-8. Если дан "Недавний контекст диалога", используй его для коротких продолжений вроде "а ещё?", "другое", "без картошки", "побыстрее", "и овсянку тоже". Если в предыдущем ответе обсуждалась еда/рецепты, а пользователь просит "а ещё?" или уточняет пожелание — возвращай intent="query", query_type="food", query_term="more" (или текст фильтра, например "без картошки"), НЕ "diary"!
-9. Отвечай строго валидным JSON объектом формата:
+2. Вопросы о плане на сегодня / списке покупок / что приготовить / карме / холодильнике / совете / заметках -> intent="query", соответствующий query_type (и query_term для diary), items=[] (НЕ создавай пустую запись в дневнике!).
+3. Тревога / бессонница / усталость без явной задачи или напоминания -> intent="support", практичный и тёплый/деловой reply с учётом «Снимка дня» И один элемент kind="diary".
+4. Если передан «Снимок дня пользователя» (время, карма, отбой, задачи, холодильник, диета), строго соблюдай директиву тона режима кармы и не выдумывай отсутствующие факты.
+5. Чистые мечты и задумки ("хочу когда-нибудь...") -> только kind="idea", НИКОГДА "task" или "reminder".
+6. Сохраняй "source_quote" дословным фрагментом исходного текста. В "model_note" пиши только пометку-гипотезу, не выдумывай факты.
+7. Для "shopping", "shopping_remove", "pantry_add", "pantry_remove" в "title" пиши чистое название товара (например "Гречка", "Овсяное молоко", "Тофу").
+8. Для "reminder" и "shift_bedtime" передай "date_hint" ("завтра", "19.11.2026") и "time_hint" ("12:00", "00:30", "в 8", "утром") без вычисления дат.
+9. Если дан "Недавний контекст диалога", используй его для коротких продолжений вроде "а ещё?", "другое", "без картошки", "побыстрее". Если в предыдущем ответе обсуждалась еда/рецепты, а пользователь просит "а ещё?" или уточняет пожелание — возвращай intent="query", query_type="food", query_term="more" (или текст фильтра, например "без картошки"), НЕ "diary"!
+10. Отвечай строго валидным JSON объектом формата:
 {
   "intent": "capture|query|chat|support",
   "reply": "короткий ответ 1-2 предложения (для chat/support или пустого)",
-  "query_type": "none|today|shopping|food|diary",
+  "query_type": "none|today|shopping|food|diary|karma|pantry|advice",
   "query_term": "",
   "items": [
     {
-      "kind": "task|reminder|shopping|shopping_remove|expense|diary|idea|done",
+      "kind": "task|reminder|shopping|shopping_remove|pantry_add|pantry_remove|pulse_log|rollover_tasks|shift_bedtime|expense|diary|idea|done",
       "title": "...",
       "source_quote": "...",
       "model_note": "",
@@ -612,6 +626,60 @@ def _clean_task_title(raw: str) -> str:
     return _capitalize_first(txt) or _capitalize_first(raw)
 
 
+_ROLLOVER_RE = re.compile(
+    r"(?iu)(?:\bперенес[ит]\w*\b|\bперекинь\b|\bскинь\b|\bотложи\b|\bсдвин[иь]\b).*"
+    r"\b(?:хвост\w*|дела|задач\w*|несделан\w*|незаверш\w*|остатк\w*)\b.*\bна\s+завтра\b"
+)
+
+_SHIFT_BEDTIME_RE = re.compile(
+    r"(?iu)(?:\b(?:сегодня\s+)?(?:ложусь|пойду\s+спать|уйду\s+спать|отбой)\s+(?:в|на|к)\s*(\d{1,2}\s*[:.]\s*\d{2})|"
+    r"\b(?:подвин[иь]|сдвин[иь]|перенес[ит]\w*)\s+отбой\s+(?:на|в|к)\s*(\d{1,2}\s*[:.]\s*\d{2}))"
+)
+
+_PANTRY_REMOVE_RE = re.compile(
+    r"(?iu)(?:^(?:я\s+|мы\s+|уже\s+)?(?:съел[аи]?|доел[аи]?|выпил[аи]?)\s+(?!вод\w*\b)(.+)|"
+    r"(?:убер[иь]|удал[иь]|убрать|удалить|вычеркн[иь])\s+(.+?)\s+из\s+(?:холодильник\w*|кладовк\w*))"
+)
+
+_PANTRY_ADD_RE = re.compile(
+    r"(?iu)(?:^(?:я\s+|мы\s+|уже\s+)?(?:купил[аи]?|взял[аи]?|прин[её]с(?:ла|ли)?|докупил[аи]?)\s+(.+)|"
+    r"^(?:дома\s+есть|положи\s+в\s+холодильник|добавь\s+в\s+холодильник|в\s+холодильнике\s+есть)\s+(.+))"
+)
+
+_PULSE_NEG_RE = re.compile(r"(?iu)\bне\s+(?:поел|пообедал|поужинал|позавтракал|встал|пил|выпил|чистил|убрал|ложусь)")
+
+_PULSE_LOG_RULES = (
+    (re.compile(r"(?iu)\b(?:убрал[аи]?\s+(?:телефон|мобил\w*)|ложусь(?:\s+спать)?|иду\s+спать)\b"), "bedtime", "Отбой"),
+    (re.compile(r"(?iu)\bпочистил[аи]?\s+зуб\w*\b"), "teeth", "Чистка зубов"),
+    (re.compile(r"(?iu)\b(?:выпил[аи]?|попил[аи]?)\s+вод\w*\b"), "water", "Стакан воды"),
+    (re.compile(r"(?iu)\b(?:я\s+|уже\s+)?поужинал[аи]?\b"), "dinner", "Ужин"),
+    (re.compile(r"(?iu)\b(?:(?:я\s+|уже\s+)?(?:пообедал[аи]?|поел[аи]?|позавтракал[аи]?))\b"), "lunch", "Приём пищи"),
+    (re.compile(r"(?iu)^(?:я\s+)?(?:встал[аи]?|проснул(?:ся|ась))\b"), "wake", "Подъём"),
+)
+
+
+def _split_pantry_products(tail: str) -> list[str]:
+    clean = re.sub(r"(?iu)\b(?:в\s+холодильник\w*|из\s+холодильник\w*|из\s+кладовк\w*|дома|сегодня|уже)\b", " ", tail or "")
+    parts = re.split(r",|\s+и\s+", clean)
+    out: list[str] = []
+    for p in parts:
+        cand = _capitalize_first(_nominative_shopping_phrase(p.strip()))
+        if cand and len(cand) >= 2 and cand.lower() not in {"все", "всё", "это"}:
+            out.append(cand)
+    return out
+
+
+def _extract_bedtime_hhmm(raw: str) -> Optional[str]:
+    m = re.search(r"(\d{1,2})\s*[:.]\s*(\d{2})", raw or "")
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh > 23 or mm > 59:
+        return None
+    return f"{hh:02d}:{mm:02d}"
+
+
 def _clean_idea_title(raw: str) -> str:
     txt = (raw or "").strip()
     txt = re.sub(r"(?iu)^(?:а\s+)?(?:ещё\s+)?(?:придумал[аи]?\s+)", "", txt).strip()
@@ -778,6 +846,26 @@ def _apply_guardrails(
             item.title = _clean_reminder_title(quote, schedule.resolved_time)
         else:
             item.title = _clean_reminder_title(item.title, schedule.resolved_time)
+    elif kind in {"pantry_add", "pantry_remove"}:
+        item.title = _capitalize_first(_nominative_shopping_phrase(item.title or quote))
+    elif kind == "pulse_log":
+        slot = (item.category or "").strip().lower()
+        if slot not in {"wake", "lunch", "dinner", "water", "teeth", "bedtime"}:
+            slot = "lunch"
+            for pat, slot_key, _ in _PULSE_LOG_RULES:
+                if pat.search(quote):
+                    slot = slot_key
+                    break
+        item.category = slot
+        item.title = _capitalize_first(item.title or quote)
+    elif kind == "shift_bedtime":
+        hhmm = _extract_bedtime_hhmm(time_hint) or _extract_bedtime_hhmm(quote)
+        item.schedule = ResolvedSchedule(
+            resolved_date=None,
+            resolved_time=hhmm,
+            is_ambiguous=(hhmm is None),
+        )
+        item.title = f"Сдвинуть отбой на {hhmm}" if hhmm else _capitalize_first(item.title or quote)
     else:
         item.title = _capitalize_first(item.title or quote)
 
@@ -810,6 +898,59 @@ def parse_inbox_fallback(
 
     items: list[ParsedInboxItem] = []
     for clause in clauses:
+        if _ROLLOVER_RE.search(clause):
+            items.append(
+                _apply_guardrails(
+                    ParsedInboxItem(
+                        kind="rollover_tasks",
+                        title="Перенести незавершённые дела на завтра",
+                        source_quote=clause,
+                    ),
+                    now_utc=now_utc,
+                    tz_str=tz_str,
+                )
+            )
+            continue
+        m_shift = _SHIFT_BEDTIME_RE.search(clause)
+        if m_shift:
+            t_raw = next((g for g in m_shift.groups() if g), "")
+            hhmm = _extract_bedtime_hhmm(t_raw)
+            items.append(
+                _apply_guardrails(
+                    ParsedInboxItem(
+                        kind="shift_bedtime",
+                        title=f"Сдвинуть отбой на {hhmm}" if hhmm else clause,
+                        source_quote=clause,
+                    ),
+                    now_utc=now_utc,
+                    tz_str=tz_str,
+                    time_hint=hhmm or "",
+                )
+            )
+            continue
+
+        if not _PULSE_NEG_RE.search(clause):
+            pulse_hit = None
+            for pat, slot_key, slot_label in _PULSE_LOG_RULES:
+                if pat.search(clause):
+                    pulse_hit = (slot_key, slot_label)
+                    break
+            if pulse_hit is not None:
+                slot_key, slot_label = pulse_hit
+                items.append(
+                    _apply_guardrails(
+                        ParsedInboxItem(
+                            kind="pulse_log",
+                            title=slot_label,
+                            source_quote=clause,
+                            category=slot_key,
+                        ),
+                        now_utc=now_utc,
+                        tz_str=tz_str,
+                    )
+                )
+                continue
+
         if _REMINDER_TRIGGER_RE.search(clause):
             schedule = resolve_temporal_expression(
                 date_hint="",
@@ -860,6 +1001,54 @@ def parse_inbox_fallback(
                 source_quote=clause,
                 quantity=qty,
                 unit=unit,
+            )
+        elif _PANTRY_REMOVE_RE.search(clause):
+            m_pr = _PANTRY_REMOVE_RE.search(clause)
+            tail_pr = next((g for g in m_pr.groups() if g), "") if m_pr else ""
+            products = _split_pantry_products(tail_pr)
+            if products:
+                for prod in products:
+                    items.append(
+                        _apply_guardrails(
+                            ParsedInboxItem(
+                                kind="pantry_remove",
+                                title=prod,
+                                source_quote=clause,
+                            ),
+                            now_utc=now_utc,
+                            tz_str=tz_str,
+                        )
+                    )
+                continue
+            item = ParsedInboxItem(
+                kind="diary",
+                title=_capitalize_first(clause),
+                source_quote=clause,
+            )
+        elif _PANTRY_ADD_RE.search(clause):
+            m_pa = _PANTRY_ADD_RE.search(clause)
+            tail_pa = next((g for g in m_pa.groups() if g), "") if m_pa else ""
+            products = _split_pantry_products(tail_pa)
+            if products:
+                for prod in products:
+                    items.append(
+                        _apply_guardrails(
+                            ParsedInboxItem(
+                                kind="pantry_add",
+                                title=prod,
+                                source_quote=clause,
+                                quantity=1.0,
+                                unit="шт",
+                            ),
+                            now_utc=now_utc,
+                            tz_str=tz_str,
+                        )
+                    )
+                continue
+            item = ParsedInboxItem(
+                kind="diary",
+                title=_capitalize_first(clause),
+                source_quote=clause,
             )
         elif _DONE_TRIGGER_RE.search(clause) and not _DIARY_FEELING_RE.search(clause):
             item = ParsedInboxItem(
@@ -956,9 +1145,26 @@ _QUERY_DIARY_RE = re.compile(
     r"что\s+было\s+(?:в\s+дневнике\s+)?(?:про|о|об)\s+(.+))"
 )
 
+_QUERY_KARMA_RE = re.compile(
+    r"(?iu)^(?:а\s+)?(?:покажи\s+|скажи\s+|подскажи\s+)?"
+    r"(?:какая\s+(?:у\s+меня\s+)?карма|моя\s+карма|карма|мой\s+режим\s*(?:и\s+карма)?|"
+    r"статус\s+карм\w*|сколько\s+(?:у\s+меня\s+)?карм\w*)\b"
+)
+
+_QUERY_PANTRY_RE = re.compile(
+    r"(?iu)^(?:а\s+)?(?:покажи\s+|скажи\s+|подскажи\s+)?"
+    r"(?:что\s+(?:у\s+нас\s+|у\s+меня\s+)?в\s+(?:холодильник\w*|кладовк\w*)|"
+    r"(?:покажи\s+)?(?:мой\s+)?холодильник|что\s+(?:у\s+меня\s+)?есть\s+дома(?:\s+из\s+еды)?)\b"
+)
+
+_QUERY_ADVICE_RE = re.compile(
+    r"(?iu)^(?:а\s+)?(?:дай\s+совет\w*|посоветуй(?:\s+что-?нибудь|\s+что\s+делать)?|"
+    r"что\s+мне\s+(?:сейчас\s+)?делать|не\s+знаю,?\s+(?:за\s+что\s+взяться|что\s+делать))\b"
+)
+
 _MORE_FOLLOWUP_RE = re.compile(
-    r"(?iu)^(?:а\s+ещ[её]|ещ[её](?:\s+вариант\w*)?|что\s+ещ[её]|"
-    r"други[ех]\s+вариант\w*|другое|дальше|а\s+что\s+ещ[её]|"
+    r"(?iu)^(?:а\s+ещ[её]|ещ[её](?:\s+вариант\w*|\s+совет\w*)?|что\s+ещ[её]|"
+    r"други[ех]\s+вариант\w*|другое|другой\s+совет|дальше|а\s+что\s+ещ[её]|"
     r"ещ[её]\s+что-?нибудь|ещ[её]\s+блюд\w*|покажи\s+ещ[её])$"
 )
 
@@ -974,7 +1180,7 @@ def _latest_assistant_query_type(recent_context: Optional[list[dict[str, Any]]])
         if turn.get("role") == "assistant":
             meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
             qt = str(meta.get("query_type") or "").strip().lower()
-            if qt in {"food", "shopping", "today", "diary"}:
+            if qt in {"food", "shopping", "today", "diary", "karma", "pantry", "advice"}:
                 return qt
             return None
     return None
@@ -1048,6 +1254,12 @@ def _try_deterministic_intent(
 
     if _QUERY_TODAY_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="today")
+    if _QUERY_KARMA_RE.search(raw):
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="karma")
+    if _QUERY_PANTRY_RE.search(raw):
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="pantry")
+    if _QUERY_ADVICE_RE.search(raw):
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="advice", query_term=raw)
     if _QUERY_SHOPPING_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="shopping")
     if _QUERY_FOOD_RE.search(raw):
@@ -1107,6 +1319,17 @@ _KIND_ALIASES = {
     "убрать из покупок": "shopping_remove",
     "удалить из покупок": "shopping_remove",
     "shopping_del": "shopping_remove",
+    "в холодильник": "pantry_add",
+    "холодильник": "pantry_add",
+    "кладовка": "pantry_add",
+    "убрать из холодильника": "pantry_remove",
+    "съел": "pantry_remove",
+    "пульс": "pulse_log",
+    "режим": "pulse_log",
+    "перенос хвостов": "rollover_tasks",
+    "перенести хвосты": "rollover_tasks",
+    "сдвиг отбоя": "shift_bedtime",
+    "перенести отбой": "shift_bedtime",
     "трата": "expense",
     "расход": "expense",
     "дневник": "diary",
@@ -1163,6 +1386,16 @@ _QUERY_TYPE_ALIASES = {
     "дневник": "diary",
     "записи": "diary",
     "заметки": "diary",
+    "karma": "karma",
+    "карма": "karma",
+    "режим": "karma",
+    "pantry": "pantry",
+    "холодильник": "pantry",
+    "кладовка": "pantry",
+    "продукты": "pantry",
+    "advice": "advice",
+    "совет": "advice",
+    "что делать": "advice",
 }
 
 
@@ -1253,6 +1486,7 @@ async def analyze_inbox_text(
     tz_str: str,
     llm_client_instance: Optional[LLMClient] = None,
     recent_context: Optional[list[dict[str, Any]]] = None,
+    user_context_block: str = "",
 ) -> InboxParseResult:
     """Разобрать сообщение через настроенную LLM с отказоустойчивым fallback."""
     clean_text = (raw_text or "").strip()
@@ -1287,12 +1521,13 @@ async def analyze_inbox_text(
     if client.is_configured():
         local_now = _to_local_now(now_utc, tz_str)
         ctx_block = _format_recent_context(recent_context)
-        ctx_part = f"{ctx_block}\n\n" if ctx_block else ""
-        user_prompt = (
-            f"Локальное время пользователя: {local_now.strftime('%d.%m.%Y %H:%M')} ({tz_str}).\n"
-            f"{ctx_part}"
-            f"Сообщение:\n{clean_text}"
-        )
+        parts = [f"Локальное время пользователя: {local_now.strftime('%d.%m.%Y %H:%M')} ({tz_str})."]
+        if user_context_block and user_context_block.strip():
+            parts.append(user_context_block.strip())
+        if ctx_block:
+            parts.append(ctx_block)
+        parts.append(f"Сообщение:\n{clean_text}")
+        user_prompt = "\n\n".join(parts)
         res = await client.complete_json(_INBOX_SYSTEM_PROMPT, user_prompt, temperature=0.1)
         if res.ok and isinstance(res.data, dict):
             intent = _normalize_intent(res.data.get("intent"))

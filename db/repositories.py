@@ -3853,3 +3853,173 @@ async def rollover_unfinished_day_plan_items(
     await conn.commit()
     return inserted
 
+
+async def get_or_create_profile_memory(
+    conn: aiosqlite.Connection, user_id: int
+) -> Dict[str, Any]:
+    """Вернуть память/портрет привычек пользователя, создав строку при необходимости."""
+    cur = await conn.execute(
+        "SELECT * FROM user_profile_memory WHERE user_id = ?",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    if row:
+        return dict(row)
+    now = utc_now_str()
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO user_profile_memory
+        (user_id, portrait_text, patterns_json, last_refreshed_at, events_seen_count, updated_at)
+        VALUES (?, '', '[]', NULL, 0, ?)
+        """,
+        (user_id, now),
+    )
+    await conn.commit()
+    cur = await conn.execute(
+        "SELECT * FROM user_profile_memory WHERE user_id = ?",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else {
+        "user_id": user_id,
+        "portrait_text": "",
+        "patterns_json": "[]",
+        "last_refreshed_at": None,
+        "events_seen_count": 0,
+    }
+
+
+async def update_profile_memory(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    portrait_text: str,
+    patterns_json: str,
+    last_refreshed_at: str,
+    events_seen_count: int,
+) -> None:
+    """Обновить портрет привычек пользователя."""
+    await get_or_create_profile_memory(conn, user_id)
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE user_profile_memory
+        SET portrait_text = ?, patterns_json = ?, last_refreshed_at = ?,
+            events_seen_count = ?, updated_at = ?
+        WHERE user_id = ?
+        """,
+        (
+            portrait_text,
+            patterns_json,
+            last_refreshed_at,
+            int(events_seen_count),
+            now,
+            user_id,
+        ),
+    )
+    await conn.commit()
+
+
+async def count_karma_events(conn: aiosqlite.Connection, user_id: int) -> int:
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS cnt FROM karma_events WHERE user_id = ?",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    return int(row["cnt"] or 0) if row else 0
+
+
+async def list_karma_events_since(
+    conn: aiosqlite.Connection, user_id: int, since_date: str
+) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        """
+        SELECT * FROM karma_events
+        WHERE user_id = ? AND local_date >= ?
+        ORDER BY id DESC
+        """,
+        (user_id, since_date),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def list_pulse_checkins_since(
+    conn: aiosqlite.Connection, user_id: int, since_date: str
+) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        """
+        SELECT * FROM pulse_checkins
+        WHERE user_id = ? AND local_date >= ?
+        ORDER BY local_date DESC, id DESC
+        """,
+        (user_id, since_date),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def find_and_delete_pantry_item_by_name(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    query: str,
+) -> Optional[Dict[str, Any]]:
+    """Найти активный продукт в холодильнике по названию/основе, мягко удалить и вернуть данные."""
+    needle = (query or "").strip().casefold().replace("ё", "е")
+    if not needle:
+        return None
+    rows = [row_to_dict(r) for r in await list_pantry_items(conn, user_id)]
+    if not rows:
+        return None
+
+    for row in rows:
+        name_norm = str(row.get("name") or "").strip().casefold().replace("ё", "е")
+        if name_norm == needle:
+            await delete_pantry_item(conn, user_id, int(row["id"]))
+            return row
+
+    needle_tokens = re.findall(r"[a-zа-я0-9]+", needle)
+    for row in rows:
+        name_norm = str(row.get("name") or "").strip().casefold().replace("ё", "е")
+        if _haystack_matches_query(name_norm, needle):
+            await delete_pantry_item(conn, user_id, int(row["id"]))
+            return row
+        if needle_tokens:
+            name_stems = {_ru_stem(w) for w in re.findall(r"[a-zа-я0-9]+", name_norm)}
+            if all(_ru_stem(tok) in name_stems for tok in needle_tokens):
+                await delete_pantry_item(conn, user_id, int(row["id"]))
+                return row
+    return None
+
+
+async def restore_pantry_item(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    item_data: Dict[str, Any],
+) -> int:
+    """Восстановить ранее удалённый продукт в холодильник (для Undo)."""
+    now = utc_now_str()
+    household_id = await get_or_create_household(conn, user_id)
+    item_id = item_data.get("id")
+    if item_id:
+        cur = await conn.execute(
+            "SELECT id FROM pantry_items WHERE id = ? AND household_id = ?",
+            (int(item_id), household_id),
+        )
+        if await cur.fetchone():
+            await conn.execute(
+                "UPDATE pantry_items SET is_active = 1, updated_at = ? WHERE id = ? AND household_id = ?",
+                (now, int(item_id), household_id),
+            )
+            await conn.commit()
+            return int(item_id)
+    return await create_pantry_item(
+        conn,
+        user_id,
+        str(item_data.get("name") or "Продукт"),
+        float(item_data.get("amount") or 1.0),
+        str(item_data.get("unit") or "шт"),
+        item_data.get("expires_at"),
+        str(item_data.get("category") or "продукты"),
+        item_data.get("low_threshold"),
+    )
+
+

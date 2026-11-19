@@ -585,6 +585,16 @@ async def init_db(conn: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_pulse_checkins_due
             ON pulse_checkins(status, next_ping_at_utc);
+
+        CREATE TABLE IF NOT EXISTS user_profile_memory (
+            user_id INTEGER PRIMARY KEY,
+            portrait_text TEXT NOT NULL DEFAULT '',
+            patterns_json TEXT NOT NULL DEFAULT '[]',
+            last_refreshed_at TEXT,
+            events_seen_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
     await ensure_columns(conn)
@@ -1089,6 +1099,16 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_pulse_checkins_due
             ON pulse_checkins(status, next_ping_at_utc);
+
+        CREATE TABLE IF NOT EXISTS user_profile_memory (
+            user_id INTEGER PRIMARY KEY,
+            portrait_text TEXT NOT NULL DEFAULT '',
+            patterns_json TEXT NOT NULL DEFAULT '[]',
+            last_refreshed_at TEXT,
+            events_seen_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
 

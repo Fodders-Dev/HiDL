@@ -110,13 +110,17 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         if items:
             user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
             added = []
+            synced_removed = 0
             for item_name in items:
-                # Простой вариант: добавляем продукт без количества и срока
-                await repo.create_pantry_item(db, user["id"], item_name.capitalize(), amount=1, unit="шт", expires_at=None, category="продукты")
+                clean_name = item_name.capitalize()
+                await repo.create_pantry_item(db, user["id"], clean_name, amount=1, unit="шт", expires_at=None, category="продукты")
+                if await repo.find_and_delete_shopping_item_by_name(db, user["id"], clean_name, scope="household"):
+                    synced_removed += 1
                 added.append(item_name)
             items_str = ", ".join(added)
+            extra = f"\nИ вычеркнула из покупок: {synced_removed} поз." if synced_removed else ""
             await message.answer(
-                f"Добавила в кладовку: {items_str}. \n"
+                f"Добавила в кладовку: {items_str}.{extra}\n"
                 f"Посмотреть всё можно в 🍽 Еда → 📦 Кладовка.",
                 reply_markup=main_menu_keyboard(),
             )

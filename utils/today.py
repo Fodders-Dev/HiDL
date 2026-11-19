@@ -306,7 +306,12 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     kb_buttons = []
     if first_pending_routine_row:
         kb_buttons.append(first_pending_routine_row)
-    kb_buttons.append([types.InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")])
+    kb_buttons.append(
+        [
+            types.InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub"),
+            types.InlineKeyboardButton(text="💡 Совет сейчас", callback_data="advice:more"),
+        ]
+    )
     has_any_reminders = bool(custom)
     kb_buttons.append([types.InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")])
     if has_any_reminders:

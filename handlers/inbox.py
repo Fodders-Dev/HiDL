@@ -15,7 +15,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import inbox_service, pulse_service
+from services import advice_service, inbox_service, pulse_service
 from services.inbox_parser import resolve_temporal_expression
 from utils.menu_match import match_menu_label
 from utils.sender import safe_edit
@@ -350,6 +350,73 @@ async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         await callback.answer()
         return
 
+    if action == "confirm" and len(parts) > 2:
+        aid = int(parts[2])
+        ok, msg = await inbox_service.confirm_inbox_action(db, user, aid)
+        await safe_edit(callback.message, msg, reply_markup=None)
+        await callback.answer("Выполнено!" if ok else "Не найдено")
+        return
+
+    if action == "reject" and len(parts) > 2:
+        aid = int(parts[2])
+        ok = await inbox_service.reject_inbox_action(db, user, aid)
+        await safe_edit(
+            callback.message,
+            "❌ Отменено — ничего менять не стала." if ok else "Действие уже закрыто.",
+            reply_markup=None,
+        )
+        await callback.answer("Отменено.")
+        return
+
+    await callback.answer()
+
+
+_SHOWN_ADVICE_BY_USER: dict[int, set[str]] = {}
+
+
+def _advice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💡 Ещё совет", callback_data="advice:more"),
+                InlineKeyboardButton(text="📅 Сегодня", callback_data="today:menu"),
+            ],
+            [InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")],
+        ]
+    )
+
+
+@router.message(Command("advice"))
+async def cmd_advice(message: types.Message, state: FSMContext, db) -> None:
+    await state.clear()
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    uid = int(user["id"])
+    excluded = _SHOWN_ADVICE_BY_USER.setdefault(uid, set())
+    reply_html, meta = await advice_service.build_situational_advice_reply(
+        db, user, "", exclude_ids=excluded
+    )
+    card_id = str((meta.get("card") or {}).get("id") or "")
+    if card_id:
+        excluded.add(card_id)
+    if len(excluded) >= 12:
+        excluded.clear()
+    await message.answer(reply_html, reply_markup=_advice_keyboard())
+
+
+@router.callback_query(lambda c: c.data and c.data == "advice:more")
+async def cb_advice_more(callback: types.CallbackQuery, db) -> None:
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    uid = int(user["id"])
+    excluded = _SHOWN_ADVICE_BY_USER.setdefault(uid, set())
+    reply_html, meta = await advice_service.build_situational_advice_reply(
+        db, user, "", exclude_ids=excluded
+    )
+    card_id = str((meta.get("card") or {}).get("id") or "")
+    if card_id:
+        excluded.add(card_id)
+    if len(excluded) >= 12:
+        excluded.clear()
+    await safe_edit(callback.message, reply_html, reply_markup=_advice_keyboard())
     await callback.answer()
 
 

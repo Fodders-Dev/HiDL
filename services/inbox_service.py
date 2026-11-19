@@ -14,7 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
-from services import stt
+from services import advice_service, context_builder, karma_service, pulse_service, stt
 from services.inbox_parser import (
     InboxParseResult,
     ParsedInboxItem,
@@ -30,6 +30,11 @@ KIND_LABELS = {
     "reminder": ("🔔", "Напоминание"),
     "shopping": ("🛒", "Покупки"),
     "shopping_remove": ("🗑", "Убрано из покупок"),
+    "pantry_add": ("🧊", "В холодильник"),
+    "pantry_remove": ("🍽", "Убрано из холодильника"),
+    "pulse_log": ("💓", "Режим и карма"),
+    "rollover_tasks": ("➡️", "Перенос хвостов"),
+    "shift_bedtime": ("🌙", "Сдвиг отбоя"),
     "expense": ("💸", "Трата"),
     "diary": ("📓", "Дневник"),
     "idea": ("💡", "Идея"),
@@ -102,6 +107,24 @@ def _format_action_line(action: dict[str, Any]) -> str:
         if action.get("status") == "skipped" or payload.get("not_found"):
             return f"ℹ️ Не нашла «{title}» в покупках"
         return f"🗑 Убрала из покупок: {title}"
+    if kind == "pantry_add":
+        qty = payload.get("quantity", 1)
+        unit = payload.get("unit", "шт")
+        synced = " (и вычеркнула из покупок)" if payload.get("synced_shopping_item") else ""
+        return f"🧊 В холодильник: {title} ({_esc(format_quantity(qty, unit))}){synced}"
+    if kind == "pantry_remove":
+        if action.get("status") == "skipped" or payload.get("not_found"):
+            return f"ℹ️ Не нашла «{title}» в холодильнике"
+        return f"🍽 Убрала из холодильника: {title}"
+    if kind == "pulse_log":
+        delta = int(payload.get("delta") or 0)
+        score_after = payload.get("score_after")
+        delta_txt = f" (+{delta} кармы → {score_after}/100)" if delta > 0 and score_after is not None else ""
+        return f"💓 Режим: {title}{delta_txt}"
+    if kind in {"rollover_tasks", "shift_bedtime"}:
+        if action.get("status") == "awaiting_confirm":
+            return f"⏳ Подтвердить: {title}"
+        return f"{icon} Выполнено: {title}"
     return f"{icon} {label}: {title}"
 
 
@@ -151,6 +174,18 @@ def build_inbox_keyboard(
             ]
         )
 
+    awaiting = [a for a in actions if a.get("status") == "awaiting_confirm"]
+    for act in awaiting:
+        aid = int(act["id"])
+        payload = _load_payload(act)
+        short = str(payload.get("short_label") or act.get("title") or "действие")[:24]
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"✅ Подтвердить: {short}", callback_data=f"inbox:confirm:{aid}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"inbox:reject:{aid}"),
+            ]
+        )
+
     if intent == "support":
         rows.append(
             [
@@ -196,6 +231,7 @@ def render_inbox_summary(
 
     active = [a for a in actions if a.get("status") == "active"]
     clarifying = [a for a in actions if a.get("status") == "clarifying"]
+    awaiting = [a for a in actions if a.get("status") == "awaiting_confirm"]
     skipped = [a for a in actions if a.get("status") == "skipped"]
 
     if intent == "support":
@@ -218,7 +254,7 @@ def render_inbox_summary(
                 lines.append(_format_action_line(act))
         for act in skipped:
             lines.append(_format_action_line(act))
-    elif not clarifying:
+    elif not clarifying and not awaiting:
         lines.append("Запись сохранена, активных пунктов сейчас нет.")
 
     if llm_error:
@@ -229,6 +265,10 @@ def render_inbox_summary(
         title = _esc(first_payload.get("title") or clarifying[0].get("title") or "напоминание")
         question = _esc(first_payload.get("question") or "Уточни дату и время.")
         lines.append(f"❓ Напоминание «{title}»: {question}")
+
+    if awaiting:
+        for act in awaiting:
+            lines.append(_format_action_line(act))
 
     kb = build_inbox_keyboard(
         inbox_row["id"],
@@ -245,11 +285,13 @@ async def _persist_parsed_items(
     inbox_row: dict[str, Any],
     parsed: InboxParseResult,
     local_date: str,
+    now_utc: Optional[datetime.datetime] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     actions: list[dict[str, Any]] = []
     clarifications: list[dict[str, Any]] = []
     source = inbox_row.get("source") or "text"
     inbox_id = int(inbox_row["id"])
+    now = now_utc or datetime.datetime.utcnow()
 
     for item in parsed.items:
         kind = item.kind
@@ -367,6 +409,183 @@ async def _persist_parsed_items(
                     title=item.title,
                     source_quote=item.source_quote,
                     payload={"not_found": True, "model_note": item.model_note},
+                    status="skipped",
+                )
+        elif kind == "pantry_add":
+            qty = float(item.quantity or 1.0)
+            unit = str(item.unit or "шт")
+            pantry_id = await repo.create_pantry_item(
+                db,
+                user["id"],
+                item.title,
+                amount=qty,
+                unit=unit,
+                expires_at=None,
+                category="продукты",
+            )
+            synced_shop = await repo.find_and_delete_shopping_item_by_name(
+                db, user["id"], item.title, scope="household"
+            )
+            action_id = await repo.create_inbox_action(
+                db,
+                user_id=user["id"],
+                inbox_message_id=inbox_id,
+                item_kind="pantry_add",
+                target_table="pantry_items",
+                target_id=pantry_id,
+                title=item.title,
+                source_quote=item.source_quote,
+                payload={
+                    "quantity": qty,
+                    "unit": unit,
+                    "synced_shopping_item": dict(synced_shop) if synced_shop else None,
+                    "model_note": item.model_note,
+                },
+                status="active",
+            )
+        elif kind == "pantry_remove":
+            removed_p = await repo.find_and_delete_pantry_item_by_name(
+                db, user["id"], item.title or item.source_quote
+            )
+            if removed_p:
+                removed_name = str(removed_p.get("name") or item.title)
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="pantry_remove",
+                    target_table="pantry_removed",
+                    target_id=int(removed_p["id"]) if removed_p.get("id") else None,
+                    title=removed_name,
+                    source_quote=item.source_quote,
+                    payload={"removed_item": dict(removed_p), "model_note": item.model_note},
+                    status="active",
+                )
+            else:
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="pantry_remove",
+                    target_table="pantry_removed",
+                    target_id=None,
+                    title=item.title,
+                    source_quote=item.source_quote,
+                    payload={"not_found": True, "model_note": item.model_note},
+                    status="skipped",
+                )
+        elif kind == "pulse_log":
+            slot = (item.category or "lunch").strip().lower()
+            if slot == "bedtime":
+                p_res = await pulse_service.confirm_bedtime(db, user, now_utc=now)
+                cid = int((p_res.get("checkin") or {}).get("id") or 0) or None
+                karma = p_res.get("karma") or {}
+            elif slot in {"water", "teeth"}:
+                slot_host = "winddown" if slot == "teeth" and now.hour >= 15 else "wake"
+                dom_host = "tasks" if slot_host == "winddown" else "sleep"
+                chk = await repo.get_pulse_checkin(db, user["id"], local_date, slot_host)
+                if chk is None:
+                    chk = await repo.upsert_pulse_checkin(
+                        db,
+                        user["id"],
+                        local_date,
+                        slot_host,
+                        dom_host,
+                        now.isoformat(),
+                        now.isoformat(),
+                    )
+                cid = int(chk["id"])
+                p_res = await pulse_service.record_hygiene_tick(db, user, cid, slot, now_utc=now)
+                karma = {"delta": p_res.get("delta", 0), "score_after": p_res.get("score_after")}
+            else:
+                slot_key = slot if slot in {"wake", "lunch", "dinner"} else "lunch"
+                dom = "sleep" if slot_key == "wake" else "food"
+                chk = await repo.get_pulse_checkin(db, user["id"], local_date, slot_key)
+                if chk is None:
+                    chk = await repo.upsert_pulse_checkin(
+                        db,
+                        user["id"],
+                        local_date,
+                        slot_key,
+                        dom,
+                        now.isoformat(),
+                        now.isoformat(),
+                    )
+                cid = int(chk["id"])
+                p_res = await pulse_service.complete_checkin(db, user, cid, now_utc=now)
+                karma = p_res.get("karma") or {}
+            action_id = await repo.create_inbox_action(
+                db,
+                user_id=user["id"],
+                inbox_message_id=inbox_id,
+                item_kind="pulse_log",
+                target_table="pulse_checkins",
+                target_id=cid,
+                title=item.title,
+                source_quote=item.source_quote,
+                payload={
+                    "slot": slot,
+                    "delta": int(karma.get("delta") or 0),
+                    "score_after": karma.get("score_after"),
+                    "model_note": item.model_note,
+                },
+                status="active",
+            )
+        elif kind == "rollover_tasks":
+            plan_items = rows_to_dicts(await repo.list_day_plan_items(db, user["id"], local_date))
+            unfinished = [p for p in plan_items if not p.get("done")]
+            to_date = (datetime.date.fromisoformat(local_date) + datetime.timedelta(days=1)).isoformat()
+            action_id = await repo.create_inbox_action(
+                db,
+                user_id=user["id"],
+                inbox_message_id=inbox_id,
+                item_kind="rollover_tasks",
+                target_table="confirm_pending",
+                target_id=None,
+                title=f"Перенести хвосты на завтра ({len(unfinished)} шт.)",
+                source_quote=item.source_quote,
+                payload={
+                    "kind": "rollover_tasks",
+                    "from_date": local_date,
+                    "to_date": to_date,
+                    "pending_count": len(unfinished),
+                    "short_label": f"перенести {len(unfinished)}",
+                },
+                status="awaiting_confirm",
+            )
+        elif kind == "shift_bedtime":
+            target_hhmm = item.schedule.resolved_time if item.schedule else None
+            _, _, is_weekend = pulse_service.get_effective_schedule(user, local_date)
+            if target_hhmm:
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="shift_bedtime",
+                    target_table="confirm_pending",
+                    target_id=None,
+                    title=f"Сдвинуть отбой на {target_hhmm}",
+                    source_quote=item.source_quote,
+                    payload={
+                        "kind": "shift_bedtime",
+                        "target_hhmm": target_hhmm,
+                        "is_weekend": is_weekend,
+                        "local_date": local_date,
+                        "short_label": f"отбой {target_hhmm}",
+                    },
+                    status="awaiting_confirm",
+                )
+            else:
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="shift_bedtime",
+                    target_table="confirm_pending",
+                    target_id=None,
+                    title="Уточнить время отбоя (нужен формат HH:MM)",
+                    source_quote=item.source_quote,
+                    payload={"not_found": True},
                     status="skipped",
                 )
         elif kind == "reminder":
@@ -733,6 +952,17 @@ async def render_food_suggestions(
     return text, kb
 
 
+def _latest_advice_ids(recent_context: Optional[list[dict[str, Any]]]) -> set[str]:
+    out: set[str] = set()
+    for turn in recent_context or []:
+        if turn.get("role") == "assistant":
+            meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
+            for cid in meta.get("shown_advice_ids") or []:
+                if cid:
+                    out.add(str(cid))
+    return out
+
+
 async def _build_query_response(
     db,
     user: dict[str, Any],
@@ -741,6 +971,7 @@ async def _build_query_response(
     *,
     llm_client_instance: Optional[LLMClient] = None,
     now_utc: Optional[datetime.datetime] = None,
+    recent_context: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, Optional[InlineKeyboardMarkup], dict[str, Any]]:
     qt = parsed.query_type
     if qt == "today":
@@ -748,6 +979,78 @@ async def _build_query_response(
 
         txt, kb = await render_today(db, user)
         return txt, kb, {"query_type": "today"}
+
+    if qt == "karma":
+        now = now_utc or datetime.datetime.utcnow()
+        tz = user.get("timezone") or "UTC"
+        local_date = local_date_str(now, tz)
+        state = await repo.get_or_create_karma_state(db, int(user["id"]))
+        events = await repo.list_karma_events(db, int(user["id"]), limit=5)
+        checkins = await repo.list_pulse_checkins_for_date(db, int(user["id"]), local_date)
+        eff = pulse_service.get_effective_schedule(user, local_date)
+        txt = karma_service.format_karma_screen(
+            user, state, events, checkins, now_utc=now, effective_schedule=eff
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🌙 Открыть «Сон и карма»", callback_data="pulse:hub"),
+                    InlineKeyboardButton(text="🧠 Портрет привычек", callback_data="pulse:portrait"),
+                ],
+                [InlineKeyboardButton(text="💡 Совет сейчас", callback_data="advice:more")],
+            ]
+        )
+        return txt, kb, {"query_type": "karma"}
+
+    if qt == "pantry":
+        items = rows_to_dicts(await repo.list_pantry_items(db, user["id"]))
+        if not items:
+            text = (
+                "❄️ <b>Холодильник</b>\nПока пусто. Можешь просто написать или надиктовать: "
+                "«купил тофу, гречку и огурцы»."
+            )
+        else:
+            lines = [f"❄️ <b>В холодильнике сейчас ({len(items)}):</b>"]
+            for idx, it in enumerate(items[:20], 1):
+                qty_s = format_quantity(it.get("amount"), it.get("unit"))
+                exp = f" · до {format_date_display(it['expires_at'])}" if it.get("expires_at") else ""
+                lines.append(f"{idx}. {_esc(it.get('name'))} ({_esc(qty_s)}){exp}")
+            text = "\n".join(lines)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🍳 Что приготовить?", callback_data="kitchen:quick_pick"),
+                    InlineKeyboardButton(text="❄️ Открыть холодильник", callback_data="kitchen:fridge"),
+                ],
+                [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
+            ]
+        )
+        return text, kb, {"query_type": "pantry"}
+
+    if qt == "advice":
+        is_more = parsed.query_term.strip().lower() == "more"
+        prev_ids = _latest_advice_ids(recent_context) if is_more else set()
+        reply_html, meta = await advice_service.build_situational_advice_reply(
+            db,
+            user,
+            user_text="" if is_more else raw_text,
+            llm_client_instance=llm_client_instance,
+            exclude_ids=prev_ids,
+            now_utc=now_utc,
+        )
+        card = meta.get("card") or {}
+        if card.get("id"):
+            prev_ids.add(str(card["id"]))
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="💡 Ещё совет", callback_data="advice:more"),
+                    InlineKeyboardButton(text="📅 Сегодня", callback_data="today:menu"),
+                ],
+                [InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")],
+            ]
+        )
+        return reply_html, kb, {"query_type": "advice", "shown_advice_ids": sorted(prev_ids)}
 
     if qt == "shopping":
         from handlers import kitchen
@@ -833,12 +1136,15 @@ async def _analyze_and_persist(
     local_date = inbox_row.get("local_date") or local_date_str(now_utc, tz)
     uid = int(user["id"])
     recent_ctx = _get_recent_context(uid, now_utc)
+    snapshot = await context_builder.build_user_day_snapshot(db, user, now_utc=now_utc)
+    ctx_for_llm = context_builder.format_context_for_llm(snapshot)
     parsed = await analyze_inbox_text(
         raw_text,
         now_utc=now_utc,
         tz_str=tz,
         llm_client_instance=llm_client_instance,
         recent_context=recent_ctx,
+        user_context_block=ctx_for_llm,
     )
 
     inbox_id = int(inbox_row["id"])
@@ -861,6 +1167,7 @@ async def _analyze_and_persist(
             raw_text,
             llm_client_instance=llm_client_instance,
             now_utc=now_utc,
+            recent_context=recent_ctx,
         )
         voice_line = _voice_prefix_line(updated_row)
         reply_text = f"{voice_line}\n\n{body_text}" if voice_line else body_text
@@ -911,8 +1218,16 @@ async def _analyze_and_persist(
         )
 
     actions, clarifications = await _persist_parsed_items(
-        db, user, inbox_row, parsed, local_date
+        db, user, inbox_row, parsed, local_date, now_utc=now_utc
     )
+    support_reply = parsed.reply_text
+    if parsed.intent == "support" and (not parsed.used_llm or not (support_reply or "").strip()):
+        card = advice_service.pick_situational_advice(snapshot, raw_text)
+        micro = str(card.get("micro_step") or "").strip()
+        tone_line = str(card.get("selected_tone_text") or "").strip()
+        if tone_line and micro:
+            support_reply = f"{tone_line}\nМикро-шаг сейчас: {micro}"
+
     new_status = "needs_clarification" if clarifications else "processed"
     await repo.update_inbox_message(
         db,
@@ -929,7 +1244,7 @@ async def _analyze_and_persist(
         actions,
         llm_error=parsed.llm_error,
         intent=parsed.intent,
-        support_reply=parsed.reply_text,
+        support_reply=support_reply,
     )
     _append_dialog_turn(uid, "user", raw_text, now_utc)
     _append_dialog_turn(uid, "assistant", reply_text, now_utc, meta={"query_type": "none"})
@@ -1145,10 +1460,10 @@ async def capture_and_process_voice(
 
 async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> None:
     table = action.get("target_table")
+    payload = _load_payload(action)
     if table == "shopping_list_removed":
         if action.get("status") == "skipped":
             return
-        payload = _load_payload(action)
         removed = payload.get("removed_item")
         if isinstance(removed, dict) and removed.get("item_name"):
             await repo.create_shopping_item(
@@ -1161,7 +1476,29 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
                 scope=str(removed.get("scope") or "household"),
             )
         return
+    if table == "pantry_removed":
+        if action.get("status") == "skipped":
+            return
+        removed = payload.get("removed_item")
+        if isinstance(removed, dict) and removed.get("name"):
+            await repo.restore_pantry_item(db, user_id, removed)
+        return
     tid = action.get("target_id")
+    if table == "pantry_items":
+        if tid:
+            await repo.delete_pantry_item(db, user_id, int(tid))
+        synced_shop = payload.get("synced_shopping_item")
+        if isinstance(synced_shop, dict) and synced_shop.get("item_name"):
+            await repo.create_shopping_item(
+                db,
+                user_id,
+                str(synced_shop["item_name"]),
+                qty=float(synced_shop.get("quantity") or 1.0),
+                unit=str(synced_shop.get("unit") or "шт"),
+                category=str(synced_shop.get("category") or "food"),
+                scope=str(synced_shop.get("scope") or "household"),
+            )
+        return
     if not tid:
         return
     tid_int = int(tid)
@@ -1175,6 +1512,107 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
         await repo.delete_journal_entry(db, user_id, tid_int, hard=False)
     elif table == "expenses":
         await repo.delete_expense(db, user_id, tid_int)
+
+
+async def confirm_inbox_action(
+    db,
+    user: dict[str, Any],
+    action_id: int,
+    now_utc: Optional[datetime.datetime] = None,
+) -> tuple[bool, str]:
+    """Подтвердить крупное голосовое/текстовое действие (перенос хвостов или сдвиг отбоя)."""
+    action = await repo.get_inbox_action(db, user["id"], action_id)
+    if not action or action.get("status") != "awaiting_confirm":
+        return False, "Это действие уже обработано или отменено."
+
+    now = now_utc or datetime.datetime.utcnow()
+    payload = _load_payload(action)
+    kind = str(payload.get("kind") or action.get("item_kind") or "")
+    inbox_id = int(action["inbox_message_id"])
+
+    if kind == "rollover_tasks":
+        from_date = str(payload.get("from_date") or local_date_str(now, user.get("timezone") or "UTC"))
+        to_date = str(
+            payload.get("to_date")
+            or (datetime.date.fromisoformat(from_date) + datetime.timedelta(days=1)).isoformat()
+        )
+        moved = await repo.rollover_unfinished_day_plan_items(db, user["id"], from_date, to_date)
+        if moved > 0:
+            await karma_service.record_karma_event(
+                db,
+                user,
+                domain="tasks",
+                event_type="rollover",
+                delta=2,
+                reason=f"Перенесены хвосты на завтра ({moved} шт.)",
+                now_utc=now,
+            )
+        payload["moved"] = moved
+        await repo.update_inbox_action(
+            db,
+            user["id"],
+            action_id,
+            status="active",
+            title=f"Перенесены хвосты на завтра ({moved} шт.)",
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        )
+        await _sync_parent_inbox_status(db, user["id"], inbox_id)
+        if moved > 0:
+            return True, f"➡️ Перенесла на завтра незавершённых дел: <b>{moved}</b> (+2 кармы)."
+        return True, "✅ Незавершённых дел на сегодня не нашлось — переносить было нечего."
+
+    if kind == "shift_bedtime":
+        target_hhmm = str(payload.get("target_hhmm") or "").strip()
+        if not target_hhmm:
+            return False, "Не удалось определить время отбоя."
+        is_weekend = bool(payload.get("is_weekend"))
+        local_date = str(payload.get("local_date") or local_date_str(now, user.get("timezone") or "UTC"))
+        eff_wake, _, _ = pulse_service.get_effective_schedule(user, local_date)
+        if is_weekend:
+            await repo.update_user_weekend_schedule(db, user["id"], eff_wake, target_hhmm)
+        else:
+            await repo.update_user_sleep(db, user["id"], target_hhmm)
+
+        refreshed_user_row = await repo.get_user(db, user["id"])
+        refreshed_user = dict(refreshed_user_row) if refreshed_user_row else dict(user)
+        wellness = await repo.get_wellness(db, user["id"])
+        slots = pulse_service.compute_daily_slots(
+            refreshed_user, dict(wellness) if wellness else None, local_date
+        )
+        for s_key in ("winddown", "bedtime"):
+            slot_spec = next((s for s in slots if s["slot_key"] == s_key), None)
+            existing_chk = await repo.get_pulse_checkin(db, user["id"], local_date, s_key)
+            if slot_spec and existing_chk and existing_chk.get("status") in {"pending", "snoozed"}:
+                sched_iso = slot_spec["scheduled_at_utc"].isoformat()
+                await repo.update_pulse_checkin(
+                    db,
+                    int(existing_chk["id"]),
+                    scheduled_at_utc=sched_iso,
+                    next_ping_at_utc=sched_iso,
+                )
+
+        await repo.update_inbox_action(
+            db,
+            user["id"],
+            action_id,
+            status="active",
+            title=f"Отбой сдвинут на {target_hhmm}",
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        )
+        await _sync_parent_inbox_status(db, user["id"], inbox_id)
+        return True, f"🌙 Отбой сдвинут на <b>{target_hhmm}</b>, Пульс на вечер обновлён."
+
+    return False, "Неизвестный тип подтверждения."
+
+
+async def reject_inbox_action(db, user: dict[str, Any], action_id: int) -> bool:
+    """Отменить ожидающее подтверждения действие."""
+    action = await repo.get_inbox_action(db, user["id"], action_id)
+    if not action or action.get("status") != "awaiting_confirm":
+        return False
+    await repo.update_inbox_action(db, user["id"], action_id, status="undone")
+    await _sync_parent_inbox_status(db, user["id"], int(action["inbox_message_id"]))
+    return True
 
 
 async def undo_inbox_message(db, user: dict[str, Any], inbox_id: int) -> int:

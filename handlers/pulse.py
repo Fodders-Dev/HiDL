@@ -14,7 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import karma_service, pulse_service
+from services import context_builder, karma_service, pulse_service
 from utils.menu_match import match_menu_label
 from utils.sender import safe_edit
 from utils.time import local_date_str, parse_hhmm
@@ -44,6 +44,10 @@ def _hub_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🔔 Настройки пульса", callback_data="pulse:toggles_menu"),
                 InlineKeyboardButton(text="📜 История кармы", callback_data="pulse:history"),
+            ],
+            [
+                InlineKeyboardButton(text="🧠 Портрет привычек", callback_data="pulse:portrait"),
+                InlineKeyboardButton(text="💡 Совет сейчас", callback_data="advice:more"),
             ],
             [
                 InlineKeyboardButton(text="🧪 Пробный пинг", callback_data="pulse:test_ping"),
@@ -600,3 +604,23 @@ async def cb_pulse_test_ping(callback: types.CallbackQuery, db) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     await pulse_service.send_test_pulse_ping(db, callback.message.bot, user)
     await callback.answer("Пробный пинг отправлен!")
+
+
+@router.callback_query(lambda c: c.data in {"pulse:portrait", "pulse:portrait_refresh"})
+async def cb_pulse_portrait(callback: types.CallbackQuery, db) -> None:
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    force = callback.data == "pulse:portrait_refresh"
+    memory = await context_builder.refresh_user_portrait_if_needed(db, user, force=force)
+    karma_state = await repo.get_or_create_karma_state(db, int(user["id"]))
+    text = context_builder.format_portrait_card(user, memory, karma_state)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Обновить портрет", callback_data="pulse:portrait_refresh"),
+                InlineKeyboardButton(text="💡 Совет сейчас", callback_data="advice:more"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="pulse:hub")],
+        ]
+    )
+    await safe_edit(callback.message, text, reply_markup=kb)
+    await callback.answer("Портрет обновлён." if force else "")
