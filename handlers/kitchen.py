@@ -4,6 +4,7 @@ import logging
 import os
 import math
 from html import escape as _html_escape
+from pathlib import Path
 from typing import Tuple, List, Optional
 
 from aiogram import Router, types, F
@@ -23,7 +24,7 @@ from utils.pantry import format_quantity, is_low
 router = Router()
 logger = logging.getLogger(__name__)
 
-RECIPES_FILE = "data/knowledge/recipes_core.json"
+RECIPES_FILE = str(Path(__file__).resolve().parents[1] / "data" / "knowledge" / "recipes_core.json")
 
 from utils.sender import safe_edit
 
@@ -475,6 +476,17 @@ async def quick_pick_recipes(callback: types.CallbackQuery, db):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode="HTML",
     )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "kitchen:more_food")
+async def kitchen_more_food(callback: types.CallbackQuery, db):
+    """Показать следующие подходящие варианты блюд без повторов."""
+    from services.inbox_service import render_food_suggestions
+
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    text, kb = await render_food_suggestions(db, user, raw_text="ещё", more=True)
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 

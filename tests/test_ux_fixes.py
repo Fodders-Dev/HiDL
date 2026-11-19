@@ -26,6 +26,7 @@ from aiogram.types import CallbackQuery, Chat, Message, Update, User
 from db import repositories as repo
 from hidl.app import create_app
 from llm_client import LLMClient, LLMResult
+from services import inbox_service
 
 
 class CaptureBotProxy:
@@ -201,8 +202,10 @@ class UXFixesTests(unittest.IsolatedAsyncioTestCase):
         await repo.ensure_user_routines(self.ctx.db_conn, self.user_id)
         self.user = dict(await repo.get_user(self.ctx.db_conn, self.user_id))
         self._msg_id = 200
+        inbox_service.clear_dialog_history()
 
     async def asyncTearDown(self):
+        inbox_service.clear_dialog_history()
         try:
             await self.ctx.db_conn.close()
         finally:
@@ -565,6 +568,44 @@ class UXFixesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("traceback", out["text"].lower())
                 if cmd == "/settings":
                     self.assertIsNotNone(getattr(out["reply_markup"], "inline_keyboard", None))
+
+    async def test_food_followup_more_uses_dialog_context_and_does_not_hit_diary(self):
+        await repo.upsert_wellness(self.ctx.db_conn, self.user_id, meal_profile="vegan")
+
+        with _offline_llm():
+            # 1. Ask what to cook for dinner
+            await self._send_text("Что приготовить на ужин?")
+            first_out = self.proxy.last_output()
+            first_text = first_out["text"]
+            self.assertNotIn("дневник", first_text.lower())
+            self.assertNotIn("куриц", first_text.lower())
+            first_cbs = _all_callback_datas(first_out["reply_markup"])
+            self.assertIn("kitchen:more_food", first_cbs)
+            first_recipes = {cb.split(":")[2] for cb in first_cbs if cb.startswith("kitchen:cook_view:")}
+            self.assertEqual(len(first_recipes), 3)
+
+            # 2. Follow up with "А еще?" -> returns next unseen vegan recipes, NOT diary!
+            await self._send_text("А еще?")
+            second_out = self.proxy.last_output()
+            second_text = second_out["text"]
+            self.assertNotIn("Последние записи дневника", second_text)
+            self.assertNotIn("куриц", second_text.lower())
+            second_cbs = _all_callback_datas(second_out["reply_markup"])
+            second_recipes = {cb.split(":")[2] for cb in second_cbs if cb.startswith("kitchen:cook_view:")}
+            self.assertEqual(len(second_recipes), 3)
+            self.assertEqual(first_recipes & second_recipes, set())
+
+            # 3. Click "🔄 Ещё варианты" -> shows remaining unseen vegan recipes (including 35m lentil_soup)
+            await self._click_callback("kitchen:more_food", second_out["message_id"], second_text)
+            third_out = self.proxy.last_output()
+            third_text = third_out["text"]
+            self.assertNotIn("куриц", third_text.lower())
+            third_cbs = _all_callback_datas(third_out["reply_markup"])
+            third_recipes = {cb.split(":")[2] for cb in third_cbs if cb.startswith("kitchen:cook_view:")}
+            self.assertGreaterEqual(len(third_recipes), 2)
+            self.assertEqual((first_recipes | second_recipes) & third_recipes, set())
+
+        self.assertEqual(len(await repo.list_journal_entries(self.ctx.db_conn, self.user_id)), 0)
 
 
 if __name__ == "__main__":

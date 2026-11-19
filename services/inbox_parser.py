@@ -165,7 +165,8 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 5. Сохраняй "source_quote" дословным фрагментом исходного текста. В "model_note" пиши только пометку-гипотезу, не выдумывай факты.
 6. Для "shopping" и "shopping_remove" в "title" пиши чистое название товара (например "Гречка", "Овсяное молоко").
 7. Для "reminder" передай "date_hint" ("завтра", "19.11.2026") и "time_hint" ("12:00", "в 8", "утром") без вычисления дат.
-8. Отвечай строго валидным JSON объектом формата:
+8. Если дан "Недавний контекст диалога", используй его для коротких продолжений вроде "а ещё?", "другое", "без картошки", "побыстрее", "и овсянку тоже". Если в предыдущем ответе обсуждалась еда/рецепты, а пользователь просит "а ещё?" или уточняет пожелание — возвращай intent="query", query_type="food", query_term="more" (или текст фильтра, например "без картошки"), НЕ "diary"!
+9. Отвечай строго валидным JSON объектом формата:
 {
   "intent": "capture|query|chat|support",
   "reply": "короткий ответ 1-2 предложения (для chat/support или пустого)",
@@ -893,6 +894,10 @@ def parse_inbox_fallback(
 
 _CHAT_REPLY_BY_PHRASE = {
     "привет": "Привет! Я рядом. Напиши или надиктуй, что сделать, купить или записать.",
+    "ку": "Привет! Я рядом. Напиши или надиктуй, что сделать, купить или записать.",
+    "здарова": "Привет! На связи — напиши или надиктуй, что запишем или разберём.",
+    "прив": "Привет! Я рядом. Напиши или надиктуй, что сделать, купить или записать.",
+    "хелло": "Привет! На связи — напиши или надиктуй, что сделать или записать.",
     "приветик": "Привет! На связи — напиши или надиктуй, что запишем или разберём.",
     "хай": "Привет! Я рядом — что запишем или подскажем?",
     "здравствуй": "Здравствуй! На связи — напиши или надиктуй, что нужно сделать или сохранить.",
@@ -951,6 +956,44 @@ _QUERY_DIARY_RE = re.compile(
     r"что\s+было\s+(?:в\s+дневнике\s+)?(?:про|о|об)\s+(.+))"
 )
 
+_MORE_FOLLOWUP_RE = re.compile(
+    r"(?iu)^(?:а\s+ещ[её]|ещ[её](?:\s+вариант\w*)?|что\s+ещ[её]|"
+    r"други[ех]\s+вариант\w*|другое|дальше|а\s+что\s+ещ[её]|"
+    r"ещ[её]\s+что-?нибудь|ещ[её]\s+блюд\w*|покажи\s+ещ[её])$"
+)
+
+_FOOD_FILTER_FOLLOWUP_RE = re.compile(
+    r"(?iu)^(?:без\s+\S+|побыстрее|быстрее|до\s+\d+\s*мин\w*)$"
+)
+
+
+def _latest_assistant_query_type(recent_context: Optional[list[dict[str, Any]]]) -> Optional[str]:
+    if not recent_context:
+        return None
+    for turn in reversed(recent_context):
+        if turn.get("role") == "assistant":
+            meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
+            qt = str(meta.get("query_type") or "").strip().lower()
+            if qt in {"food", "shopping", "today", "diary"}:
+                return qt
+            return None
+    return None
+
+
+def _format_recent_context(recent_context: Optional[list[dict[str, Any]]]) -> str:
+    if not recent_context:
+        return ""
+    lines = ["Недавний контекст диалога:"]
+    for turn in recent_context[-4:]:
+        role = "Пользователь" if turn.get("role") == "user" else "HiDL"
+        txt = re.sub(r"\s+", " ", str(turn.get("text") or "").strip())
+        if not txt:
+            continue
+        if len(txt) > 180:
+            txt = txt[:177] + "..."
+        lines.append(f"- {role}: {txt}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
 
 def _match_deterministic_chat(clean_text: str) -> Optional[InboxParseResult]:
     """Быстрый разбор коротких приветствий и благодарностей без записи в дневник."""
@@ -971,8 +1014,11 @@ def _match_deterministic_chat(clean_text: str) -> Optional[InboxParseResult]:
     )
 
 
-def _try_deterministic_intent(clean_text: str) -> Optional[InboxParseResult]:
-    """Детерминированный роутинг приветствий и прямых вопросов."""
+def _try_deterministic_intent(
+    clean_text: str,
+    recent_context: Optional[list[dict[str, Any]]] = None,
+) -> Optional[InboxParseResult]:
+    """Детерминированный роутинг приветствий, продолжений диалога и прямых вопросов."""
     chat_res = _match_deterministic_chat(clean_text)
     if chat_res is not None:
         return chat_res
@@ -980,6 +1026,25 @@ def _try_deterministic_intent(clean_text: str) -> Optional[InboxParseResult]:
     raw = (clean_text or "").strip()
     if not raw or len(_split_clauses(raw)) > 1:
         return None
+
+    stripped_punct = re.sub(r"[?!.,;:\s]+$", "", raw).strip()
+    prev_qt = _latest_assistant_query_type(recent_context)
+    if prev_qt and _MORE_FOLLOWUP_RE.fullmatch(stripped_punct):
+        return InboxParseResult(
+            items=[],
+            used_llm=False,
+            intent="query",
+            query_type=prev_qt,
+            query_term="more",
+        )
+    if prev_qt == "food" and _FOOD_FILTER_FOLLOWUP_RE.fullmatch(stripped_punct):
+        return InboxParseResult(
+            items=[],
+            used_llm=False,
+            intent="query",
+            query_type="food",
+            query_term=stripped_punct,
+        )
 
     if _QUERY_TODAY_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="today")
@@ -1006,9 +1071,10 @@ def parse_inbox_offline(
     clean_text: str,
     now_utc: datetime.datetime,
     tz_str: str,
+    recent_context: Optional[list[dict[str, Any]]] = None,
 ) -> InboxParseResult:
     """Офлайн-разбор с поддержкой chat/query/support/capture без обращения к LLM."""
-    det = _try_deterministic_intent(clean_text)
+    det = _try_deterministic_intent(clean_text, recent_context=recent_context)
     if det is not None:
         return det
 
@@ -1186,22 +1252,45 @@ async def analyze_inbox_text(
     now_utc: datetime.datetime,
     tz_str: str,
     llm_client_instance: Optional[LLMClient] = None,
+    recent_context: Optional[list[dict[str, Any]]] = None,
 ) -> InboxParseResult:
     """Разобрать сообщение через настроенную LLM с отказоустойчивым fallback."""
     clean_text = (raw_text or "").strip()
     if not clean_text:
         return InboxParseResult(items=[], used_llm=False)
 
-    # Короткие приветствия и подтверждения обрабатываем мгновенно и без мусора в дневнике.
+    # Короткие приветствия и контекстные «А ещё?» обрабатываем мгновенно и без мусора в дневнике.
     chat_hit = _match_deterministic_chat(clean_text)
     if chat_hit is not None:
         return chat_hit
 
+    stripped_punct = re.sub(r"[?!.,;:\s]+$", "", clean_text).strip()
+    prev_qt = _latest_assistant_query_type(recent_context)
+    if prev_qt and _MORE_FOLLOWUP_RE.fullmatch(stripped_punct):
+        return InboxParseResult(
+            items=[],
+            used_llm=False,
+            intent="query",
+            query_type=prev_qt,
+            query_term="more",
+        )
+    if prev_qt == "food" and _FOOD_FILTER_FOLLOWUP_RE.fullmatch(stripped_punct):
+        return InboxParseResult(
+            items=[],
+            used_llm=False,
+            intent="query",
+            query_type="food",
+            query_term=stripped_punct,
+        )
+
     client = llm_client_instance or default_llm_client
     if client.is_configured():
         local_now = _to_local_now(now_utc, tz_str)
+        ctx_block = _format_recent_context(recent_context)
+        ctx_part = f"{ctx_block}\n\n" if ctx_block else ""
         user_prompt = (
             f"Локальное время пользователя: {local_now.strftime('%d.%m.%Y %H:%M')} ({tz_str}).\n"
+            f"{ctx_part}"
             f"Сообщение:\n{clean_text}"
         )
         res = await client.complete_json(_INBOX_SYSTEM_PROMPT, user_prompt, temperature=0.1)
@@ -1235,11 +1324,11 @@ async def analyze_inbox_text(
         else:
             llm_error = res.error or "llm_failed"
 
-        offline = parse_inbox_offline(clean_text, now_utc, tz_str)
+        offline = parse_inbox_offline(clean_text, now_utc, tz_str, recent_context=recent_context)
         offline.llm_provider = res.provider
         offline.llm_model = res.model
         offline.llm_raw_json = res.text
         offline.llm_error = llm_error
         return offline
 
-    return parse_inbox_offline(clean_text, now_utc, tz_str)
+    return parse_inbox_offline(clean_text, now_utc, tz_str, recent_context=recent_context)

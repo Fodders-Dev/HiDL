@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import html
 import json
+import re
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -12,7 +13,7 @@ from typing import Any, Callable, Optional
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
-from llm_client import LLMClient
+from llm_client import LLMClient, client as default_llm_client
 from services import stt
 from services.inbox_parser import (
     InboxParseResult,
@@ -455,17 +456,298 @@ async def _persist_parsed_items(
     return actions, clarifications
 
 
+_DIALOG_TTL_SEC = 20 * 60
+_DIALOG_MAX_TURNS = 6
+_DIALOG_HISTORY: dict[int, list[dict[str, Any]]] = {}
+
+
+def clear_dialog_history(user_id: Optional[int] = None) -> None:
+    """Очистить краткосрочную историю диалога (для тестов или сброса контекста)."""
+    if user_id is None:
+        _DIALOG_HISTORY.clear()
+    else:
+        _DIALOG_HISTORY.pop(int(user_id), None)
+
+
+def _normalize_utc(dt: Optional[datetime.datetime]) -> datetime.datetime:
+    cur = dt or datetime.datetime.now(datetime.timezone.utc)
+    if cur.tzinfo is None:
+        return cur.replace(tzinfo=datetime.timezone.utc)
+    return cur.astimezone(datetime.timezone.utc)
+
+
+def _get_recent_context(
+    user_id: int,
+    now_utc: Optional[datetime.datetime] = None,
+) -> list[dict[str, Any]]:
+    now = _normalize_utc(now_utc)
+    turns = _DIALOG_HISTORY.get(int(user_id), [])
+    fresh: list[dict[str, Any]] = []
+    for t in turns:
+        ts = t.get("ts")
+        if isinstance(ts, datetime.datetime):
+            ts_norm = _normalize_utc(ts)
+            if (now - ts_norm).total_seconds() <= _DIALOG_TTL_SEC:
+                fresh.append(t)
+    fresh = fresh[-_DIALOG_MAX_TURNS:]
+    if fresh:
+        _DIALOG_HISTORY[int(user_id)] = fresh
+    else:
+        _DIALOG_HISTORY.pop(int(user_id), None)
+    return list(fresh)
+
+
+def _append_dialog_turn(
+    user_id: int,
+    role: str,
+    text: str,
+    now_utc: Optional[datetime.datetime] = None,
+    meta: Optional[dict[str, Any]] = None,
+) -> None:
+    now = _normalize_utc(now_utc)
+    history = _get_recent_context(user_id, now)
+    history.append(
+        {
+            "role": role,
+            "text": (text or "").strip(),
+            "ts": now,
+            "meta": dict(meta or {}),
+        }
+    )
+    _DIALOG_HISTORY[int(user_id)] = history[-_DIALOG_MAX_TURNS:]
+
+
+def _latest_food_meta(recent_context: list[dict[str, Any]]) -> dict[str, Any]:
+    for turn in reversed(recent_context):
+        if turn.get("role") == "assistant":
+            meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
+            if meta.get("query_type") == "food":
+                return meta
+    return {}
+
+
+def _extract_excluded_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    for m in re.finditer(r"(?iu)\bбез\s+([а-яёa-z-]+)", text or ""):
+        raw = m.group(1).strip().lower()
+        if len(raw) >= 3:
+            terms.append(repo._ru_stem(raw) or raw)
+    return terms
+
+
+def _recipe_matches_exclusion(recipe: dict[str, Any], excluded_stems: list[str]) -> bool:
+    if not excluded_stems:
+        return False
+    parts = [str(recipe.get("title") or ""), str(recipe.get("desc") or "")]
+    for ing in recipe.get("ingredients") or []:
+        if isinstance(ing, dict):
+            parts.append(str(ing.get("name") or ""))
+    haystack = " ".join(parts).lower()
+    return any(stem in haystack for stem in excluded_stems)
+
+
+async def _render_food_suggestions_with_meta(
+    db,
+    user: dict[str, Any],
+    *,
+    raw_text: str = "",
+    more: bool = False,
+    query_term: str = "",
+    llm_client_instance: Optional[LLMClient] = None,
+    now_utc: Optional[datetime.datetime] = None,
+    record_history: bool = True,
+) -> tuple[str, InlineKeyboardMarkup, dict[str, Any]]:
+    """Подобрать 3 неповторяющихся рецепта под профиль питания (с LLM-идеями, когда каталог исчерпан)."""
+    from handlers import kitchen
+
+    now = _normalize_utc(now_utc)
+    uid = int(user["id"])
+    recent = _get_recent_context(uid, now)
+    prev_meta = _latest_food_meta(recent)
+
+    q_lower = f"{raw_text} {query_term}".lower()
+    is_more = bool(
+        more
+        or query_term.strip().lower() == "more"
+        or "ещ" in q_lower
+        or "друг" in q_lower
+        or "дальше" in q_lower
+        or "без " in q_lower
+        or "быстр" in q_lower
+    )
+
+    already_ids: list[str] = list(prev_meta.get("shown_recipe_ids") or []) if is_more else []
+    already_titles: list[str] = list(prev_meta.get("shown_titles") or []) if is_more else []
+
+    profile = await kitchen._get_meal_profile(db, uid)
+    allowed = [
+        r for r in kitchen.load_recipes() if kitchen._recipe_allowed_for_profile(r, profile)
+    ]
+
+    tag_pref = (
+        "breakfast"
+        if "завтрак" in q_lower
+        else "lunch"
+        if "обед" in q_lower
+        else "dinner"
+        if "ужин" in q_lower
+        else (prev_meta.get("tag_pref") if is_more else None)
+    )
+    excluded = _extract_excluded_terms(f"{raw_text} {query_term}")
+    if excluded:
+        allowed = [r for r in allowed if not _recipe_matches_exclusion(r, excluded)]
+
+    fast_only = any(w in q_lower for w in ("побыстрее", "быстрее", "до 15", "до 20"))
+    max_fast_min = 20 if ("побыстрее" in q_lower or "быстрее" in q_lower) else 30
+
+    tier_pref_fast: list[dict[str, Any]] = []
+    tier_other_fast: list[dict[str, Any]] = []
+    tier_rest: list[dict[str, Any]] = []
+    for r in allowed:
+        t_min = int(r.get("time_minutes") or 999)
+        tags = r.get("tags") or []
+        if tag_pref and tag_pref in tags and t_min <= max_fast_min:
+            tier_pref_fast.append(r)
+        elif t_min <= max_fast_min:
+            tier_other_fast.append(r)
+        elif not fast_only:
+            tier_rest.append(r)
+
+    ordered = tier_pref_fast + tier_other_fast + tier_rest
+    shown_id_set = set(already_ids)
+    candidates = [r for r in ordered if str(r.get("id") or "") not in shown_id_set][:3]
+
+    btn_rows: list[list[InlineKeyboardButton]] = []
+    new_meta: dict[str, Any] = {
+        "query_type": "food",
+        "tag_pref": tag_pref,
+        "shown_recipe_ids": list(already_ids),
+        "shown_titles": list(already_titles),
+    }
+
+    if candidates:
+        header = "🍳 <b>Ещё подходящие варианты:</b>" if is_more else "🍳 <b>Быстрые варианты (до 30 мин):</b>"
+        lines = [header]
+        for idx, r in enumerate(candidates, 1):
+            t = int(r.get("time_minutes") or 0)
+            desc = (r.get("desc") or "").strip()
+            title = str(r.get("title") or "Рецепт")
+            rid = str(r.get("id") or "")
+            line = f"{idx}. <b>{_esc(title)}</b> · {t} мин"
+            if desc:
+                line += f" — {_esc(desc)}"
+            lines.append(line)
+            btn_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"🍳 {title} · {t}м",
+                        callback_data=f"kitchen:cook_view:{rid}:2:all:0",
+                    )
+                ]
+            )
+            if rid and rid not in new_meta["shown_recipe_ids"]:
+                new_meta["shown_recipe_ids"].append(rid)
+            if title and title not in new_meta["shown_titles"]:
+                new_meta["shown_titles"].append(title)
+        text = "\n".join(lines)
+        btn_rows.append([InlineKeyboardButton(text="🔄 Ещё варианты", callback_data="kitchen:more_food")])
+    else:
+        client = llm_client_instance or default_llm_client
+        if client.is_configured():
+            diet_desc = (
+                "строго веганские (без мяса, рыбы, яиц и молочных продуктов)"
+                if profile == "vegan"
+                else "вегетарианские (без мяса и рыбы)"
+                if profile == "vegetarian"
+                else "обычные домашние"
+            )
+            meal_word = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин"}.get(
+                tag_pref or "", "приём пищи"
+            )
+            avoid_list = ", ".join(already_titles[-12:])
+            excl_note = f" Без: {', '.join(excluded)}." if excluded else ""
+            sys_prompt = (
+                "Ты кулинарный помощник HiDL. Предложи ровно 3 простых домашних блюда по-русски "
+                "в формате короткого нумерованного списка (1., 2., 3.) на 2 порции, время готовки до 30 минут, "
+                "по 1 строке на блюдо (Название · время — короткая суть). Без лишнего вступления и мед. советов."
+            )
+            usr_prompt = (
+                f"Подбери 3 идеи на {meal_word}. Питание: {diet_desc}.{excl_note}\n"
+                + (f"Не повторяй эти блюда: {avoid_list}." if avoid_list else "")
+            )
+            res = await client.complete_text(sys_prompt, usr_prompt, temperature=0.5, max_tokens=320)
+            if res.ok and res.text.strip():
+                raw_ideas = res.text.strip()
+                for line in raw_ideas.splitlines():
+                    cleaned = re.sub(r"^\s*\d+[\).]\s*", "", line).strip()
+                    name_part = re.split(r"[·—–-]", cleaned, maxsplit=1)[0].strip(" *•_")
+                    if name_part and name_part not in new_meta["shown_titles"]:
+                        new_meta["shown_titles"].append(name_part)
+                text = f"🍳 <b>Новые идеи:</b>\n{_esc(raw_ideas)}"
+                btn_rows.append([InlineKeyboardButton(text="🔄 Ещё варианты", callback_data="kitchen:more_food")])
+            else:
+                new_meta["shown_recipe_ids"] = []
+                text = "🍳 Варианты из книги рецептов закончились — можешь начать круг заново или открыть всю книгу."
+                btn_rows.append([InlineKeyboardButton(text="🔄 Показать сначала", callback_data="kitchen:more_food")])
+        else:
+            new_meta["shown_recipe_ids"] = []
+            text = (
+                f"🍳 Все подходящие рецепты из книги ({len(allowed)}) уже показаны — "
+                "можешь открыть всю книгу или начать круг заново."
+            )
+            btn_rows.append([InlineKeyboardButton(text="🔄 Показать сначала", callback_data="kitchen:more_food")])
+
+    btn_rows.append([InlineKeyboardButton(text="📖 Все рецепты", callback_data="kitchen:recipes")])
+    btn_rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=btn_rows)
+
+    if record_history:
+        _append_dialog_turn(uid, "user", raw_text or ("Ещё варианты блюд" if is_more else "Что приготовить?"), now)
+        _append_dialog_turn(uid, "assistant", text, now, meta=new_meta)
+
+    return text, kb, new_meta
+
+
+async def render_food_suggestions(
+    db,
+    user: dict[str, Any],
+    *,
+    raw_text: str = "",
+    more: bool = False,
+    query_term: str = "",
+    llm_client_instance: Optional[LLMClient] = None,
+    now_utc: Optional[datetime.datetime] = None,
+    record_history: bool = True,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Подобрать 3 неповторяющихся рецепта под профиль питания."""
+    text, kb, _ = await _render_food_suggestions_with_meta(
+        db,
+        user,
+        raw_text=raw_text,
+        more=more,
+        query_term=query_term,
+        llm_client_instance=llm_client_instance,
+        now_utc=now_utc,
+        record_history=record_history,
+    )
+    return text, kb
+
+
 async def _build_query_response(
     db,
     user: dict[str, Any],
     parsed: InboxParseResult,
     raw_text: str,
-) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    *,
+    llm_client_instance: Optional[LLMClient] = None,
+    now_utc: Optional[datetime.datetime] = None,
+) -> tuple[str, Optional[InlineKeyboardMarkup], dict[str, Any]]:
     qt = parsed.query_type
     if qt == "today":
         from utils.today import render_today
 
-        return await render_today(db, user)
+        txt, kb = await render_today(db, user)
+        return txt, kb, {"query_type": "today"}
 
     if qt == "shopping":
         from handlers import kitchen
@@ -482,55 +764,20 @@ async def _build_query_response(
                     f"{idx}. {mark} {_esc(it['item_name'])} ({_esc(format_quantity(it.get('quantity'), it.get('unit')))})"
                 )
             text = "\n".join(lines)
-        return text, kitchen.shopping_list_keyboard(items, scope="household")
+        return text, kitchen.shopping_list_keyboard(items, scope="household"), {"query_type": "shopping"}
 
     if qt == "food":
-        from handlers import kitchen
-
-        profile = await kitchen._get_meal_profile(db, user["id"])
-        fast_recipes = [
-            r
-            for r in kitchen.load_recipes()
-            if kitchen._recipe_allowed_for_profile(r, profile) and int(r.get("time_minutes") or 999) <= 30
-        ]
-        q_lower = (raw_text or "").lower()
-        tag_pref = (
-            "breakfast" if "завтрак" in q_lower
-            else "lunch" if "обед" in q_lower
-            else "dinner" if "ужин" in q_lower
-            else None
+        txt, kb, meta = await _render_food_suggestions_with_meta(
+            db,
+            user,
+            raw_text=raw_text,
+            more=(parsed.query_term.strip().lower() == "more"),
+            query_term=parsed.query_term,
+            llm_client_instance=llm_client_instance,
+            now_utc=now_utc,
+            record_history=False,
         )
-        if tag_pref:
-            pref = [r for r in fast_recipes if tag_pref in (r.get("tags") or [])]
-            rest = [r for r in fast_recipes if tag_pref not in (r.get("tags") or [])]
-            candidates = (pref + rest)[:3]
-        else:
-            candidates = fast_recipes[:3]
-
-        btn_rows: list[list[InlineKeyboardButton]] = []
-        if candidates:
-            lines = ["🍳 <b>Быстрые варианты (до 30 мин):</b>"]
-            for idx, r in enumerate(candidates, 1):
-                t = int(r.get("time_minutes") or 0)
-                desc = (r.get("desc") or "").strip()
-                line = f"{idx}. <b>{_esc(r.get('title'))}</b> · {t} мин"
-                if desc:
-                    line += f" — {_esc(desc)}"
-                lines.append(line)
-                btn_rows.append(
-                    [
-                        InlineKeyboardButton(
-                            text=f"🍳 {r.get('title', 'Рецепт')} · {t}м",
-                            callback_data=f"kitchen:cook_view:{r['id']}:2:all:0",
-                        )
-                    ]
-                )
-            text = "\n".join(lines)
-        else:
-            text = "🍳 Подходящих быстрых рецептов не нашлось — загляни во все рецепты."
-        btn_rows.append([InlineKeyboardButton(text="📖 Все рецепты", callback_data="kitchen:recipes")])
-        btn_rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")])
-        return text, InlineKeyboardMarkup(inline_keyboard=btn_rows)
+        return txt, kb, meta
 
     if qt == "diary":
         term = (parsed.query_term or "").strip()
@@ -557,16 +804,20 @@ async def _build_query_response(
                 [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
             ]
         )
-        return "\n".join(lines), kb
+        return "\n".join(lines), kb, {"query_type": "diary", "query_term": term}
 
     fallback_reply = _esc(parsed.reply_text) if parsed.reply_text else (
         "Не совсем поняла, где искать. Могу открыть план на сегодня или дневник."
     )
-    return fallback_reply, InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📓 Открыть дневник", callback_data="diary:tab:diary")],
-            [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
-        ]
+    return (
+        fallback_reply,
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📓 Открыть дневник", callback_data="diary:tab:diary")],
+                [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
+            ]
+        ),
+        {"query_type": "none"},
     )
 
 
@@ -580,11 +831,14 @@ async def _analyze_and_persist(
 ) -> InboxProcessOutcome:
     tz = user.get("timezone") or "UTC"
     local_date = inbox_row.get("local_date") or local_date_str(now_utc, tz)
+    uid = int(user["id"])
+    recent_ctx = _get_recent_context(uid, now_utc)
     parsed = await analyze_inbox_text(
         raw_text,
         now_utc=now_utc,
         tz_str=tz,
         llm_client_instance=llm_client_instance,
+        recent_context=recent_ctx,
     )
 
     inbox_id = int(inbox_row["id"])
@@ -600,9 +854,18 @@ async def _analyze_and_persist(
             llm_error=parsed.llm_error or "",
         )
         updated_row = await repo.get_inbox_message(db, user["id"], inbox_id) or inbox_row
-        body_text, reply_markup = await _build_query_response(db, user, parsed, raw_text)
+        body_text, reply_markup, query_meta = await _build_query_response(
+            db,
+            user,
+            parsed,
+            raw_text,
+            llm_client_instance=llm_client_instance,
+            now_utc=now_utc,
+        )
         voice_line = _voice_prefix_line(updated_row)
         reply_text = f"{voice_line}\n\n{body_text}" if voice_line else body_text
+        _append_dialog_turn(uid, "user", raw_text, now_utc)
+        _append_dialog_turn(uid, "assistant", body_text, now_utc, meta=query_meta)
         return InboxProcessOutcome(
             inbox_id=inbox_id,
             status="answered",
@@ -631,6 +894,8 @@ async def _analyze_and_persist(
         chat_msg = _esc(parsed.reply_text or "На связи! Напиши или надиктуй, что сделать или записать.")
         voice_line = _voice_prefix_line(updated_row)
         reply_text = f"{voice_line}\n\n{chat_msg}" if voice_line else chat_msg
+        _append_dialog_turn(uid, "user", raw_text, now_utc)
+        _append_dialog_turn(uid, "assistant", chat_msg, now_utc, meta={"query_type": "none"})
         return InboxProcessOutcome(
             inbox_id=inbox_id,
             status="replied",
@@ -666,6 +931,8 @@ async def _analyze_and_persist(
         intent=parsed.intent,
         support_reply=parsed.reply_text,
     )
+    _append_dialog_turn(uid, "user", raw_text, now_utc)
+    _append_dialog_turn(uid, "assistant", reply_text, now_utc, meta={"query_type": "none"})
     return InboxProcessOutcome(
         inbox_id=inbox_id,
         status=new_status,
