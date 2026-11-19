@@ -20,6 +20,17 @@ class Registration(StatesGroup):
     sleep = State()
 
 
+async def _handle_reg_cancel(message: types.Message, state: FSMContext) -> bool:
+    if (message.text or "").strip().lower() in {"отмена", "назад"}:
+        await state.clear()
+        await message.answer(
+            "Отменила настройку. Если захочешь продолжить — набери /start.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return True
+    return False
+
+
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
@@ -31,7 +42,6 @@ async def cmd_start(message: types.Message, state: FSMContext, db) -> None:
         return
 
     await state.clear()
-    await state.set_state(Registration.name)
     first_name = message.from_user.first_name or "друг"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -70,12 +80,15 @@ async def regname_choice(callback: types.CallbackQuery, state: FSMContext) -> No
             reply_markup=kb,
         )
     else:
+        await state.set_state(Registration.name)
         await callback.message.answer("Как к тебе обращаться?")
     await callback.answer()
 
 
-@router.message(Registration.name)
+@router.message(Registration.name, lambda m: bool(m.text and not m.text.startswith("/")))
 async def reg_name(message: types.Message, state: FSMContext) -> None:
+    if await _handle_reg_cancel(message, state):
+        return
     await state.update_data(name=(message.text or "").strip() or message.from_user.first_name or "друг")
     await state.set_state(Registration.gender)
     kb = InlineKeyboardMarkup(
@@ -108,8 +121,10 @@ async def reggender_choice(callback: types.CallbackQuery, state: FSMContext) -> 
     await callback.answer("Сохранено")
 
 
-@router.message(Registration.timezone)
+@router.message(Registration.timezone, lambda m: bool(m.text and not m.text.startswith("/")))
 async def reg_timezone(message: types.Message, state: FSMContext) -> None:
+    if await _handle_reg_cancel(message, state):
+        return
     tz_raw = message.text.strip()
     if not is_valid_timezone(tz_raw):
         await message.answer(
@@ -122,8 +137,10 @@ async def reg_timezone(message: types.Message, state: FSMContext) -> None:
     await message.answer("Во сколько просыпаешься обычно? Формат HH:MM, например 07:30. После этого настроим план по дому (5 вопросов).")
 
 
-@router.message(Registration.wake_up)
+@router.message(Registration.wake_up, lambda m: bool(m.text and not m.text.startswith("/")))
 async def reg_wake_up(message: types.Message, state: FSMContext) -> None:
+    if await _handle_reg_cancel(message, state):
+        return
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
         await message.answer(
@@ -135,8 +152,10 @@ async def reg_wake_up(message: types.Message, state: FSMContext) -> None:
     await message.answer("Во сколько обычно ложишься спать? Формат HH:MM, например 23:30.")
 
 
-@router.message(Registration.sleep)
+@router.message(Registration.sleep, lambda m: bool(m.text and not m.text.startswith("/")))
 async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_reg_cancel(message, state):
+        return
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
         await message.answer(
@@ -160,7 +179,7 @@ async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
     await message.answer(
         f"Принято, {data['name']}! Добавила базовые настройки.\n\n"
         "Главное меню внизу: Сегодня, Еда, Дом, Деньги, Спорт, Покупки,\n"
-        "Расписание, Поговорить, Кафе фокуса, Настройки.\n\n"
+        "Расписание, Дневник, Кафе фокуса, Настройки.\n\n"
         "Если захочешь, мы настроим план по дому из раздела 🧹 Дом — там я задам пару вопросов и соберу список регулярных дел.\n\n"
         "Если что-то захочешь поменять — заходи в ⚙ Настройки. "
         "Если запутаешься — всегда можно набрать /help.",
@@ -171,36 +190,15 @@ async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: types.Message) -> None:
     await message.answer(
-        "Команды ниже — для тех случаев, когда хочется «по‑старому».\n"
-        "В обычной жизни достаточно нажимать большие кнопки внизу.\n\n"
-        "Главное:\n"
-        "📅 Сегодня — твои дела и кнопки отметок\n"
-        "🍽 Еда — тарелка дня, рецепты, меню, список покупок\n"
-        "💰 Деньги — траты, отчёт, лимиты (всё через кнопки)\n"
-        "🧹 Дом — уборка, зоны, стирка/запах, план по дому\n"
-        "🏋️ Спорт — прогулки/фокус, позже добавим тренировки/вес\n"
-        "☕ Кафе фокуса — короткие фокус‑сессии с чек‑инами\n"
-        "😴 Режим сна — плавно выстроить сон и утренний подъем\n"
-        "⚙ Настройки — тон, вода/еда, фокус, щадящий режим, профиль, время рутин\n"
-        "💬 Поговорить / голос или свободный текст — разложу по делам, покупкам, напоминаниям и дневнику\n"
-        "🗓 Расписание — день по блокам + подсказки.\n\n"
-        "Продвинутые команды:\n"
-        "/today — показать план\n"
-        "/diary — дневник, идеи, поиск и экспорт\n"
-        "/schedule — расписание\n"
-        "/reminders — свои напоминания\n"
-        "/stats — статистика\n"
-        "/budget_set /budget_cat /spent /spent_week — финансы\n"
-        "/bills — счета\n"
-        "/cafe — кафе фокуса\n"
-        "/help_now — помощь сейчас\n"
-        "/sleep — режим сна\n"
-        "/gentle /resume — щадящий режим\n"
-        "/tone — тон\n"
-        "/wellness — вода/еда/фокус\n"
-        "/donate — поддержать\n"
-        "/home_plan /home_audit — дом\n"
-        "/meal_plan /plate /shoplist — еда\n"
-        "/talk — поболтать",
+        "В обычной жизни достаточно кнопок меню внизу — команды учить не нужно.\n\n"
+        "• 📅 Сегодня — план дня, рутины, прогресс\n"
+        "• 🍽 Еда и 🛒 Покупки — рецепты, холодильник и список покупок\n"
+        "• 🧹 Дом и 💰 Деньги — уборка по шагам, траты и счета\n"
+        "• 🗓 Расписание и ☕ Кафе фокуса — слоты дня и таймер фокуса\n"
+        "• 📓 Дневник (или просто текст/голос в чат) — разложу дела, мысли и напоминания\n\n"
+        "Полезные команды:\n"
+        "/today — сегодня • /diary — дневник • /pantry — холодильник\n"
+        "/reminders — напоминания • /sleep — сон • /settings — настройки\n"
+        "/help_now — срочная поддержка, когда мало сил",
         reply_markup=main_menu_keyboard(),
     )

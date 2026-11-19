@@ -3,12 +3,15 @@ import datetime
 
 from aiogram import Router, types
 from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils import texts
 from utils.menu_match import match_menu_label
+from utils.sender import safe_edit
 from utils.texts import register_text
 from utils.time import local_date_str, parse_hhmm
 from utils.user import ensure_user
@@ -18,12 +21,29 @@ FOCUS_EDIT_REQUESTS = {}
 TIME_EDIT_REQUESTS = {}
 
 
+class WellnessState(StatesGroup):
+    focus_edit = State()
+    time_edit = State()
+
+
+def _wellness_text(current: dict) -> str:
+    work = current.get("focus_work") or 20
+    rest = current.get("focus_rest") or 10
+    return (
+        "Напоминания здоровья:\n"
+        f"• Вода: {'вкл' if current.get('water_enabled') else 'выкл'}\n"
+        f"• Приём пищи: {'вкл' if current.get('meal_enabled') else 'выкл'}\n"
+        f"• Фокус-таймер {work}/{rest}: {'вкл' if current.get('focus_mode') else 'выкл'}\n"
+        "Переключи нужное:"
+    )
+
+
 def wellness_keyboard(current) -> InlineKeyboardMarkup:
     water = "✅" if current.get("water_enabled") else "❌"
     meal = "✅" if current.get("meal_enabled") else "❌"
     focus = "✅" if current.get("focus_mode") else "❌"
-    work = current.get("focus_work", 20)
-    rest = current.get("focus_rest", 10)
+    work = current.get("focus_work") or 20
+    rest = current.get("focus_rest") or 10
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"Вода {water}", callback_data="well:water")],
@@ -33,10 +53,16 @@ def wellness_keyboard(current) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Сменить интервалы", callback_data="well:focus_edit"),
             ],
             [
-                InlineKeyboardButton(text=f"Вода часы: {current.get('water_times','')}", callback_data="well:water_times"),
+                InlineKeyboardButton(
+                    text=f"Вода часы: {current.get('water_times') or 'не задано'}",
+                    callback_data="well:water_times",
+                ),
             ],
             [
-                InlineKeyboardButton(text=f"Еда часы: {current.get('meal_times','')}", callback_data="well:meal_times"),
+                InlineKeyboardButton(
+                    text=f"Еда часы: {current.get('meal_times') or 'не задано'}",
+                    callback_data="well:meal_times",
+                ),
             ],
             [
                 InlineKeyboardButton(text="Пресет воды 1x", callback_data="well:water_preset:1"),
@@ -46,28 +72,33 @@ def wellness_keyboard(current) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Пресет еды 2x", callback_data="well:meal_preset:2"),
                 InlineKeyboardButton(text="Пресет еды 3x", callback_data="well:meal_preset:3"),
             ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
         ]
     )
 
 
 @router.message(Command("wellness"))
-async def wellness_settings(message: types.Message, db) -> None:
+async def wellness_settings(message: types.Message, db, state: FSMContext | None = None) -> None:
+    if state:
+        await state.clear()
+    FOCUS_EDIT_REQUESTS.pop(message.from_user.id, None)
+    TIME_EDIT_REQUESTS.pop(message.from_user.id, None)
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     row = await repo.get_wellness(db, user["id"])
     current = dict(row) if row else {"water_enabled": 0, "meal_enabled": 0, "focus_mode": 0}
-    await message.answer(
-        "Напоминания здоровья:\n"
-        f"• Вода: {'вкл' if current.get('water_enabled') else 'выкл'}\n"
-        f"• Приём пищи: {'вкл' if current.get('meal_enabled') else 'выкл'}\n"
-        f"• Фокус-таймер {current.get('focus_work', 20)}/{current.get('focus_rest', 10)}: {'вкл' if current.get('focus_mode') else 'выкл'}\n"
-        "Переключи нужное:",
-        reply_markup=wellness_keyboard(current),
-    )
+    await message.answer(_wellness_text(current), reply_markup=wellness_keyboard(current))
 
 
-@router.message(lambda m: m.text and m.from_user.id in FOCUS_EDIT_REQUESTS)
-async def focus_edit_input(message: types.Message, db) -> None:
-    parts = message.text.strip().split()
+@router.message(lambda m: m.text and not m.text.startswith("/") and m.from_user.id in FOCUS_EDIT_REQUESTS)
+async def focus_edit_input(message: types.Message, db, state: FSMContext | None = None) -> None:
+    raw = message.text.strip()
+    if raw.lower() in {"отмена", "назад"}:
+        FOCUS_EDIT_REQUESTS.pop(message.from_user.id, None)
+        if state:
+            await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
+    parts = raw.split()
     if len(parts) < 2:
         await message.answer(
             texts.error("нужно два числа: работа отдых, например 20 10."),
@@ -83,10 +114,11 @@ async def focus_edit_input(message: types.Message, db) -> None:
             texts.error("нужны целые числа (работа отдых)."),
         )
         return
-    user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await repo.upsert_wellness(db, user["id"], focus_work=work, focus_rest=rest)
     FOCUS_EDIT_REQUESTS.pop(message.from_user.id, None)
+    if state:
+        await state.clear()
     await message.answer(
         f"Установила интервалы {work}/{rest}. Включи фокус в настройках здоровья (кнопка «Вода/Еда/Фокус»).",
         reply_markup=main_menu_keyboard(),
@@ -106,34 +138,45 @@ async def gentle_button(message: types.Message, db) -> None:
     )
 
 
-@router.message(lambda m: m.from_user.id in TIME_EDIT_REQUESTS)
-async def time_edit_input(message: types.Message, db) -> None:
+@router.message(lambda m: m.text and not m.text.startswith("/") and m.from_user.id in TIME_EDIT_REQUESTS)
+async def time_edit_input(message: types.Message, db, state: FSMContext | None = None) -> None:
     req = TIME_EDIT_REQUESTS.get(message.from_user.id)
     if not req:
         return
-    kind, _ = req
     raw = message.text.strip()
+    if raw.lower() in {"отмена", "назад"}:
+        TIME_EDIT_REQUESTS.pop(message.from_user.id, None)
+        if state:
+            await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
+    kind, _ = req
     parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts or any(not parse_hhmm(p) for p in parts):
+    parsed = [parse_hhmm(p) for p in parts]
+    if not parts or any(t is None for t in parsed):
         await message.answer(
             texts.error("время в формате HH:MM, например 11:00,16:00."),
         )
         return
+    normalized = ",".join(t.strftime("%H:%M") for t in parsed if t is not None)
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     if kind == "water":
-        await repo.upsert_wellness(db, user["id"], water_times=",".join(parts))
+        await repo.upsert_wellness(db, user["id"], water_times=normalized)
     elif kind == "meal":
-        await repo.upsert_wellness(db, user["id"], meal_times=",".join(parts))
+        await repo.upsert_wellness(db, user["id"], meal_times=normalized)
     TIME_EDIT_REQUESTS.pop(message.from_user.id, None)
+    if state:
+        await state.clear()
     await message.answer("Часы обновлены.", reply_markup=main_menu_keyboard())
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("well:"))
-async def wellness_toggle(callback: types.CallbackQuery, db) -> None:
+async def wellness_toggle(callback: types.CallbackQuery, db, state: FSMContext | None = None) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     row = await repo.get_wellness(db, user["id"])
     current = dict(row) if row else {"water_enabled": 0, "meal_enabled": 0, "focus_mode": 0}
-    action = callback.data.split(":")[1]
+    parts = callback.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
     if action == "water":
         await repo.upsert_wellness(
             db, user["id"], water_enabled=0 if current.get("water_enabled") else 1
@@ -147,6 +190,8 @@ async def wellness_toggle(callback: types.CallbackQuery, db) -> None:
             db, user["id"], focus_mode=0 if current.get("focus_mode") else 1
         )
     elif action == "focus_edit":
+        if state:
+            await state.set_state(WellnessState.focus_edit)
         await callback.message.answer(
             "Введи интервалы через пробел (минуты): работа отдых. Пример: 20 10 или 10 5.",
             reply_markup=None,
@@ -155,6 +200,8 @@ async def wellness_toggle(callback: types.CallbackQuery, db) -> None:
         FOCUS_EDIT_REQUESTS[callback.from_user.id] = callback.message.chat.id
         return
     elif action == "water_times":
+        if state:
+            await state.set_state(WellnessState.time_edit)
         await callback.message.answer(
             "Введи часы для воды через запятую в формате HH:MM, например: 11:00,16:00",
             reply_markup=None,
@@ -163,6 +210,8 @@ async def wellness_toggle(callback: types.CallbackQuery, db) -> None:
         await callback.answer()
         return
     elif action == "meal_times":
+        if state:
+            await state.set_state(WellnessState.time_edit)
         await callback.message.answer(
             "Введи часы для еды через запятую в формате HH:MM, например: 13:00,19:00",
             reply_markup=None,
@@ -170,19 +219,25 @@ async def wellness_toggle(callback: types.CallbackQuery, db) -> None:
         TIME_EDIT_REQUESTS[callback.from_user.id] = ("meal", callback.message.chat.id)
         await callback.answer()
         return
-    elif action.startswith("water_preset"):
-        preset = action.split(":")[-1]
+    elif action == "water_preset":
+        preset = parts[2] if len(parts) > 2 else ""
         times = "11:00" if preset == "1" else "11:00,16:00"
         await repo.upsert_wellness(db, user["id"], water_times=times)
-    elif action.startswith("meal_preset"):
-        preset = action.split(":")[-1]
+    elif action == "meal_preset":
+        preset = parts[2] if len(parts) > 2 else ""
         times = "13:00,19:00" if preset == "2" else "10:00,14:00,19:00"
         await repo.upsert_wellness(db, user["id"], meal_times=times)
+    FOCUS_EDIT_REQUESTS.pop(callback.from_user.id, None)
+    TIME_EDIT_REQUESTS.pop(callback.from_user.id, None)
+    if state:
+        await state.clear()
     updated = await repo.get_wellness(db, user["id"])
-    try:
-        await callback.message.edit_reply_markup(reply_markup=wellness_keyboard(updated))
-    except Exception:
-        pass
+    updated_dict = dict(updated) if updated else {"water_enabled": 0, "meal_enabled": 0, "focus_mode": 0}
+    await safe_edit(
+        callback.message,
+        _wellness_text(updated_dict),
+        reply_markup=wellness_keyboard(updated_dict),
+    )
     await callback.answer("Обновлено")
 
 
@@ -197,7 +252,31 @@ async def focus_mode(message: types.Message, db) -> None:
     row = await repo.get_wellness(db, user["id"])
     current = dict(row) if row else {"focus_mode": 0}
     if not current.get("focus_mode"):
-        await message.answer("Включи режим фокуса в настройках здоровья (кнопка «Вода/Еда/Фокус» в настройках).")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Включить/выключить фокус-таймер",
+                        callback_data="well:focus",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⏱ Сменить интервалы",
+                        callback_data="well:focus_edit",
+                    ),
+                    InlineKeyboardButton(
+                        text="☕ Кафе фокуса",
+                        callback_data="help:cafe",
+                    ),
+                ],
+            ]
+        )
+        await message.answer(
+            "Режим фокуса сейчас выключен.\n"
+            "Включи фокус-таймер прямо здесь или открой «Кафе фокуса»:",
+            reply_markup=kb,
+        )
         return
     work = current.get("focus_work", 20)
     rest = current.get("focus_rest", 10)

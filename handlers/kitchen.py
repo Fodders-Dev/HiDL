@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 RECIPES_FILE = "data/knowledge/recipes_core.json"
 
+from utils.sender import safe_edit
+
 DIET_TAGS = {
     "omnivore": None,
     "vegetarian": {"vegetarian", "vegan"},
@@ -102,6 +104,24 @@ def _recipe_allowed_for_profile(recipe: dict, profile: str) -> bool:
     if allowed is None:
         return True
     return bool(tags.intersection(allowed))
+
+
+def get_quick_recipes(profile: str, limit: int = 3, max_minutes: int = 30) -> List[dict]:
+    """Return up to `limit` quick recipes matching the user's meal profile."""
+    allowed = [r for r in load_recipes() if _recipe_allowed_for_profile(r, profile)]
+    quick = [r for r in allowed if int(r.get("time_minutes") or 999) <= max_minutes]
+    quick.sort(key=lambda r: int(r.get("time_minutes") or 999))
+    return (quick or allowed)[:limit]
+
+
+def _cancel_fsm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="kitchen:cancel_fsm")]]
+    )
+
+
+def _is_cancel_text(text: Optional[str]) -> bool:
+    return (text or "").strip().lower() in {"отмена", "назад"}
 
 
 def _recipe_in_category(recipe: dict, category: str) -> bool:
@@ -234,6 +254,7 @@ def _parse_expires(text: str) -> Tuple[str | None, str | None]:
 # --- KEYBOARDS ---
 def kitchen_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
         [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
         [InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes")],
         [InlineKeyboardButton(text="🛒 Список покупок", callback_data="kitchen:shoplist")],
@@ -243,7 +264,7 @@ def kitchen_main_keyboard() -> InlineKeyboardMarkup:
 def recipes_list_keyboard(recipes: List[dict]) -> InlineKeyboardMarkup:
     rows = []
     for r in recipes:
-        rows.append([InlineKeyboardButton(text=_recipe_button_text(r), callback_data=f"kitchen:cook_view:{r['id']}:1:all:0")])
+        rows.append([InlineKeyboardButton(text=_recipe_button_text(r), callback_data=f"kitchen:cook_view:{r['id']}:2:all:0")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="kitchen:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -263,7 +284,7 @@ def recipes_paged_keyboard(items: List[dict], category: str, page: int, page_siz
     start = page * page_size
     chunk = items[start : start + page_size]
     for r in chunk:
-        rows.append([InlineKeyboardButton(text=_recipe_button_text(r), callback_data=f"kitchen:cook_view:{r['id']}:1:{category}:{page}")])
+        rows.append([InlineKeyboardButton(text=_recipe_button_text(r), callback_data=f"kitchen:cook_view:{r['id']}:2:{category}:{page}")])
 
     nav: list[InlineKeyboardButton] = []
     if page > 0:
@@ -383,23 +404,38 @@ async def finish_shopping(callback: types.CallbackQuery, db):
     await callback.answer(f"Перенесено продуктов: {count}", show_alert=True)
     await _render_shoplist(callback, db, scope=scope)
 
+@router.callback_query(lambda c: c.data == "kitchen:cancel_fsm")
+async def kitchen_cancel_fsm(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit(callback.message, "Отменила.", reply_markup=None)
+    await callback.answer("Отменила.")
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shop_add"))
 async def add_shop_start(callback: types.CallbackQuery, state: FSMContext):
     parts = (callback.data or "").split(":")
     scope = parts[2] if len(parts) > 2 else "household"
     await state.set_state(ShoppingAddState.name)
     await state.update_data(shop_scope=scope)
-    await callback.message.answer("Что нужно купить? (Напиши название)", reply_markup=main_menu_keyboard())
+    await callback.message.answer("Что нужно купить? (Напиши название)", reply_markup=_cancel_fsm_keyboard())
     await callback.answer()
 
-@router.message(ShoppingAddState.name)
+@router.message(ShoppingAddState.name, lambda m: bool(m.text and not m.text.startswith("/")))
 async def add_shop_name(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text)
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
+    await state.update_data(name=message.text.strip())
     await state.set_state(ShoppingAddState.amount)
-    await message.answer("Сколько? (например '1 кг', '2 шт' или просто число)", reply_markup=main_menu_keyboard())
+    await message.answer("Сколько? (например '1 кг', '2 шт' или просто число)", reply_markup=_cancel_fsm_keyboard())
 
-@router.message(ShoppingAddState.amount)
+@router.message(ShoppingAddState.amount, lambda m: bool(m.text and not m.text.startswith("/")))
 async def add_shop_amount(message: types.Message, state: FSMContext, db):
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
     amount, unit = _parse_amount_unit(message.text)
     data = await state.get_data()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -412,6 +448,36 @@ async def add_shop_amount(message: types.Message, state: FSMContext, db):
     await message.answer("Перейти к списку?", reply_markup=kb)
 
 # --- HANDLERS: RECIPES ---
+@router.callback_query(lambda c: c.data == "kitchen:quick_pick")
+async def quick_pick_recipes(callback: types.CallbackQuery, db):
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    profile = await _get_meal_profile(db, user["id"])
+    quick = get_quick_recipes(profile, limit=3, max_minutes=30)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_recipe_button_text(r),
+                callback_data=f"kitchen:cook_view:{r['id']}:2:all:0",
+            )
+        ]
+        for r in quick
+    ]
+    rows.append([InlineKeyboardButton(text="📖 Вся книга рецептов", callback_data="kitchen:recipes")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
+    lines = [f"🍳 <b>Что приготовить быстро (до 30 мин)</b>\nПитание: <b>{_diet_label(profile)}</b>\n"]
+    for r in quick:
+        lines.append(f"• <b>{_h(r.get('title'))}</b> ({int(r.get('time_minutes') or 15)} мин) — {_h(r.get('desc', ''))}")
+    if not quick:
+        lines.append("Подходящих быстрых рецептов не нашлось — посмотри всю книгу.")
+    await safe_edit(
+        callback.message,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @router.callback_query(lambda c: c.data == "kitchen:recipes")
 async def show_recipes(callback: types.CallbackQuery, db):
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
@@ -464,7 +530,7 @@ async def show_recipes_category(callback: types.CallbackQuery, db):
 async def view_recipe(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     rid = parts[2] if len(parts) > 2 else ""
-    servings = _safe_int(parts[3], 1) if len(parts) > 3 else 1
+    servings = _safe_int(parts[3], 2) if len(parts) > 3 else 2
     category = parts[4] if len(parts) > 4 else "all"
     page = _safe_int(parts[5], 0) if len(parts) > 5 else 0
     recipe = get_recipe(rid)
@@ -493,7 +559,14 @@ async def view_recipe(callback: types.CallbackQuery):
             text += "\n…"
 
     serv_row = [
-        InlineKeyboardButton(text=str(i), callback_data=f"kitchen:cook_view:{rid}:{i}:{category}:{page}")
+        InlineKeyboardButton(
+            text=(
+                f"✅ {i}"
+                if i == servings
+                else (f"🍽 {i}" if (i == 2 and servings != 2) or (i == 1 and servings == 2) else str(i))
+            ),
+            callback_data=f"kitchen:cook_view:{rid}:{i}:{category}:{page}",
+        )
         for i in range(1, 6)
     ]
     kb = InlineKeyboardMarkup(
@@ -628,13 +701,11 @@ async def cook_auto_add_shop(callback: types.CallbackQuery, state: FSMContext, d
     await state.clear()
 
 # --- HANDLERS: FRIDGE (Legacy Pantry Logic Wrapper) ---
-@router.callback_query(lambda c: c.data == "kitchen:fridge")
-async def fridge_view(callback: types.CallbackQuery, db):
-    # Reimplemented fridge view below
-    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+async def _build_fridge_payload(db, tg_user_id: int, tg_full_name: str) -> Tuple[str, InlineKeyboardMarkup]:
+    user = await ensure_user(db, tg_user_id, tg_full_name)
     rows_all = await repo.list_pantry_items(db, user["id"])
     items = rows_to_dicts(rows_all)
-    
+
     text = "<b>❄️ Мой холодильник</b>\n"
     if not items:
         text += (
@@ -642,25 +713,35 @@ async def fridge_view(callback: types.CallbackQuery, db):
             "Если не хочется думать — я могу собрать базовый минимум в список покупок."
         )
     else:
-        # Group by category
         cats = {}
         for i in items:
             c = i.get("category", "прочее")
-            if c not in cats: cats[c] = []
-            cats[c].append(i)
-            
+            cats.setdefault(c, []).append(i)
+
         for c, c_items in cats.items():
             text += f"\n<b>{_h((c or '').capitalize())}</b>:\n"
             for i in c_items:
                 low = " ⚠️" if is_low(i) else ""
                 text += f"• {_h(i.get('name',''))} — {format_quantity(i['amount'], i['unit'])}{low}\n"
-                
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить продукт", callback_data="kitchen:fridge_add")],
         [InlineKeyboardButton(text="🗑 Удалить что-то", callback_data="kitchen:fridge_del_view")],
         [InlineKeyboardButton(text="🧺 Базовый минимум в покупки", callback_data="kitchen:shop_min:add")],
         [InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")]
     ])
+    return text, kb
+
+
+async def send_fridge(message: types.Message, db) -> None:
+    """Открыть холодильник из обычного сообщения (/pantry)."""
+    text, kb = await _build_fridge_payload(db, message.from_user.id, message.from_user.full_name)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data == "kitchen:fridge")
+async def fridge_view(callback: types.CallbackQuery, db):
+    text, kb = await _build_fridge_payload(db, callback.from_user.id, callback.from_user.full_name)
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
@@ -745,17 +826,25 @@ async def add_minimum_shoplist(callback: types.CallbackQuery, db):
 @router.callback_query(lambda c: c.data == "kitchen:fridge_add")
 async def fridge_add_start(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(PantryAddState.name)
-    await callback.message.answer("Напиши название продукта:", reply_markup=main_menu_keyboard())
+    await callback.message.answer("Напиши название продукта:", reply_markup=_cancel_fsm_keyboard())
     await callback.answer()
 
-@router.message(PantryAddState.name)
+@router.message(PantryAddState.name, lambda m: bool(m.text and not m.text.startswith("/")))
 async def fridge_add_name_handler(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text)
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
+    await state.update_data(name=message.text.strip())
     await state.set_state(PantryAddState.amount)
-    await message.answer("Сколько? (например '1 кг')", reply_markup=main_menu_keyboard())
+    await message.answer("Сколько? (например '1 кг')", reply_markup=_cancel_fsm_keyboard())
 
-@router.message(PantryAddState.amount)
+@router.message(PantryAddState.amount, lambda m: bool(m.text and not m.text.startswith("/")))
 async def fridge_add_amount_handler(message: types.Message, state: FSMContext):
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
     amt, unit = _parse_amount_unit(message.text)
     await state.update_data(amount=amt, unit=unit)
     await state.set_state(PantryAddState.category)

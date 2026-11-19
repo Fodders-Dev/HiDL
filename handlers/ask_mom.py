@@ -1,4 +1,6 @@
 import datetime
+import html
+import re
 
 from aiogram import Router, types
 from aiogram.filters import Command, StateFilter
@@ -6,11 +8,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+import llm_client
 from utils.menu_match import match_menu_label
 from utils.mom_tips import pick_tip, find_tip_by_tag, get_tip
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.nl_parser import parse_command
+from utils.sender import safe_edit
 from utils.time import local_date_str
 from utils.tone import tone_message, tone_ack
 from services.knowledge import get_knowledge_service
@@ -87,6 +91,10 @@ class AskMomCook(StatesGroup):
     profile = State()
 
 
+class AskMomFree(StatesGroup):
+    question = State()
+
+
 def ask_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -118,30 +126,52 @@ async def start_cook_flow(message: types.Message, state: FSMContext) -> None:
     )
 
 
+_ASK_STOP_WORDS = {
+    "как", "что", "где", "когда", "почему", "зачем", "кто", "чем", "можно", "ли",
+    "надо", "нужно", "если", "или", "для", "про", "при", "без", "под", "над",
+    "через", "после", "мне", "меня", "мой", "моя", "моё", "мои", "это", "тут",
+    "уже", "ещё", "еще", "очень", "просто", "быстро", "помоги", "подскажи",
+}
+
+
+def _find_best_mom_tip(question: str) -> dict | None:
+    tokens = [
+        tok
+        for tok in re.findall(r"[а-яёa-z0-9-]+", (question or "").lower())
+        if len(tok) >= 4 and tok not in _ASK_STOP_WORDS
+    ]
+    if not tokens:
+        return None
+    return find_tip_by_tag(" ".join(tokens))
+
+
 @router.message(Command("ask_mom"))
 @router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"спросить маму", "спроси маму"}))
 async def ask_mom_entry(message: types.Message, state: FSMContext) -> None:
     await state.clear()
-    # попробовать разобрать как естественную команду (NL)
-    parsed = parse_command(message.text or "")
-    if parsed and parsed.type == "ask":
-        await handle_question(message, parsed.payload.get("question") or message.text)
+    raw = (message.text or "").strip()
+    if match_menu_label(raw, {"спросить маму", "спроси маму"}):
+        text = ""
+    else:
+        text = re.sub(r"^/ask_mom(?:@\S+)?", "", raw, flags=re.IGNORECASE).strip()
+
+    if not text:
+        await message.answer(
+            "Мама на связи. Я могу подсказать по быту или просто поддержать. Выбери тему:",
+            reply_markup=ask_menu_keyboard(),
+        )
         return
-    # если пользователь задал вопрос текстом сразу после команды
-    text = message.text.replace("/ask_mom", "").strip()
-    if text:
-        tip = find_tip_by_tag(text)
-        if tip:
-            await message.answer(_tip_to_text(tip), reply_markup=_tip_actions_kb(tip.get("id")))
-            return
-    await message.answer(
-        "Мама на связи. Я могу подсказать по быту (отстирать пятно, сварить яйцо), или просто поддержать. Выбери тему:",
-        reply_markup=ask_menu_keyboard(),
-    )
+
+    tip = _find_best_mom_tip(text)
+    if tip:
+        await message.answer(_tip_to_text(tip), reply_markup=_tip_actions_kb(tip.get("id")))
+        return
+    await handle_question(message, text)
 
 
 def _tip_to_text(tip: dict) -> str:
-    lines = [f"{tip.get('title','Совет')}:"] + [f"• {b}" for b in tip.get("body", [])]
+    items = tip.get("body") or tip.get("tips") or []
+    lines = [f"{tip.get('title','Совет')}:"] + [f"• {b}" for b in items]
     return "\n".join(lines)
 
 
@@ -184,21 +214,22 @@ async def ask_make_reminder(callback: types.CallbackQuery, db) -> None:
 
 
 async def handle_question(message: types.Message, question: str) -> None:
-    tip = find_tip_by_tag(question) or EXTRA_TIPS.get("laundry_symbols") if "знач" in question.lower() else None
+    q_low = (question or "").lower()
+    tip = _find_best_mom_tip(question) or (EXTRA_TIPS.get("laundry_symbols") if "знач" in q_low else None)
     if not tip:
         # дополнительные словари
         for key in ("laundry_drawer", "low_energy"):
-            if key in question.lower():
+            if key in q_low:
                 tip = EXTRA_TIPS[key]
                 break
     if not tip:
         for tag, manual_tip in EXTRA_TIPS.items():
-            if tag in question.lower():
+            if tag in q_low:
                 tip = manual_tip
                 break
-    if not tip and "сил" in question.lower():
+    if not tip and "сил" in q_low:
         tip = EXTRA_TIPS["low_energy"]
-    
+
     # Попробуем найти в Базе Знаний
     if not tip:
         ks = get_knowledge_service()
@@ -206,16 +237,31 @@ async def handle_question(message: types.Message, question: str) -> None:
         if kb_results:
             await message.answer(kb_results[0], reply_markup=ask_menu_keyboard())
             return
-    
+
     if tip:
-        lines = [f"{tip.get('title','Совет')}:"]
-        lines += [f"• {b}" for b in tip.get("body", [])]
-        await message.answer("\n".join(lines), reply_markup=ask_menu_keyboard())
-    else:
-        await message.answer(
-            "Поняла вопрос, пока нет точной карточки. Давай выберем тему, чтобы подсказать быстрее:",
-            reply_markup=ask_menu_keyboard(),
+        await message.answer(_tip_to_text(tip), reply_markup=ask_menu_keyboard())
+        return
+
+    if llm_client.client.is_configured():
+        sys_prompt = (
+            "Ты — тёплая, практичная помощница в разделе «Спроси маму» (HiDL). "
+            "Отвечай по-русски в женском роде, бережно и конкретно, без медицинских диагнозов. "
+            "Дай короткий ответ: не больше 5 коротких строк с понятным следующим шагом."
         )
+        res = await llm_client.client.complete_text(
+            sys_prompt,
+            question,
+            temperature=0.3,
+            max_tokens=300,
+        )
+        if res.ok and (res.text or "").strip():
+            await message.answer(html.escape(res.text.strip()), reply_markup=ask_menu_keyboard())
+            return
+
+    await message.answer(
+        "Поняла вопрос, пока нет точной карточки. Давай выберем тему, чтобы подсказать быстрее:",
+        reply_markup=ask_menu_keyboard(),
+    )
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("ask:start"))
@@ -280,9 +326,36 @@ async def ask_start(callback: types.CallbackQuery, state: FSMContext) -> None:
         else:
             await send_tip(callback.message, "health")
     elif kind == "free":
-        await state.clear()
-        await callback.message.answer("Напиши свой вопрос текстом. Я отвечу по ситуации.", reply_markup=main_menu_keyboard())
+        await state.set_state(AskMomFree.question)
+        await callback.message.answer(
+            "Напиши свой вопрос текстом — помогу разобрать шаг за шагом.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="ask:cancel")]]
+            ),
+        )
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data == "ask:cancel")
+async def ask_cancel(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await safe_edit(
+        callback.message,
+        "Мама на связи. Я могу подсказать по быту или просто поддержать. Выбери тему:",
+        reply_markup=ask_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(AskMomFree.question, lambda m: m.text and not m.text.startswith("/"))
+async def ask_free_question_input(message: types.Message, state: FSMContext) -> None:
+    q = (message.text or "").strip()
+    if q.lower() in {"отмена", "отменить", "назад"}:
+        await state.clear()
+        await message.answer("Отменила. Если что — я рядом.", reply_markup=main_menu_keyboard())
+        return
+    await state.clear()
+    await handle_question(message, q)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("ask:odor:"))
@@ -416,11 +489,16 @@ async def send_tip(message: types.Message, category: str, tip_id: str | None = N
     await message.answer("\n".join(lines), reply_markup=kb)
 
 
-@router.message(AskMomCook.ingredients)
+@router.message(AskMomCook.ingredients, lambda m: m.text and not m.text.startswith("/"))
 async def ask_cook(message: types.Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    if raw.lower() in {"отмена", "отменить"}:
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
     data = await state.get_data()
     profile = data.get("profile", "omnivore")
-    suggestion = cook_suggestion(message.text, profile=profile)
+    suggestion = cook_suggestion(raw, profile=profile)
     await state.clear()
     await message.answer(suggestion, reply_markup=main_menu_keyboard())
 

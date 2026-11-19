@@ -43,6 +43,20 @@ class SpendState(StatesGroup):
     payday_budget = State()
 
 
+def _cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="money:cancel")]]
+    )
+
+
+async def _handle_cancel(message: types.Message, state: FSMContext) -> bool:
+    if (message.text or "").strip().lower() in {"отмена", "назад"}:
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return True
+    return False
+
+
 @router.message(Command("budget"))
 async def budget_info(message: types.Message) -> None:
     await message.answer(
@@ -246,6 +260,7 @@ async def tone_select(message: types.Message, db) -> None:
             ]
         ),
     )
+@router.message(Command("finance"))
 @router.message(lambda m: match_menu_label(m.text, {"деньги", "финансы"}))
 async def money_menu_entry(message: types.Message, state: FSMContext, db) -> None:
     await _ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -272,9 +287,21 @@ async def money_menu_entry(message: types.Message, state: FSMContext, db) -> Non
 async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     action = callback.data.split(":")[1]
+    if action == "cancel":
+        await state.clear()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await callback.answer("Отменила.")
+        return
     if action == "spent":
         await state.set_state(SpendState.amount)
-        await callback.message.answer("Сколько ушло? Напиши сумму, или сразу сумму и категорию (например «500 еда»).")
+        await callback.message.answer(
+            "Сколько ушло? Напиши сумму, или сразу сумму и категорию (например «500 еда»).",
+            reply_markup=_cancel_kb(),
+        )
     elif action == "report":
         user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         text = await _compose_spent_week(db, user)
@@ -315,7 +342,8 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         await state.set_state(SpendState.payday_day)
         await callback.message.answer(
             "Какого числа обычно приходит зарплата? Введи число 1–31. "
-            "Сразу после этого спрошу бюджет на еду/быт до следующей выплаты."
+            "Сразу после этого спрошу бюджет на еду/быт до следующей выплаты.",
+            reply_markup=_cancel_kb(),
         )
     elif action == "tips":
         tips_text = (
@@ -356,18 +384,20 @@ async def limit_cat(callback: types.CallbackQuery, state: FSMContext, db) -> Non
     await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     await state.update_data(limit_category=cat)
     await state.set_state(SpendState.category)
-    await callback.message.answer(f"Лимит для {cat}: введи сумму в месяц (₽).", reply_markup=main_menu_keyboard())
+    await callback.message.answer(f"Лимит для {cat}: введи сумму в месяц (₽).", reply_markup=_cancel_kb())
     await callback.answer()
 
 
-@router.message(SpendState.amount)
+@router.message(SpendState.amount, lambda m: bool(m.text and not m.text.startswith("/")))
 async def spend_amount(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     text = message.text.strip()
     parts = text.split(maxsplit=1)
     try:
         amount = float(parts[0])
     except Exception:
-        await message.answer("Введи сумму числом. Пример: 1000 или 1000 еда")
+        await message.answer("Введи сумму числом. Пример: 1000 или 1000 еда", reply_markup=_cancel_kb())
         return
     if len(parts) > 1:
         category = parts[1]
@@ -378,11 +408,13 @@ async def spend_amount(message: types.Message, state: FSMContext, db) -> None:
     else:
         await state.update_data(amount=amount)
         await state.set_state(SpendState.category)
-        await message.answer("На что потратил? Пример: еда, транспорт, вкусвилл.")
+        await message.answer("На что потратил? Пример: еда, транспорт, вкусвилл.", reply_markup=_cancel_kb())
 
 
-@router.message(SpendState.category)
+@router.message(SpendState.category, lambda m: bool(m.text and not m.text.startswith("/")))
 async def spend_category(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     data = await state.get_data()
     amount = data.get("amount")
     category = message.text.strip()
@@ -396,6 +428,7 @@ async def spend_category(message: types.Message, state: FSMContext, db) -> None:
 
             await message.answer(
                 texts.error("лимит должен быть числом, например 15000"),
+                reply_markup=_cancel_kb(),
             )
             return
         limit_cat_name = data.get("limit_category", "другое")
@@ -408,8 +441,10 @@ async def spend_category(message: types.Message, state: FSMContext, db) -> None:
     await message.answer(f"Записала: {amount:.0f} ({category})", reply_markup=main_menu_keyboard())
 
 
-@router.message(SpendState.payday_day)
+@router.message(SpendState.payday_day, lambda m: bool(m.text and not m.text.startswith("/")))
 async def payday_day_set(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     try:
         day = int(message.text.strip())
         if day < 1 or day > 31:
@@ -419,15 +454,18 @@ async def payday_day_set(message: types.Message, state: FSMContext, db) -> None:
 
         await message.answer(
             texts.error("день должен быть от 1 до 31. Попробуй ещё раз."),
+            reply_markup=_cancel_kb(),
         )
         return
     await state.update_data(payday_day=day)
     await state.set_state(SpendState.payday_budget)
-    await message.answer("Какой бюджет на еду/быт до следующей зарплаты? Введи сумму в ₽.")
+    await message.answer("Какой бюджет на еду/быт до следующей зарплаты? Введи сумму в ₽.", reply_markup=_cancel_kb())
 
 
-@router.message(SpendState.payday_budget)
+@router.message(SpendState.payday_budget, lambda m: bool(m.text and not m.text.startswith("/")))
 async def payday_budget_set(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     data = await state.get_data()
     day = data.get("payday_day", 1)
     try:
@@ -439,6 +477,7 @@ async def payday_budget_set(message: types.Message, state: FSMContext, db) -> No
 
         await message.answer(
             texts.error("нужно неотрицательное число. Введи сумму в ₽."),
+            reply_markup=_cancel_kb(),
         )
         return
     user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -504,37 +543,43 @@ async def bills_menu(message: types.Message, state: FSMContext, db) -> None:
 async def bill_add(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     await state.set_state(SpendState.bill_title)
-    await callback.message.answer("Как называется платёж? Например: ЖКХ, Интернет, Мобила.", reply_markup=main_menu_keyboard())
+    await callback.message.answer("Как называется платёж? Например: ЖКХ, Интернет, Мобила.", reply_markup=_cancel_kb())
     await callback.answer()
 
 
-@router.message(SpendState.bill_title)
+@router.message(SpendState.bill_title, lambda m: bool(m.text and not m.text.startswith("/")))
 async def bill_set_title(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     await state.update_data(bill_title=message.text.strip())
     await state.set_state(SpendState.bill_amount)
-    await message.answer("Примерная сумма (₽)?", reply_markup=main_menu_keyboard())
+    await message.answer("Примерная сумма (₽)?", reply_markup=_cancel_kb())
 
 
-@router.message(SpendState.bill_amount)
+@router.message(SpendState.bill_amount, lambda m: bool(m.text and not m.text.startswith("/")))
 async def bill_set_amount(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     try:
         amount = float(message.text.strip().replace(",", "."))
     except Exception:
-        await message.answer("Сумма должна быть числом. Попробуй ещё раз.")
+        await message.answer("Сумма должна быть числом. Попробуй ещё раз.", reply_markup=_cancel_kb())
         return
     await state.update_data(bill_amount=amount)
     await state.set_state(SpendState.bill_day)
-    await message.answer("В какой день месяца платить? (1–28)", reply_markup=main_menu_keyboard())
+    await message.answer("В какой день месяца платить? (1–28)", reply_markup=_cancel_kb())
 
 
-@router.message(SpendState.bill_day)
+@router.message(SpendState.bill_day, lambda m: bool(m.text and not m.text.startswith("/")))
 async def bill_set_day(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     try:
         day = int(message.text.strip())
         if day < 1 or day > 28:
             raise ValueError
     except Exception:
-        await message.answer("День должен быть от 1 до 28, чтобы не промахиваться с месяцами.")
+        await message.answer("День должен быть от 1 до 28, чтобы не промахиваться с месяцами.", reply_markup=_cancel_kb())
         return
     data = await state.get_data()
     title = data.get("bill_title", "Счёт")

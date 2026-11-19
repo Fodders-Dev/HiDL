@@ -21,12 +21,15 @@ from services.inbox_parser import (
     compute_one_time_last_sent,
 )
 from utils.pantry import format_quantity
+from utils.rows import rows_to_dicts
 from utils.time import format_date_display, local_date_str
 
 KIND_LABELS = {
     "task": ("✅", "Задача"),
     "reminder": ("🔔", "Напоминание"),
     "shopping": ("🛒", "Покупки"),
+    "shopping_remove": ("🗑", "Убрано из покупок"),
+    "expense": ("💸", "Трата"),
     "diary": ("📓", "Дневник"),
     "idea": ("💡", "Идея"),
     "done": ("✔", "Сделано"),
@@ -67,6 +70,14 @@ def _load_payload(action: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
+def _format_amount(amount: Any) -> str:
+    try:
+        val = float(amount)
+    except (TypeError, ValueError):
+        return str(amount or 0)
+    return str(int(val)) if val.is_integer() else f"{val:g}"
+
+
 def _format_action_line(action: dict[str, Any]) -> str:
     kind = action.get("item_kind") or "diary"
     icon, label = KIND_LABELS.get(kind, ("📝", "Запись"))
@@ -82,6 +93,14 @@ def _format_action_line(action: dict[str, Any]) -> str:
         qty = payload.get("quantity", 1)
         unit = payload.get("unit", "шт")
         return f"{icon} {label}: {title} ({_esc(format_quantity(qty, unit))})"
+    if kind == "expense":
+        amt_str = _format_amount(payload.get("amount", 0))
+        cat = _esc(payload.get("category") or action.get("title") or "другое")
+        return f"💸 Трата: {amt_str} ₽ ({cat})"
+    if kind == "shopping_remove":
+        if action.get("status") == "skipped" or payload.get("not_found"):
+            return f"ℹ️ Не нашла «{title}» в покупках"
+        return f"🗑 Убрала из покупок: {title}"
     return f"{icon} {label}: {title}"
 
 
@@ -90,6 +109,7 @@ def build_inbox_keyboard(
     actions: list[dict[str, Any]],
     *,
     llm_error: Optional[str] = None,
+    intent: str = "capture",
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     clarifying = [a for a in actions if a.get("status") == "clarifying"]
@@ -130,6 +150,14 @@ def build_inbox_keyboard(
             ]
         )
 
+    if intent == "support":
+        rows.append(
+            [
+                InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu"),
+                InlineKeyboardButton(text="😴 Режим сна", callback_data="sleep:menu:main"),
+            ]
+        )
+
     active_or_clar = [a for a in actions if a.get("status") in {"active", "clarifying"}]
     ctrl_row: list[InlineKeyboardButton] = []
     if active_or_clar:
@@ -143,25 +171,51 @@ def build_inbox_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _voice_prefix_line(inbox_row: dict[str, Any]) -> str:
+    if inbox_row.get("source") == "voice" and inbox_row.get("raw_text"):
+        quote = inbox_row["raw_text"].strip()
+        if len(quote) > 160:
+            quote = quote[:157] + "..."
+        return f"🎙 Расшифровала: «{_esc(quote)}»"
+    return ""
+
+
 def render_inbox_summary(
     inbox_row: dict[str, Any],
     actions: list[dict[str, Any]],
     *,
     llm_error: Optional[str] = None,
+    intent: str = "capture",
+    support_reply: str = "",
 ) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     lines: list[str] = []
-    if inbox_row.get("source") == "voice" and inbox_row.get("raw_text"):
-        quote = inbox_row["raw_text"].strip()
-        if len(quote) > 160:
-            quote = quote[:157] + "..."
-        lines.append(f"🎙 Расшифровала: «{_esc(quote)}»")
+    voice_line = _voice_prefix_line(inbox_row)
+    if voice_line:
+        lines.append(voice_line)
 
     active = [a for a in actions if a.get("status") == "active"]
     clarifying = [a for a in actions if a.get("status") == "clarifying"]
+    skipped = [a for a in actions if a.get("status") == "skipped"]
 
-    if active:
-        lines.append("Записала:")
-        for act in active:
+    if intent == "support":
+        warm = _esc(support_reply.strip()) if support_reply.strip() else (
+            "Я рядом. Если тревожно или тяжело уснуть, не обязательно решать всё прямо сейчас — "
+            "сделай спокойный выдох и дай себе немного бережности."
+        )
+        lines.append(warm)
+        if active:
+            if len(active) == 1 and active[0].get("item_kind") == "diary":
+                lines.append("Бережно сохранила мысль в 📓 Дневник.")
+            else:
+                lines.append("Бережно сохранила:")
+                for act in active:
+                    lines.append(_format_action_line(act))
+    elif active or skipped:
+        if active:
+            lines.append("Записала:")
+            for act in active:
+                lines.append(_format_action_line(act))
+        for act in skipped:
             lines.append(_format_action_line(act))
     elif not clarifying:
         lines.append("Запись сохранена, активных пунктов сейчас нет.")
@@ -175,7 +229,12 @@ def render_inbox_summary(
         question = _esc(first_payload.get("question") or "Уточни дату и время.")
         lines.append(f"❓ Напоминание «{title}»: {question}")
 
-    kb = build_inbox_keyboard(inbox_row["id"], actions, llm_error=llm_error)
+    kb = build_inbox_keyboard(
+        inbox_row["id"],
+        actions,
+        llm_error=llm_error,
+        intent=intent,
+    )
     return "\n".join(lines), (kb if kb.inline_keyboard else None)
 
 
@@ -236,6 +295,79 @@ async def _persist_parsed_items(
                 payload={"quantity": item.quantity, "unit": item.unit, "model_note": item.model_note},
                 status="active",
             )
+        elif kind == "expense":
+            amt = float(item.amount or 0.0)
+            cat = (item.category or item.title or "другое").strip().lower()
+            if amt > 0:
+                exp_id = await repo.add_expense(db, user["id"], amt, cat)
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="expense",
+                    target_table="expenses",
+                    target_id=exp_id,
+                    title=item.title or cat.capitalize(),
+                    source_quote=item.source_quote,
+                    payload={"amount": amt, "category": cat, "model_note": item.model_note},
+                    status="active",
+                )
+            else:
+                entry_id = await repo.create_journal_entry(
+                    db,
+                    user_id=user["id"],
+                    entry_type="diary",
+                    entry_date=local_date,
+                    source=source,
+                    user_text=item.source_quote,
+                    title=item.title,
+                    model_note=item.model_note,
+                    tags=item.tags,
+                    inbox_message_id=inbox_id,
+                )
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="diary",
+                    target_table="journal_entries",
+                    target_id=entry_id,
+                    title=item.title,
+                    source_quote=item.source_quote,
+                    payload={"model_note": item.model_note, "tags": item.tags},
+                    status="active",
+                )
+        elif kind == "shopping_remove":
+            removed = await repo.find_and_delete_shopping_item_by_name(
+                db, user["id"], item.title or item.source_quote, scope="household"
+            )
+            if removed:
+                removed_name = str(removed.get("item_name") or item.title)
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="shopping_remove",
+                    target_table="shopping_list_removed",
+                    target_id=int(removed["id"]) if removed.get("id") else None,
+                    title=removed_name,
+                    source_quote=item.source_quote,
+                    payload={"removed_item": dict(removed), "model_note": item.model_note},
+                    status="active",
+                )
+            else:
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="shopping_remove",
+                    target_table="shopping_list_removed",
+                    target_id=None,
+                    title=item.title,
+                    source_quote=item.source_quote,
+                    payload={"not_found": True, "model_note": item.model_note},
+                    status="skipped",
+                )
         elif kind == "reminder":
             sched = item.schedule
             if sched and not sched.is_ambiguous and sched.resolved_date and sched.resolved_time:
@@ -323,6 +455,121 @@ async def _persist_parsed_items(
     return actions, clarifications
 
 
+async def _build_query_response(
+    db,
+    user: dict[str, Any],
+    parsed: InboxParseResult,
+    raw_text: str,
+) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    qt = parsed.query_type
+    if qt == "today":
+        from utils.today import render_today
+
+        return await render_today(db, user)
+
+    if qt == "shopping":
+        from handlers import kitchen
+
+        items = rows_to_dicts(await repo.list_shopping_items(db, user["id"], scope="household"))
+        if not items:
+            text = "🛒 <b>Список покупок</b>\nПока пусто. Можешь просто написать или надиктовать, что купить."
+        else:
+            bought_cnt = sum(1 for i in items if i.get("is_bought"))
+            lines = [f"🛒 <b>Список покупок</b> (всего: {len(items)}, отмечено: {bought_cnt}):"]
+            for idx, it in enumerate(items[:15], 1):
+                mark = "✅" if it.get("is_bought") else "⭕️"
+                lines.append(
+                    f"{idx}. {mark} {_esc(it['item_name'])} ({_esc(format_quantity(it.get('quantity'), it.get('unit')))})"
+                )
+            text = "\n".join(lines)
+        return text, kitchen.shopping_list_keyboard(items, scope="household")
+
+    if qt == "food":
+        from handlers import kitchen
+
+        profile = await kitchen._get_meal_profile(db, user["id"])
+        fast_recipes = [
+            r
+            for r in kitchen.load_recipes()
+            if kitchen._recipe_allowed_for_profile(r, profile) and int(r.get("time_minutes") or 999) <= 30
+        ]
+        q_lower = (raw_text or "").lower()
+        tag_pref = (
+            "breakfast" if "завтрак" in q_lower
+            else "lunch" if "обед" in q_lower
+            else "dinner" if "ужин" in q_lower
+            else None
+        )
+        if tag_pref:
+            pref = [r for r in fast_recipes if tag_pref in (r.get("tags") or [])]
+            rest = [r for r in fast_recipes if tag_pref not in (r.get("tags") or [])]
+            candidates = (pref + rest)[:3]
+        else:
+            candidates = fast_recipes[:3]
+
+        btn_rows: list[list[InlineKeyboardButton]] = []
+        if candidates:
+            lines = ["🍳 <b>Быстрые варианты (до 30 мин):</b>"]
+            for idx, r in enumerate(candidates, 1):
+                t = int(r.get("time_minutes") or 0)
+                desc = (r.get("desc") or "").strip()
+                line = f"{idx}. <b>{_esc(r.get('title'))}</b> · {t} мин"
+                if desc:
+                    line += f" — {_esc(desc)}"
+                lines.append(line)
+                btn_rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"🍳 {r.get('title', 'Рецепт')} · {t}м",
+                            callback_data=f"kitchen:cook_view:{r['id']}:2:all:0",
+                        )
+                    ]
+                )
+            text = "\n".join(lines)
+        else:
+            text = "🍳 Подходящих быстрых рецептов не нашлось — загляни во все рецепты."
+        btn_rows.append([InlineKeyboardButton(text="📖 Все рецепты", callback_data="kitchen:recipes")])
+        btn_rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")])
+        return text, InlineKeyboardMarkup(inline_keyboard=btn_rows)
+
+    if qt == "diary":
+        term = (parsed.query_term or "").strip()
+        notes = await repo.search_user_notes(db, user["id"], term, limit=8)
+        header = (
+            f"🔍 <b>Нашла по запросу «{_esc(term)}»:</b>"
+            if term
+            else "📓 <b>Последние записи дневника:</b>"
+        )
+        lines = [header]
+        if not notes:
+            lines.append("Пока ничего похожего не нашла.")
+        else:
+            for idx, item in enumerate(notes, 1):
+                d = format_date_display(item.get("entry_date") or "")
+                src_icon = "🎙" if item.get("source") == "voice" else "💬"
+                txt = (item.get("user_text") or item.get("title") or "").strip()
+                if len(txt) > 160:
+                    txt = txt[:157] + "..."
+                lines.append(f"{idx}. {d} {src_icon} {_esc(txt)}")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📓 Открыть дневник", callback_data="diary:tab:diary")],
+                [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
+            ]
+        )
+        return "\n".join(lines), kb
+
+    fallback_reply = _esc(parsed.reply_text) if parsed.reply_text else (
+        "Не совсем поняла, где искать. Могу открыть план на сегодня или дневник."
+    )
+    return fallback_reply, InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📓 Открыть дневник", callback_data="diary:tab:diary")],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
+        ]
+    )
+
+
 async def _analyze_and_persist(
     db,
     user: dict[str, Any],
@@ -340,25 +587,87 @@ async def _analyze_and_persist(
         llm_client_instance=llm_client_instance,
     )
 
+    inbox_id = int(inbox_row["id"])
+
+    if parsed.intent == "query":
+        await repo.update_inbox_message(
+            db,
+            inbox_id,
+            status="answered",
+            llm_provider=parsed.llm_provider,
+            llm_model=parsed.llm_model,
+            llm_raw_json=parsed.llm_raw_json,
+            llm_error=parsed.llm_error or "",
+        )
+        updated_row = await repo.get_inbox_message(db, user["id"], inbox_id) or inbox_row
+        body_text, reply_markup = await _build_query_response(db, user, parsed, raw_text)
+        voice_line = _voice_prefix_line(updated_row)
+        reply_text = f"{voice_line}\n\n{body_text}" if voice_line else body_text
+        return InboxProcessOutcome(
+            inbox_id=inbox_id,
+            status="answered",
+            is_duplicate=False,
+            source=updated_row.get("source") or "text",
+            raw_text=raw_text,
+            actions=[],
+            clarifications=[],
+            llm_error=parsed.llm_error,
+            used_llm=parsed.used_llm,
+            reply_text=reply_text,
+            reply_markup=reply_markup,
+        )
+
+    if parsed.intent == "chat" and not parsed.items:
+        await repo.update_inbox_message(
+            db,
+            inbox_id,
+            status="replied",
+            llm_provider=parsed.llm_provider,
+            llm_model=parsed.llm_model,
+            llm_raw_json=parsed.llm_raw_json,
+            llm_error=parsed.llm_error or "",
+        )
+        updated_row = await repo.get_inbox_message(db, user["id"], inbox_id) or inbox_row
+        chat_msg = _esc(parsed.reply_text or "На связи! Напиши или надиктуй, что сделать или записать.")
+        voice_line = _voice_prefix_line(updated_row)
+        reply_text = f"{voice_line}\n\n{chat_msg}" if voice_line else chat_msg
+        return InboxProcessOutcome(
+            inbox_id=inbox_id,
+            status="replied",
+            is_duplicate=False,
+            source=updated_row.get("source") or "text",
+            raw_text=raw_text,
+            actions=[],
+            clarifications=[],
+            llm_error=parsed.llm_error,
+            used_llm=parsed.used_llm,
+            reply_text=reply_text,
+            reply_markup=None,
+        )
+
     actions, clarifications = await _persist_parsed_items(
         db, user, inbox_row, parsed, local_date
     )
     new_status = "needs_clarification" if clarifications else "processed"
     await repo.update_inbox_message(
         db,
-        int(inbox_row["id"]),
+        inbox_id,
         status=new_status,
         llm_provider=parsed.llm_provider,
         llm_model=parsed.llm_model,
         llm_raw_json=parsed.llm_raw_json,
         llm_error=parsed.llm_error or "",
     )
-    updated_row = await repo.get_inbox_message(db, user["id"], int(inbox_row["id"])) or inbox_row
+    updated_row = await repo.get_inbox_message(db, user["id"], inbox_id) or inbox_row
     reply_text, reply_markup = render_inbox_summary(
-        updated_row, actions, llm_error=parsed.llm_error
+        updated_row,
+        actions,
+        llm_error=parsed.llm_error,
+        intent=parsed.intent,
+        support_reply=parsed.reply_text,
     )
     return InboxProcessOutcome(
-        inbox_id=int(inbox_row["id"]),
+        inbox_id=inbox_id,
         status=new_status,
         is_duplicate=False,
         source=updated_row.get("source") or "text",
@@ -569,6 +878,22 @@ async def capture_and_process_voice(
 
 async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> None:
     table = action.get("target_table")
+    if table == "shopping_list_removed":
+        if action.get("status") == "skipped":
+            return
+        payload = _load_payload(action)
+        removed = payload.get("removed_item")
+        if isinstance(removed, dict) and removed.get("item_name"):
+            await repo.create_shopping_item(
+                db,
+                user_id,
+                str(removed["item_name"]),
+                qty=float(removed.get("quantity") or 1.0),
+                unit=str(removed.get("unit") or "шт"),
+                category=str(removed.get("category") or "food"),
+                scope=str(removed.get("scope") or "household"),
+            )
+        return
     tid = action.get("target_id")
     if not tid:
         return
@@ -581,6 +906,8 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
         await repo.delete_custom_reminder(db, user_id, tid_int)
     elif table == "journal_entries":
         await repo.delete_journal_entry(db, user_id, tid_int, hard=False)
+    elif table == "expenses":
+        await repo.delete_expense(db, user_id, tid_int)
 
 
 async def undo_inbox_message(db, user: dict[str, Any], inbox_id: int) -> int:

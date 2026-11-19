@@ -9,6 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
+from keyboards.common import main_menu_keyboard
 from utils.time import parse_hhmm, local_date_str
 from utils.texts import error
 from utils.user import ensure_user
@@ -56,6 +57,23 @@ def _sleep_menu_keyboard(enabled: bool, origin: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _sleep_cancel_keyboard(origin: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"sleep:menu:{origin}")]
+        ]
+    )
+
+
+async def _handle_sleep_cancel(message: types.Message, state: FSMContext) -> bool:
+    """Сбросить FSM режима сна при текстовой отмене."""
+    if (message.text or "").strip().lower() in {"отмена", "назад"}:
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return True
+    return False
+
+
 async def _render_sleep_menu(
     message: types.Message,
     db,
@@ -74,13 +92,10 @@ async def _render_sleep_menu(
 @router.message(Command("sleep"))
 async def sleep_menu_command(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
-    await _render_sleep_menu(
-        message,
-        db,
-        origin="main",
-        tg_user_id=message.from_user.id,
-        tg_full_name=message.from_user.full_name,
-    )
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    text = _sleep_menu_text(user)
+    kb = _sleep_menu_keyboard(bool(user.get("sleep_mode_enabled")), origin="main")
+    await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("sleep:menu"))
@@ -104,7 +119,10 @@ async def sleep_setup_callback(callback: types.CallbackQuery, state: FSMContext)
     origin = parts[2] if len(parts) > 2 else "main"
     await state.update_data(sleep_origin=origin)
     await state.set_state(SleepModeState.target_sleep)
-    await callback.message.answer("Во сколько хочешь засыпать? Формат HH:MM.")
+    await callback.message.answer(
+        "Во сколько хочешь засыпать? Формат HH:MM.",
+        reply_markup=_sleep_cancel_keyboard(origin),
+    )
     await callback.answer()
 
 
@@ -118,7 +136,10 @@ async def sleep_toggle_callback(callback: types.CallbackQuery, state: FSMContext
         if not user.get("sleep_target_sleep") or not user.get("sleep_target_wake"):
             await state.update_data(sleep_origin=origin)
             await state.set_state(SleepModeState.target_sleep)
-            await callback.message.answer("Чтобы включить режим, задай цель. Во сколько хочешь засыпать?")
+            await callback.message.answer(
+                "Чтобы включить режим, задай цель. Во сколько хочешь засыпать?",
+                reply_markup=_sleep_cancel_keyboard(origin),
+            )
             await callback.answer()
             return
         await repo.update_sleep_mode(db, user["id"], True)
@@ -139,26 +160,42 @@ async def sleep_toggle_callback(callback: types.CallbackQuery, state: FSMContext
     )
 
 
-@router.message(SleepModeState.target_sleep)
+@router.message(SleepModeState.target_sleep, lambda m: m.text and not m.text.startswith("/"))
 async def sleep_set_target_sleep(message: types.Message, state: FSMContext) -> None:
+    if await _handle_sleep_cancel(message, state):
+        return
+    data = await state.get_data()
+    origin = data.get("sleep_origin", "main")
     raw = (message.text or "").strip()
     parsed = parse_hhmm(raw)
     if not parsed:
-        await message.answer(error("нужен формат HH:MM, например 23:30"))
+        await message.answer(
+            error("нужен формат HH:MM, например 23:30"),
+            reply_markup=_sleep_cancel_keyboard(origin),
+        )
         return
     await state.update_data(target_sleep=parsed.strftime("%H:%M"))
     await state.set_state(SleepModeState.target_wake)
-    await message.answer("Во сколько хочешь вставать? Формат HH:MM.")
+    await message.answer(
+        "Во сколько хочешь вставать? Формат HH:MM.",
+        reply_markup=_sleep_cancel_keyboard(origin),
+    )
 
 
-@router.message(SleepModeState.target_wake)
+@router.message(SleepModeState.target_wake, lambda m: m.text and not m.text.startswith("/"))
 async def sleep_set_target_wake(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_sleep_cancel(message, state):
+        return
+    data = await state.get_data()
+    origin = data.get("sleep_origin", "main")
     raw = (message.text or "").strip()
     parsed = parse_hhmm(raw)
     if not parsed:
-        await message.answer(error("нужен формат HH:MM, например 07:30"))
+        await message.answer(
+            error("нужен формат HH:MM, например 07:30"),
+            reply_markup=_sleep_cancel_keyboard(origin),
+        )
         return
-    data = await state.get_data()
     target_sleep = data.get("target_sleep")
     target_wake = parsed.strftime("%H:%M")
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -169,9 +206,12 @@ async def sleep_set_target_wake(message: types.Message, state: FSMContext, db) -
     shift_every = int(user.get("sleep_shift_every") or 2)
     await repo.update_sleep_shift_settings(db, user["id"], shift_step, shift_every, local_date)
     await state.clear()
-    origin = data.get("sleep_origin", "main")
     await message.answer("Приняла. Подстрою режим постепенно и без резких рывков.")
-    await _render_sleep_menu(message, db, origin=origin)
+    updated_user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    await message.answer(
+        _sleep_menu_text(updated_user),
+        reply_markup=_sleep_menu_keyboard(bool(updated_user.get("sleep_mode_enabled")), origin),
+    )
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("sleep:evening"))

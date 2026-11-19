@@ -37,7 +37,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     routine_status = {row_to_dict(t).get("routine_id"): row_to_dict(t).get("status") for t in tasks}
 
     routine_lines = []
-    routine_kb = []
+    first_pending_routine_row = None
     for r_raw in routines:
         r = row_to_dict(r_raw)
         if not r.get("routine_id"):
@@ -47,21 +47,20 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         if st == "skip":
             label = f"⏭ {r.get('title')} ({r.get('reminder_time')})"
         routine_lines.append(label)
-        routine_kb.append(
-            [
+        if st == "pending" and first_pending_routine_row is None:
+            title_short = (r.get("title") or "Рутина")[:20]
+            first_pending_routine_row = [
                 types.InlineKeyboardButton(
-                    text=f"✅ {r.get('title')}",
+                    text=f"✅ {title_short}",
                     callback_data=f"routine:{r.get('routine_id')}:{local_date}:done",
                 ),
                 types.InlineKeyboardButton(
-                    text=f"⏭ {r.get('title')}",
+                    text=f"⏭ {title_short}",
                     callback_data=f"routine:{r.get('routine_id')}:{local_date}:skip",
                 ),
             ]
-        )
     if adhd and len(routine_lines) > 3:
         routine_lines = routine_lines[:3]
-        routine_kb = routine_kb[:3]
 
     custom = await repo.list_custom_reminders(db, user["id"])
     custom_status = await repo.custom_statuses_for_date(db, user["id"], local_date)
@@ -95,7 +94,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     reg_due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=local_date, due_in_days=1)
     reg_done_today = await repo.list_regular_tasks_done_on_date(db, user["id"], local_date)
     regular_lines = []
-    regular_kb = []
+    today_date = datetime.date.fromisoformat(local_date)
     for r_raw in reg_due[:3]:
         r = row_to_dict(r_raw)
         zone = r.get("zone") or "misc"
@@ -108,15 +107,16 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             "fridge": "🧊",
             "misc": "🧰",
         }.get(zone, "🧰")
-        regular_lines.append(f"{icon} {r.get('title')} — до {format_date_display(r.get('next_due_date'))}")
-        regular_kb.append(
-            [
-                types.InlineKeyboardButton(text=f"✅ {r.get('title','')[:16]}", callback_data=f"hweek:done:{r.get('id')}"),
-                types.InlineKeyboardButton(text="↪️ +1", callback_data=f"hweek:later:1:{r.get('id')}"),
-                types.InlineKeyboardButton(text="+3", callback_data=f"hweek:later:3:{r.get('id')}"),
-                types.InlineKeyboardButton(text="+7", callback_data=f"hweek:later:7:{r.get('id')}"),
-            ]
-        )
+        next_due = r.get("next_due_date") or ""
+        due_label = "давно не обновлялось"
+        if next_due:
+            try:
+                due_dt = datetime.date.fromisoformat(next_due)
+                if (today_date - due_dt).days <= 7:
+                    due_label = f"до {format_date_display(next_due)}"
+            except Exception:
+                due_label = f"до {format_date_display(next_due)}"
+        regular_lines.append(f"{icon} {r.get('title')} — {due_label}")
     if reg_done_today:
         done_lines = [f"• {row_to_dict(r).get('title')} — следующая дата {format_date_display(row_to_dict(r).get('next_due_date'))}" for r in reg_done_today[:2]]
         regular_lines += ["Выполнено сегодня:"] + done_lines
@@ -167,10 +167,8 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     routine_done_cnt = sum(r["cnt"] for r in stats_r if r["status"] == "done")
     routine_total_cnt = sum(r["cnt"] for r in stats_r)
     summary_lines = [
-        f"🎯 Очки: сегодня {points_today}, за неделю {points_week}, стрик {streak} дн.",
-        f"✅ Прогресс: {done_today}/{important_total or total_today or 0} задач за сегодня",
-        f"🌞 Рутины: {routine_done_cnt}/{routine_total_cnt} пунктов за сегодня",
-        gentle_streak(streak),
+        f"✅ Прогресс: {done_today}/{important_total or total_today or 0} за сегодня",
+        f"🌞 Рутины: {routine_done_cnt}/{routine_total_cnt}",
     ]
     finance_line = await payday_summary(db, user, local_date)
     home_summary = ""
@@ -284,11 +282,18 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             blocks.append("\n".join(plan_lines))
         # Если скрыли, верхняя строка саммари (строки 174-178) уже покажет статус
 
-    # Footer для ADHD режима
+    # Footer: очки, стрик и щадящий фокус
+    footer_line = f"🎯 Очки: {points_today} сегодня / {points_week} за неделю"
+    if streak > 0:
+        footer_line += f" • {gentle_streak(streak)}"
+    blocks.append(footer_line)
+
     if adhd:
-        blocks.append("\n<i>В ADHD‑режиме я показываю не больше 3 пунктов в списках, остальное — по кнопкам.</i>")
+        blocks.append("<i>В щадящем фокусе показываю не больше 3 пунктов, остальное — по кнопкам.</i>")
 
     kb_buttons = []
+    if first_pending_routine_row:
+        kb_buttons.append(first_pending_routine_row)
     has_any_reminders = bool(custom)
     kb_buttons.append([types.InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")])
     if has_any_reminders:

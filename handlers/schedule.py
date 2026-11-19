@@ -23,6 +23,20 @@ class ScheduleState(StatesGroup):
     add_event = State()
 
 
+def _cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="sched:cancel")]]
+    )
+
+
+async def _handle_cancel(message: types.Message, state: FSMContext) -> bool:
+    if (message.text or "").strip().lower() in {"отмена", "назад"}:
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class Interval:
     start: int  # minutes from 00:00
@@ -254,6 +268,16 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
 
+    if action == "cancel":
+        await state.clear()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await callback.answer("Отменила.")
+        return
+
     if action == "add_block":
         await state.set_state(ScheduleState.add_block)
         await callback.message.answer(
@@ -262,7 +286,7 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             "<b>Работа/Учёба; 09:00-18:00; пн-пт</b>\n"
             "Можно: пн,вт,ср или каждый день.",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_cancel_kb(),
         )
         await callback.answer()
         return
@@ -274,7 +298,7 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             "Напиши так:\n"
             "<b>Спорт; 19:00-19:30</b>",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=_cancel_kb(),
         )
         await callback.answer()
         return
@@ -307,23 +331,25 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
     await callback.answer()
 
 
-@router.message(ScheduleState.add_block)
+@router.message(ScheduleState.add_block, lambda m: bool(m.text and not m.text.startswith("/")))
 async def schedule_add_block(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     raw = (message.text or "").strip()
     parts = [p.strip() for p in raw.split(";")]
     if len(parts) < 2:
-        await message.answer("Нужно: <Название; 09:00-18:00; дни>. Попробуй ещё раз.", reply_markup=main_menu_keyboard())
+        await message.answer("Нужно: <Название; 09:00-18:00; дни>. Попробуй ещё раз.", reply_markup=_cancel_kb())
         return
     title = parts[0] or "Блок"
     m = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", parts[1])
     if not m:
-        await message.answer("Не вижу время. Формат: 09:00-18:00", reply_markup=main_menu_keyboard())
+        await message.answer("Не вижу время. Формат: 09:00-18:00", reply_markup=_cancel_kb())
         return
     st = parse_hhmm(m.group(1))
     en = parse_hhmm(m.group(2))
     if not st or not en:
-        await message.answer("Время должно быть HH:MM.", reply_markup=main_menu_keyboard())
+        await message.answer("Время должно быть HH:MM.", reply_markup=_cancel_kb())
         return
     weekdays = _parse_weekdays(parts[2] if len(parts) > 2 else "пн-пт") or "0,1,2,3,4"
     await repo.create_schedule_block(db, user["id"], title, _hhmm_str(st), _hhmm_str(en), weekdays)
@@ -331,24 +357,26 @@ async def schedule_add_block(message: types.Message, state: FSMContext, db) -> N
     await message.answer("✅ Сохранила блок.", reply_markup=main_menu_keyboard())
 
 
-@router.message(ScheduleState.add_event)
+@router.message(ScheduleState.add_event, lambda m: bool(m.text and not m.text.startswith("/")))
 async def schedule_add_event(message: types.Message, state: FSMContext, db) -> None:
+    if await _handle_cancel(message, state):
+        return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     raw = (message.text or "").strip()
     parts = [p.strip() for p in raw.split(";")]
     if len(parts) < 2:
-        await message.answer("Нужно: <Название; 19:00-19:30>. Попробуй ещё раз.", reply_markup=main_menu_keyboard())
+        await message.answer("Нужно: <Название; 19:00-19:30>. Попробуй ещё раз.", reply_markup=_cancel_kb())
         return
     title = parts[0] or "Событие"
     m = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", parts[1])
     if not m:
-        await message.answer("Не вижу время. Формат: 19:00-19:30", reply_markup=main_menu_keyboard())
+        await message.answer("Не вижу время. Формат: 19:00-19:30", reply_markup=_cancel_kb())
         return
     st = parse_hhmm(m.group(1))
     en = parse_hhmm(m.group(2))
     if not st or not en:
-        await message.answer("Время должно быть HH:MM.", reply_markup=main_menu_keyboard())
+        await message.answer("Время должно быть HH:MM.", reply_markup=_cancel_kb())
         return
     await repo.create_schedule_event(db, user["id"], local_date, _hhmm_str(st), _hhmm_str(en), title, category="manual", source="manual")
     await state.clear()

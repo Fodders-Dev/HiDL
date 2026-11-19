@@ -25,8 +25,11 @@ router = Router()
 @router.callback_query(lambda c: c.data and c.data == "main:menu")
 async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
-    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("Главное меню внизу 👇")
 
 
 @router.message(Command("menu"))
@@ -47,20 +50,10 @@ async def cmd_today(message: types.Message, db, state: FSMContext) -> None:
 
 
 @router.message(Command("settings"))
-async def settings_info(message: types.Message, db) -> None:
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def settings_info(message: types.Message, state: FSMContext, db) -> None:
+    from handlers import settings as settings_handler
 
-    now_utc = datetime.datetime.utcnow()
-    local_time = format_time_local(now_utc, user["timezone"])
-    await message.answer(
-        "Твои настройки:\n"
-        f"Имя: {user['name']}\n"
-        f"Часовой пояс: {user['timezone']} (сейчас {local_time})\n"
-        f"Подъём: {user['wake_up_time']} / Отбой: {user['sleep_time']}\n"
-        f"Цели/приоритет: {user['goals'] or 'не задано'}\n\n"
-        "Чтобы поменять что-то — нажми ⚙ Настройки в меню.",
-        reply_markup=main_menu_keyboard(),
-    )
+    await settings_handler.settings_entry(message, state=state, db=db)
 
 
 @router.message(lambda m: match_menu_label(m.text, {"еда"}))
@@ -81,6 +74,15 @@ async def shopping_menu(message: types.Message, db, state: FSMContext) -> None:
 
 
 
+@router.message(Command("pantry"))
+async def pantry_command(message: types.Message, db, state: FSMContext) -> None:
+    from handlers import kitchen
+
+    await state.clear()
+    await kitchen.send_fridge(message, db)
+
+
+@router.message(Command("home"))
 @router.message(lambda m: match_menu_label(m.text, {"дом"}))
 async def home_menu(message: types.Message, db, state: FSMContext) -> None:
     from utils.user import ensure_user
@@ -98,10 +100,18 @@ async def home_menu(message: types.Message, db, state: FSMContext) -> None:
     )
 
 
+@router.message(Command("movement"))
 @router.message(lambda m: match_menu_label(m.text, {"спорт", "движение"}))
 async def move_menu(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Спорт: чуть подвигаться, чтобы стало легче в голове и теле.", reply_markup=movement_menu_keyboard())
+
+
+@router.message(lambda m: match_menu_label(m.text, {"дневник"}))
+async def diary_menu(message: types.Message, state: FSMContext, db) -> None:
+    from handlers import inbox
+
+    await inbox.cmd_diary(message.model_copy(update={"text": "/diary"}), state, db)
 
 
 @router.message(lambda m: match_menu_label(m.text, {"поговорить", "поболтать"}))
@@ -118,7 +128,7 @@ async def today_menu(callback: types.CallbackQuery, db) -> None:
     user = dict(user_row)
     from utils.today import render_today
     text, kb = await render_today(db, user)
-    await callback.message.edit_text(text, reply_markup=kb or main_menu_keyboard())
+    await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
 
@@ -163,6 +173,7 @@ async def food_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
 async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -> None:
     action = callback.data.split(":")[1]
     if action == "menu":
+        await state.clear()
         await callback.message.answer(
             "Дом: помогу навести порядок по-человечески. Выбирай, что актуально сейчас:",
             reply_markup=home_menu_keyboard(),
@@ -183,11 +194,21 @@ async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
     elif action == "week":
         from handlers import home_tasks
 
-        await home_tasks.show_week_plan(callback.message, db)
+        await home_tasks.show_week_plan(
+            callback.message,
+            db,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+        )
     elif action == "all":
         from handlers import home_tasks
 
-        await home_tasks.show_all_tasks(callback.message, db)
+        await home_tasks.show_all_tasks(
+            callback.message,
+            db,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+        )
     elif action == "supplies":
         from handlers import home_supplies
 
@@ -248,7 +269,7 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
         from handlers import settings as settings_handler
 
         await settings_handler.settings_select(
-            callback.replace(data="settings:profile"),
+            callback.model_copy(update={"data": "settings:profile"}),
             state=state,
             db=db,
             skip_answer=True,
@@ -256,7 +277,13 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
     elif action == "settings":
         from handlers import settings as settings_handler
 
-        await settings_handler.settings_entry(callback.message, state=state, db=db)
+        await settings_handler.settings_select(
+            callback.model_copy(update={"data": "settings:main"}),
+            state=state,
+            db=db,
+            skip_answer=True,
+        )
+        return
     await callback.answer()
 
 

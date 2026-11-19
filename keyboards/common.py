@@ -12,7 +12,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="🍽 Еда")],
             [KeyboardButton(text="💰 Деньги"), KeyboardButton(text="🧹 Дом")],
             [KeyboardButton(text="🏋️ Спорт"), KeyboardButton(text="🛒 Покупки")],
-            [KeyboardButton(text="🗓 Расписание"), KeyboardButton(text="💬 Поговорить")],
+            [KeyboardButton(text="🗓 Расписание"), KeyboardButton(text="📓 Дневник")],
             [KeyboardButton(text="⚙ Настройки"), KeyboardButton(text="☕ Кафе фокуса")],
         ],
         resize_keyboard=True,
@@ -22,6 +22,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 def food_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
             [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
             [InlineKeyboardButton(text="📖 Книга рецептов", callback_data="kitchen:recipes")],
             [InlineKeyboardButton(text="🛒 Список покупок", callback_data="kitchen:shoplist")],

@@ -158,8 +158,15 @@ def _format_task_line(t) -> str:
     return f"{status} {zone_icon} {row['title']} — каждые {freq} д., до {next_disp}"
 
 
-async def show_week_plan(message: types.Message, db) -> None:
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def show_week_plan(
+    message: types.Message,
+    db,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
+    uid = tg_user_id if tg_user_id is not None else message.from_user.id
+    uname = tg_full_name if tg_full_name is not None else message.from_user.full_name
+    user = await ensure_user(db, uid, uname)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     await repo.ensure_regular_tasks(db, user["id"], today)
     tasks = await repo.list_regular_tasks(
@@ -178,8 +185,15 @@ async def show_week_plan(message: types.Message, db) -> None:
     await message.answer("\n".join(lines), reply_markup=kb or main_menu_keyboard())
 
 
-async def show_all_tasks(message: types.Message, db) -> None:
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def show_all_tasks(
+    message: types.Message,
+    db,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
+    uid = tg_user_id if tg_user_id is not None else message.from_user.id
+    uname = tg_full_name if tg_full_name is not None else message.from_user.full_name
+    user = await ensure_user(db, uid, uname)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     await repo.ensure_regular_tasks(db, user["id"], today)
     tasks = rows_to_dicts(
@@ -285,17 +299,24 @@ async def freq_set(callback: types.CallbackQuery, db, state: FSMContext) -> None
     await state.clear()
 
 
-@router.message(HomeFreqState.wait_custom)
+@router.message(HomeFreqState.wait_custom, lambda m: bool(m.text and not m.text.startswith("/")))
 async def freq_custom(message: types.Message, state: FSMContext, db) -> None:
+    raw = (message.text or "").strip()
+    if raw.lower() in {"отмена", "назад"}:
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
     data = await state.get_data()
     task_id = data.get("freq_task_id")
     try:
-        days = int(message.text.strip())
+        days = int(raw)
+        if days < 1 or days > 365:
+            raise ValueError
     except Exception:
         from utils import texts
 
         await message.answer(
-            texts.error("нужно число дней, например 14."),
+            texts.error("нужно число дней (от 1 до 365), например 14."),
         )
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -368,6 +389,7 @@ def _zones_keyboard(selected: List[str]) -> InlineKeyboardMarkup:
     
     action_text = "🚀 Начать" if selected else "Выбери зоны"
     rows.append([InlineKeyboardButton(text=action_text, callback_data="cl2:confirm")])
+    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="home:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -547,7 +569,8 @@ async def cl2_resume(callback: types.CallbackQuery, db, state: FSMContext) -> No
 async def _render_step(message: types.Message, session_id: int, idx: int, steps: List[dict]) -> None:
     if idx >= len(steps):
         # Completed
-        await message.edit_text("🎉 Уборка завершена! Ты молодец!", reply_markup=main_menu_keyboard())
+        await safe_edit(message, "🎉 Уборка завершена! Ты молодец!", reply_markup=None)
+        await message.answer("Что дальше?", reply_markup=main_menu_keyboard())
         return
 
     step = steps[idx]
@@ -596,10 +619,12 @@ async def cl2_step_action(callback: types.CallbackQuery, db) -> None:
     
     if next_idx >= len(steps):
         await repo.complete_session(db, session_id)
-        await callback.message.edit_text(
-            f"🎉 Уборка завершена!\nВсе шаги пройдены. Дом стал чище, а ты — круче.", 
-            reply_markup=main_menu_keyboard()
+        await safe_edit(
+            callback.message,
+            "🎉 Уборка завершена!\nВсе шаги пройдены. Дом стал чище, а ты — круче.",
+            reply_markup=None,
         )
+        await callback.message.answer("Что дальше?", reply_markup=main_menu_keyboard())
     else:
         # Update DB
         new_json = json.dumps(steps, ensure_ascii=False)
@@ -852,13 +877,23 @@ async def send_smell_menu(message: types.Message) -> None:
 # Fallbacks на старые кнопки
 @router.callback_query(lambda c: c.data and c.data.startswith("home:regular"))
 async def home_regular_entry(callback: types.CallbackQuery, db) -> None:
-    await show_week_plan(callback.message, db)
+    await show_week_plan(
+        callback.message,
+        db,
+        tg_user_id=callback.from_user.id,
+        tg_full_name=callback.from_user.full_name,
+    )
     await callback.answer()
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("home:regular_all"))
 async def home_regular_all(callback: types.CallbackQuery, db) -> None:
-    await show_all_tasks(callback.message, db)
+    await show_all_tasks(
+        callback.message,
+        db,
+        tg_user_id=callback.from_user.id,
+        tg_full_name=callback.from_user.full_name,
+    )
     await callback.answer()
 
 

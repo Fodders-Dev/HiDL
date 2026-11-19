@@ -5,8 +5,9 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from handlers import focus_cafe, guides
+from handlers import focus_cafe, kitchen
 from utils.sender import safe_edit
+from utils.user import ensure_user
 
 router = Router()
 
@@ -60,7 +61,10 @@ async def _render_help_menu(message: types.Message) -> None:
 @router.message(lambda m: m.text and "помощ" in m.text.lower() and "сейчас" in m.text.lower())
 async def help_now_entry(message: types.Message, state: FSMContext) -> None:
     await state.clear()
-    await _render_help_menu(message)
+    await message.answer(
+        "Что сейчас сложнее всего? Выбери один вариант — дам короткий следующий шаг.",
+        reply_markup=_help_menu_keyboard(),
+    )
 
 
 @router.callback_query(lambda c: c.data == "help:menu")
@@ -104,11 +108,42 @@ async def help_now_procrast(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "help:cafe")
 async def help_now_cafe(callback: types.CallbackQuery, state: FSMContext, db) -> None:
-    await focus_cafe.cafe_start(callback.message, state, db)
+    await focus_cafe.cafe_start(
+        callback.message,
+        state,
+        db,
+        tg_user_id=callback.from_user.id,
+        tg_full_name=callback.from_user.full_name,
+    )
     await callback.answer()
 
 
 @router.callback_query(lambda c: c.data == "help:food")
 async def help_now_food(callback: types.CallbackQuery, db) -> None:
-    await guides.recipes_fast(callback.message, db)
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    profile = await kitchen._get_meal_profile(db, user["id"])  # noqa: SLF001
+    quick = kitchen.get_quick_recipes(profile, limit=3, max_minutes=30)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=kitchen._recipe_button_text(r),  # noqa: SLF001
+                callback_data=f"kitchen:cook_view:{r['id']}:2:all:0",
+            )
+        ]
+        for r in quick
+    ]
+    rows.append([InlineKeyboardButton(text="📖 Все рецепты", callback_data="kitchen:recipes")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="help:menu")])
+    lines = [f"🍽 Быстрые варианты до 30 мин ({kitchen._diet_label(profile)}):"]  # noqa: SLF001
+    for r in quick:
+        lines.append(
+            f"• {kitchen._h(r.get('title'))} ({int(r.get('time_minutes') or 15)} мин) — {kitchen._h(r.get('desc', ''))}"  # noqa: SLF001
+        )
+    if not quick:
+        lines.append("Пока не нашла подходящих рецептов — посмотри всю книгу.")
+    await safe_edit(
+        callback.message,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
     await callback.answer()

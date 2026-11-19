@@ -6,6 +6,8 @@ from hidl.app import create_app
 from scheduler.reminder import ReminderScheduler
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 

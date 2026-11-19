@@ -17,6 +17,7 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from services import inbox_service
 from services.inbox_parser import resolve_temporal_expression
+from utils.menu_match import match_menu_label
 from utils.sender import safe_edit
 from utils.time import format_date_display, local_date_str
 from utils.user import ensure_user
@@ -60,6 +61,12 @@ async def handle_free_text_inbox(message: types.Message, db) -> None:
         outcome.reply_text,
         reply_markup=outcome.reply_markup or main_menu_keyboard(),
     )
+
+
+async def inbox_free_text(message: types.Message, state: FSMContext, db) -> None:
+    """Делегирование свободного текста в inbox со сбросом временного FSM-состояния."""
+    await state.clear()
+    await handle_free_text_inbox(message, db)
 
 
 @router.message(F.voice)
@@ -173,6 +180,10 @@ async def _refresh_summary_message(message: types.Message, db, user: dict[str, A
 async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     parts = (callback.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
+    if action not in {"retitle", "clarify_custom"}:
+        current = await state.get_state()
+        if current and current.startswith("InboxEditState:"):
+            await state.clear()
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
 
     if action == "summary" and len(parts) > 2:
@@ -238,9 +249,15 @@ async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         if not act:
             await callback.answer("Пункт не найден.", show_alert=True)
             return
+        inbox_id = int(act["inbox_message_id"])
         await state.set_state(InboxEditState.rename)
-        await state.update_data(edit_action_id=aid, edit_inbox_id=int(act["inbox_message_id"]))
-        await callback.message.answer("Напиши новый короткий текст для этого пункта:")
+        await state.update_data(edit_action_id=aid, edit_inbox_id=inbox_id)
+        await callback.message.answer(
+            "Напиши новый короткий текст для этого пункта:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"inbox:edit:{inbox_id}")]]
+            ),
+        )
         await callback.answer()
         return
 
@@ -283,10 +300,14 @@ async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         if not act:
             await callback.answer("Уточнение не найдено.", show_alert=True)
             return
+        inbox_id = int(act["inbox_message_id"])
         await state.set_state(InboxEditState.clarify_when)
-        await state.update_data(clarify_action_id=aid, clarify_inbox_id=int(act["inbox_message_id"]))
+        await state.update_data(clarify_action_id=aid, clarify_inbox_id=inbox_id)
         await callback.message.answer(
-            "На какую дату и время поставить? Например: «завтра в 14:00» или «20:30»."
+            "На какую дату и время поставить? Например: «завтра в 14:00» или «20:30».",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"inbox:summary:{inbox_id}")]]
+            ),
         )
         await callback.answer()
         return
@@ -328,13 +349,24 @@ async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
     await callback.answer()
 
 
-@router.message(InboxEditState.rename)
+@router.message(InboxEditState.rename, lambda m: m.text and not m.text.startswith("/"))
 async def inbox_rename_input(message: types.Message, state: FSMContext, db) -> None:
     data = await state.get_data()
     aid = data.get("edit_action_id")
+    inbox_id = data.get("edit_inbox_id")
     new_title = (message.text or "").strip()
     if not new_title:
         await message.answer("Напиши непустой текст.")
+        return
+    if new_title.lower() in {"отмена", "отменить"}:
+        await state.clear()
+        if inbox_id:
+            user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+            actions = await repo.list_inbox_actions(db, user["id"], int(inbox_id), include_undone=False)
+            text, kb = _build_edit_list_view(int(inbox_id), actions)
+            await message.answer(text, reply_markup=kb)
+        else:
+            await message.answer("Отменила правку.", reply_markup=main_menu_keyboard())
         return
     await state.clear()
     if not aid:
@@ -349,10 +381,16 @@ async def inbox_rename_input(message: types.Message, state: FSMContext, db) -> N
     await message.answer(text, reply_markup=kb)
 
 
-@router.message(InboxEditState.clarify_when)
+@router.message(InboxEditState.clarify_when, lambda m: m.text and not m.text.startswith("/"))
 async def inbox_clarify_when_input(message: types.Message, state: FSMContext, db) -> None:
     data = await state.get_data()
     aid = data.get("clarify_action_id")
+    clarify_inbox_id = data.get("clarify_inbox_id")
+    raw_input = (message.text or "").strip()
+    if raw_input.lower() in {"отмена", "отменить"}:
+        await state.clear()
+        await message.answer("Отменила уточнение.", reply_markup=main_menu_keyboard())
+        return
     if not aid:
         await state.clear()
         await message.answer("Черновик не найден.", reply_markup=main_menu_keyboard())
@@ -428,17 +466,24 @@ async def _render_diary_view(
     rows.append(tab_row)
 
     if query:
-        entries = await repo.search_journal_entries(db, user["id"], query, limit=10)
+        entries = await repo.search_user_notes(db, user["id"], query, limit=10)
         lines = [f"<b>🔍 Поиск в дневнике:</b> «{_esc(query)}»"]
         if not entries:
             lines.append("Ничего не нашлось.")
         else:
-            for e in entries:
+            for idx, e in enumerate(entries, 1):
                 src_icon = "🎙" if e.get("source") == "voice" else "💬"
-                lines.append(
-                    f"• {format_date_display(e['entry_date'])} {src_icon} <b>{_esc(e['title'])}</b>\n"
-                    f"  «{_esc(e['user_text'])}»"
-                )
+                title = (e.get("title") or "").strip()
+                utext = (e.get("user_text") or "").strip()
+                if title and title.lower() != utext.lower():
+                    lines.append(
+                        f"{idx}. {format_date_display(e['entry_date'])} {src_icon} <b>{_esc(title)}</b>\n"
+                        f"   «{_esc(utext)}»"
+                    )
+                else:
+                    lines.append(
+                        f"{idx}. {format_date_display(e['entry_date'])} {src_icon} «{_esc(utext or title)}»"
+                    )
     elif tab == "raw":
         msgs = await repo.list_inbox_messages(db, user["id"], limit=10)
         lines = ["<b>📥 Сырые входящие (последние):</b>"]
@@ -462,17 +507,17 @@ async def _render_diary_view(
             lines.append("Пока пусто. Напиши или надиктуй мысль в чат — я сохраню.")
         else:
             del_row: list[InlineKeyboardButton] = []
-            for e in entries:
+            for idx, e in enumerate(entries, 1):
                 src_icon = "🎙" if e.get("source") == "voice" else "💬"
                 note = (e.get("model_note") or "").strip()
-                line = f"• {format_date_display(e['entry_date'])} {src_icon} {_esc(e['user_text'])}"
+                line = f"{idx}. {format_date_display(e['entry_date'])} {src_icon} {_esc(e['user_text'])}"
                 if note:
                     line += f"\n  <i>Заметка модели: {_esc(note)}</i>"
                 lines.append(line)
                 if len(del_row) < 4:
                     del_row.append(
                         InlineKeyboardButton(
-                            text=f"🗑 #{e['id']}",
+                            text=f"🗑 {idx}",
                             callback_data=f"diary:del:{e['id']}:{tab}",
                         )
                     )
@@ -490,11 +535,12 @@ async def _render_diary_view(
 
 
 @router.message(Command("diary"))
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"дневник"}))
 async def cmd_diary(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     raw = (message.text or "").strip()
-    parts = raw.split(maxsplit=1)
+    parts = raw.split(maxsplit=1) if raw.startswith("/") else [raw]
     query = parts[1].strip() if len(parts) > 1 else ""
     text, kb = await _render_diary_view(db, user, tab="diary", query=query)
     await message.answer(text, reply_markup=kb)

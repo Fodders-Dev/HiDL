@@ -71,8 +71,16 @@ def _cooldown_text(user: dict, now_utc: datetime.datetime) -> str | None:
 
 @router.message(Command("cafe"))
 @router.message(lambda m: match_menu_label(m.text, {"кафе фокуса", "кафе"}))
-async def cafe_start(message: types.Message, state: FSMContext, db) -> None:
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def cafe_start(
+    message: types.Message,
+    state: FSMContext,
+    db,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
+    uid = tg_user_id if tg_user_id is not None else message.from_user.id
+    uname = tg_full_name if tg_full_name is not None else message.from_user.full_name
+    user = await ensure_user(db, uid, uname)
     await state.clear()
     now_utc = datetime.datetime.utcnow()
     cooldown_text = _cooldown_text(user, now_utc)
@@ -113,9 +121,13 @@ async def cafe_start(message: types.Message, state: FSMContext, db) -> None:
     )
 
 
-@router.message(FocusCafeState.task)
+@router.message(FocusCafeState.task, lambda m: bool(m.text and not m.text.startswith("/")))
 async def cafe_task(message: types.Message, state: FSMContext) -> None:
     task = (message.text or "").strip()
+    if task.lower() in {"отмена", "назад"}:
+        await state.clear()
+        await message.answer("Отменила фокус-сессию.", reply_markup=main_menu_keyboard())
+        return
     if not task:
         await message.answer("Нужна короткая формулировка задачи.")
         return
@@ -151,9 +163,13 @@ async def cafe_pick_duration(callback: types.CallbackQuery, state: FSMContext, d
     await _start_session(callback, state, db, minutes)
 
 
-@router.message(FocusCafeState.duration)
+@router.message(FocusCafeState.duration, lambda m: bool(m.text and not m.text.startswith("/")))
 async def cafe_custom_duration(message: types.Message, state: FSMContext, db) -> None:
     raw = (message.text or "").strip()
+    if raw.lower() in {"отмена", "назад"}:
+        await state.clear()
+        await message.answer("Отменила фокус-сессию.", reply_markup=main_menu_keyboard())
+        return
     try:
         minutes = int(raw)
     except ValueError:

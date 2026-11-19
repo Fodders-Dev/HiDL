@@ -1,5 +1,6 @@
 import datetime
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -1876,6 +1877,15 @@ async def add_expense(conn: aiosqlite.Connection, user_id: int, amount: float, c
     return cursor.lastrowid
 
 
+async def delete_expense(conn: aiosqlite.Connection, user_id: int, expense_id: int) -> None:
+    """Удалить запись траты пользователя по ID."""
+    await conn.execute(
+        "DELETE FROM expenses WHERE id = ? AND user_id = ?",
+        (expense_id, user_id),
+    )
+    await conn.commit()
+
+
 async def expenses_last_days(
     conn: aiosqlite.Connection, user_id: int, days: int = 7
 ) -> List[aiosqlite.Row]:
@@ -2568,6 +2578,43 @@ async def delete_shopping_item(conn: aiosqlite.Connection, user_id: int, item_id
     await conn.commit()
 
 
+async def find_and_delete_shopping_item_by_name(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    query: str,
+    scope: str = "household",
+) -> Optional[Dict[str, Any]]:
+    """Найти позицию в списке покупок по названию/основе слова, удалить её и вернуть данные."""
+    needle = (query or "").strip().casefold().replace("ё", "е")
+    if not needle:
+        return None
+    rows = [row_to_dict(r) for r in await list_shopping_items(conn, user_id, scope=scope)]
+    if not rows:
+        return None
+
+    # Предпочитаем ещё не купленные позиции; сперва точное совпадение, затем по основе слова.
+    ordered = sorted(rows, key=lambda r: int(bool(r.get("is_bought"))))
+    for row in ordered:
+        name_norm = str(row.get("item_name") or "").strip().casefold().replace("ё", "е")
+        if name_norm == needle:
+            await delete_shopping_item(conn, user_id, int(row["id"]), scope=scope)
+            return row
+
+    needle_tokens = re.findall(r"[a-zа-я0-9]+", needle)
+    for row in ordered:
+        name = str(row.get("item_name") or "")
+        name_norm = name.casefold().replace("ё", "е")
+        if _haystack_matches_query(name_norm, needle):
+            await delete_shopping_item(conn, user_id, int(row["id"]), scope=scope)
+            return row
+        if needle_tokens:
+            name_stems = {_ru_stem(w) for w in re.findall(r"[a-zа-я0-9]+", name_norm)}
+            if all(_ru_stem(tok) in name_stems for tok in needle_tokens):
+                await delete_shopping_item(conn, user_id, int(row["id"]), scope=scope)
+                return row
+    return None
+
+
 async def update_shopping_item_name(
     conn: aiosqlite.Connection, user_id: int, item_id: int, name: str, scope: str = "household"
 ) -> None:
@@ -3007,6 +3054,51 @@ async def list_journal_entries(
     return rows_to_dicts(await cursor.fetchall())
 
 
+_RU_ENDINGS = (
+    "иями", "ями", "ами", "ого", "ему", "ыми", "ими", "ться", "тся",
+    "ее", "ие", "ые", "ое", "ей", "ой", "ий", "ый",
+    "ам", "ям", "ах", "ях", "ом", "ем", "ым", "им",
+    "ую", "юю", "ая", "яя", "ою", "ею",
+    "ть", "ти", "ов", "ев", "ия", "ья", "ье",
+    "ла", "ло", "ли",
+    "а", "я", "у", "ю", "е", "о", "ы", "и", "ь", "й",
+)
+
+
+def _ru_stem(word: str) -> str:
+    """Упрощённый стеммер для русских слов (оставляет не менее 3 символов)."""
+    w = (word or "").strip().casefold().replace("ё", "е")
+    if len(w) < 4:
+        return w
+    for end in _RU_ENDINGS:
+        if w.endswith(end) and len(w) - len(end) >= 3:
+            return w[: -len(end)]
+    return w
+
+
+def _haystack_matches_query(haystack: str, query: str) -> bool:
+    """Проверить, что основы всех токенов запроса встречаются в тексте."""
+    needle = (query or "").strip().casefold().replace("ё", "е")
+    if not needle:
+        return True
+    hay_norm = (haystack or "").casefold().replace("ё", "е")
+    if needle in hay_norm:
+        return True
+    tokens = re.findall(r"[a-zа-я0-9]+", needle)
+    if not tokens:
+        return False
+    hay_words = re.findall(r"[a-zа-я0-9]+", hay_norm)
+    for tok in tokens:
+        if len(tok) <= 3:
+            if tok not in hay_norm:
+                return False
+        else:
+            stem = _ru_stem(tok)
+            if tok not in hay_norm and not any(w.startswith(stem) for w in hay_words):
+                return False
+    return True
+
+
 async def search_journal_entries(
     conn: aiosqlite.Connection,
     user_id: int,
@@ -3030,12 +3122,141 @@ async def search_journal_entries(
                 str(row.get("model_note") or ""),
                 str(row.get("tags_json") or ""),
             ]
-        ).casefold()
-        if needle in haystack:
+        )
+        if _haystack_matches_query(haystack, needle):
             matches.append(row)
             if len(matches) >= limit:
                 break
     return matches
+
+
+async def search_user_notes(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    query: str,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Поиск по дневнику, активным действиям входящих и сырым входящим сообщениям."""
+    needle = (query or "").strip()
+    if not needle:
+        rows = await list_journal_entries(conn, user_id, limit=limit)
+        return [
+            {
+                "entry_date": r.get("entry_date") or "",
+                "source": r.get("source") or "text",
+                "title": r.get("title") or "",
+                "user_text": r.get("user_text") or "",
+                "kind": r.get("entry_type") or "diary",
+            }
+            for r in rows
+        ]
+
+    results: List[Dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    matched_inbox_ids: set[int] = set()
+
+    def _add_result(entry_date: str, source: str, title: str, user_text: str, kind: str) -> bool:
+        norm = re.sub(
+            r"\s+",
+            " ",
+            re.sub(r"[^\w\s]+", " ", (user_text or title).casefold().replace("ё", "е")),
+        ).strip()
+        key = (entry_date, norm)
+        if key in seen_keys:
+            return False
+        seen_keys.add(key)
+        results.append(
+            {
+                "entry_date": entry_date,
+                "source": source,
+                "title": title,
+                "user_text": user_text,
+                "kind": kind,
+            }
+        )
+        return len(results) >= limit
+
+    # 1. journal_entries (не удалённые)
+    j_cur = await conn.execute(
+        "SELECT * FROM journal_entries WHERE user_id = ? AND is_deleted = 0 ORDER BY id DESC",
+        (user_id,),
+    )
+    for row in rows_to_dicts(await j_cur.fetchall()):
+        hay = " ".join(
+            [
+                str(row.get("user_text") or ""),
+                str(row.get("title") or ""),
+                str(row.get("model_note") or ""),
+                str(row.get("tags_json") or ""),
+            ]
+        )
+        if _haystack_matches_query(hay, needle):
+            if row.get("inbox_message_id"):
+                matched_inbox_ids.add(int(row["inbox_message_id"]))
+            if _add_result(
+                str(row.get("entry_date") or ""),
+                str(row.get("source") or "text"),
+                str(row.get("title") or ""),
+                str(row.get("user_text") or ""),
+                str(row.get("entry_type") or "diary"),
+            ):
+                return results
+
+    # 2. Активные inbox_actions
+    a_cur = await conn.execute(
+        """
+        SELECT a.*, m.local_date, m.source AS msg_source
+        FROM inbox_actions a
+        LEFT JOIN inbox_messages m ON m.id = a.inbox_message_id
+        WHERE a.user_id = ? AND a.status IN ('active', 'clarifying')
+        ORDER BY a.id DESC
+        """,
+        (user_id,),
+    )
+    for row in rows_to_dicts(await a_cur.fetchall()):
+        hay = f"{row.get('title') or ''} {row.get('source_quote') or ''}"
+        if _haystack_matches_query(hay, needle):
+            if row.get("inbox_message_id"):
+                matched_inbox_ids.add(int(row["inbox_message_id"]))
+            edate = str(row.get("local_date") or str(row.get("created_at") or "")[:10])
+            if _add_result(
+                edate,
+                str(row.get("msg_source") or "text"),
+                str(row.get("title") or ""),
+                str(row.get("source_quote") or row.get("title") or ""),
+                str(row.get("item_kind") or "diary"),
+            ):
+                return results
+
+    # 3. Сырые inbox_messages (исключаем отменённые и служебные ответы/вопросы)
+    m_cur = await conn.execute(
+        """
+        SELECT * FROM inbox_messages
+        WHERE user_id = ?
+          AND raw_text IS NOT NULL
+          AND TRIM(raw_text) != ''
+          AND status NOT IN ('undone', 'answered', 'replied')
+        ORDER BY id DESC
+        """,
+        (user_id,),
+    )
+    for row in rows_to_dicts(await m_cur.fetchall()):
+        mid = row.get("id")
+        if mid and int(mid) in matched_inbox_ids:
+            continue
+        raw = str(row.get("raw_text") or "").strip()
+        if _haystack_matches_query(raw, needle):
+            edate = str(row.get("local_date") or str(row.get("created_at") or "")[:10])
+            if _add_result(
+                edate,
+                str(row.get("source") or "text"),
+                raw[:80],
+                raw,
+                "raw",
+            ):
+                return results
+
+    return results
 
 
 async def update_journal_entry(
