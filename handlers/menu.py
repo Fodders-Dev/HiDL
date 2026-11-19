@@ -11,6 +11,7 @@ from keyboards.common import (
     home_menu_keyboard,
     main_menu_keyboard,
     money_menu_keyboard,
+    more_menu_keyboard,
     movement_menu_keyboard,
     settings_menu_keyboard,
 )
@@ -56,12 +57,21 @@ async def settings_info(message: types.Message, state: FSMContext, db) -> None:
     await settings_handler.settings_entry(message, state=state, db=db)
 
 
-@router.message(lambda m: match_menu_label(m.text, {"еда"}))
+@router.message(lambda m: match_menu_label(m.text, {"еда", "еда и покупки"}))
 async def food_menu(message: types.Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Еда — это топливо и радость. Я помогу не ломать голову над вопросом «что приготовить» и следить за запасами.",
         reply_markup=food_menu_keyboard(),
+    )
+
+
+@router.message(lambda m: match_menu_label(m.text, {"ещё", "еще"}))
+async def more_menu(message: types.Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Дополнительные разделы (дом, деньги, спорт, фокус, настройки и заморозка ЧП):",
+        reply_markup=more_menu_keyboard(),
     )
 
 
@@ -84,13 +94,21 @@ async def pantry_command(message: types.Message, db, state: FSMContext) -> None:
 
 @router.message(Command("home"))
 @router.message(lambda m: match_menu_label(m.text, {"дом"}))
-async def home_menu(message: types.Message, db, state: FSMContext) -> None:
+async def home_menu(
+    message: types.Message,
+    db,
+    state: FSMContext,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
     from utils.user import ensure_user
     from utils.time import local_date_str
     import datetime
 
     await state.clear()
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    uid = tg_user_id if tg_user_id is not None else message.from_user.id
+    uname = tg_full_name if tg_full_name is not None else message.from_user.full_name
+    user = await ensure_user(db, uid, uname)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     # гарантируем наличие базовой регулярки
     await repo.ensure_regular_tasks(db, user["id"], today)
@@ -284,6 +302,48 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
             skip_answer=True,
         )
         return
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("more:"))
+async def more_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -> None:
+    action = callback.data.split(":")[1]
+    if action == "home":
+        await home_menu(
+            callback.message,
+            db,
+            state,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+        )
+    elif action == "money":
+        await state.clear()
+        await callback.message.answer(
+            "Деньги: давай без боли и осуждения. Выбирай:",
+            reply_markup=money_menu_keyboard(),
+        )
+    elif action == "sport":
+        await state.clear()
+        await callback.message.answer(
+            "Спорт: чуть подвигаться, чтобы стало легче в голове и теле.",
+            reply_markup=movement_menu_keyboard(),
+        )
+    elif action == "focus":
+        from handlers import focus_cafe
+
+        await focus_cafe.cafe_start(
+            callback.message,
+            state=state,
+            db=db,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+        )
+    elif action == "menu":
+        await state.clear()
+        await callback.message.answer(
+            "Дополнительные разделы:",
+            reply_markup=more_menu_keyboard(),
+        )
     await callback.answer()
 
 

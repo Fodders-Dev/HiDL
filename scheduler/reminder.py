@@ -8,6 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import repositories as repo
+from services import pulse_service
 from utils.time import format_date_display, local_date_str, should_trigger, tzinfo_from_string
 from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
@@ -78,7 +79,18 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_focus, "interval", seconds=60, id="focus_tick")
         self.scheduler.add_job(self._tick_sleep_mode, "interval", minutes=5, id="sleep_mode_tick")
         self.scheduler.add_job(self._tick_daily_brief, "interval", minutes=5, id="daily_brief_tick")
+        self.scheduler.add_job(self._tick_pulse, "interval", seconds=60, id="pulse_tick")
         self.scheduler.start()
+
+    @staticmethod
+    def _legacy_pings_active(user: dict) -> bool:
+        """Legacy-кроны активны только если включены явно или отключён единый Пульс."""
+        return bool(user.get("legacy_pings_enabled", 0)) or not bool(
+            user.get("pulse_enabled", 1)
+        )
+
+    async def _tick_pulse(self) -> None:
+        await pulse_service.process_pulse_tick(self.conn, self.bot)
 
     async def _safe_send_message(
         self,
@@ -140,30 +152,31 @@ class ReminderScheduler:
             if _sleep_window_active(user, now_utc):
                 await self._tick_custom(user, now_utc, local_date)
                 continue
-            await repo.ensure_user_routines(self.conn, user["id"])
-            routines = await repo.list_user_routines(self.conn, user["id"])
-            for routine in routines:
-                if routine["last_sent_date"] == local_date:
-                    log_debug(f"[tick] routine already sent user={user['id']} routine={routine['routine_id']} date={local_date}")
-                    continue
-                if not should_trigger(
-                    now_utc, user["timezone"], routine["reminder_time"], window_minutes=5
-                ):
-                    continue
-                sent = await self._send_routine(user, routine, local_date)
-                if not sent:
-                    continue
-                await repo.set_routine_sent(
-                    self.conn, user["id"], routine["routine_id"], local_date
-                )
-                await repo.upsert_user_task(
-                    self.conn,
-                    user["id"],
-                    routine["routine_id"],
-                    local_date,
-                    status="pending",
-                    note="",
-                )
+            if self._legacy_pings_active(user):
+                await repo.ensure_user_routines(self.conn, user["id"])
+                routines = await repo.list_user_routines(self.conn, user["id"])
+                for routine in routines:
+                    if routine["last_sent_date"] == local_date:
+                        log_debug(f"[tick] routine already sent user={user['id']} routine={routine['routine_id']} date={local_date}")
+                        continue
+                    if not should_trigger(
+                        now_utc, user["timezone"], routine["reminder_time"], window_minutes=5
+                    ):
+                        continue
+                    sent = await self._send_routine(user, routine, local_date)
+                    if not sent:
+                        continue
+                    await repo.set_routine_sent(
+                        self.conn, user["id"], routine["routine_id"], local_date
+                    )
+                    await repo.upsert_user_task(
+                        self.conn,
+                        user["id"],
+                        routine["routine_id"],
+                        local_date,
+                        status="pending",
+                        note="",
+                    )
             await self._tick_custom(user, now_utc, local_date)
 
     async def _tick_day_plan(self) -> None:
@@ -177,7 +190,7 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
-            if _sleep_window_active(user, now_utc):
+            if not self._legacy_pings_active(user):
                 continue
             if _sleep_window_active(user, now_utc):
                 continue
@@ -237,6 +250,8 @@ class ReminderScheduler:
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
             if user.get("quiet_mode"):
+                continue
+            if not self._legacy_pings_active(user):
                 continue
             if _sleep_window_active(user, now_utc):
                 continue
@@ -516,6 +531,8 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
+            if not self._legacy_pings_active(user):
+                continue
             if _sleep_window_active(user, now_utc):
                 continue
             wellness_row = await repo.get_wellness(self.conn, user["id"])
@@ -617,6 +634,8 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
+            if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
+                continue
             if user.get("quiet_mode"):
                 continue
             if _sleep_window_active(user, now_utc):
@@ -635,6 +654,8 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
+            if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
+                continue
             if user.get("quiet_mode"):
                 continue
             if _sleep_window_active(user, now_utc):
@@ -684,11 +705,18 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
+            if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
+                continue
             if user.get("quiet_mode"):
+                continue
+            if not self._legacy_pings_active(user):
                 continue
             if _sleep_window_active(user, now_utc):
                 continue
             today = datetime.date.fromisoformat(local_date)
+            tzinfo = tzinfo_from_string(user["timezone"])
+            if now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo).weekday() != 0:
+                continue
             care_items = [
                 ("last_care_dentist", 180, "🦷 Давно не было стоматолога? Запишись на осмотр/чистку."),
                 ("last_care_vision", 365, "👓 Проверь зрение, если давно не проверял(а)."),
@@ -722,7 +750,11 @@ class ReminderScheduler:
         for user in users:
             user = dict(user)
             local_date = local_date_str(now_utc, user["timezone"])
+            if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
+                continue
             if user.get("quiet_mode"):
+                continue
+            if not self._legacy_pings_active(user):
                 continue
             if _sleep_window_active(user, now_utc):
                 continue
@@ -754,13 +786,15 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            today = local_date_str(now_utc, user["timezone"])
+            if user.get("pause_until") and today <= (user.get("pause_until") or ""):
+                continue
             if user.get("quiet_mode"):
                 continue
             tzinfo = tzinfo_from_string(user["timezone"])
             local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
             if local_dt.weekday() != 6:
                 continue
-            today = local_date_str(now_utc, user["timezone"])
             await repo.ensure_regular_tasks(self.conn, user["id"], today)
             tasks = await repo.list_regular_tasks(self.conn, user["id"], due_only=False)
             if not tasks:
@@ -786,6 +820,8 @@ class ReminderScheduler:
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
             if user.get("quiet_mode"):
+                continue
+            if not self._legacy_pings_active(user):
                 continue
             
             # Получаем настройки wellness
@@ -989,6 +1025,8 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
+            if not self._legacy_pings_active(user):
+                continue
 
             await self._maybe_shift_sleep(user, local_date)
 
@@ -1041,6 +1079,8 @@ class ReminderScheduler:
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
             if user.get("quiet_mode"):
+                continue
+            if not self._legacy_pings_active(user):
                 continue
             if _sleep_window_active(user, now_utc):
                 continue

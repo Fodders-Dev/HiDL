@@ -10,6 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from services import karma_service, pulse_service
 from utils.time import parse_hhmm, local_date_str
 from utils.texts import error
 from utils.user import ensure_user
@@ -215,10 +216,56 @@ async def sleep_set_target_wake(message: types.Message, state: FSMContext, db) -
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("sleep:evening"))
-async def sleep_evening_ack(callback: types.CallbackQuery) -> None:
-    await callback.answer("Хорошо, помогу держать темп.")
+async def sleep_evening_ack(callback: types.CallbackQuery, db) -> None:
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    action = callback.data.split(":")[2] if len(callback.data.split(":")) > 2 else "ok"
+    if action == "later":
+        snooze = await pulse_service.schedule_adhoc_snooze(
+            db, user, "bedtime", "sleep", 20, "Отбой"
+        )
+        await safe_edit(
+            callback.message,
+            f"⏰ Ок, напомню про отбой в {snooze['next_local_hhmm']} (+20 мин).",
+            reply_markup=None,
+        )
+        await callback.answer(f"Напомню в {snooze['next_local_hhmm']}")
+        return
+    res = await pulse_service.confirm_bedtime(db, user)
+    await safe_edit(
+        callback.message,
+        f"🌙 Отбой подтверждён. Карма: {res['karma']['score_after']}/100. Спокойной ночи!",
+        reply_markup=None,
+    )
+    await callback.answer("Хорошо, отдыхай.")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("sleep:morning"))
-async def sleep_morning_ack(callback: types.CallbackQuery) -> None:
-    await callback.answer("Отлично. Давай мягко запускаться.")
+async def sleep_morning_ack(callback: types.CallbackQuery, db) -> None:
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    action = callback.data.split(":")[2] if len(callback.data.split(":")) > 2 else "up"
+    if action == "snooze":
+        snooze = await pulse_service.schedule_adhoc_snooze(
+            db, user, "wake", "sleep", 10, "Подъём"
+        )
+        await safe_edit(
+            callback.message,
+            f"⏰ Повторный подъём в {snooze['next_local_hhmm']} (+10 мин). Только не проспи!",
+            reply_markup=None,
+        )
+        await callback.answer(f"Разбужу в {snooze['next_local_hhmm']}")
+        return
+    await repo.clear_user_sleep_confirmed(db, int(user["id"]))
+    k_res = await karma_service.record_karma_event(
+        db,
+        user,
+        domain="sleep",
+        event_type="wake_confirmed",
+        delta=4,
+        reason="Подтверждён подъём утром",
+    )
+    await safe_edit(
+        callback.message,
+        f"☀️ Отлично, доброе утро! +4 кармы ({k_res['score_after']}/100).",
+        reply_markup=None,
+    )
+    await callback.answer("Доброе утро!")

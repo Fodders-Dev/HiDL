@@ -28,6 +28,7 @@ from handlers import (
     routines,
     day_plan,
     kitchen,
+    pulse,
     settings as settings_handler,
     start,
     stats,
@@ -96,6 +97,7 @@ async def create_app(test_mode: bool = False) -> AppContext:
     routers = (
         start.router,
         menu.router,
+        pulse.router,
         schedule.router,
         knowledge.router,
         routines.router,

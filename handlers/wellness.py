@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from services import karma_service, pulse_service
 from utils import texts
 from utils.menu_match import match_menu_label
 from utils.sender import safe_edit
@@ -365,20 +366,29 @@ async def meal_confirm(callback: types.CallbackQuery, db) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     
     if action == "yes":
-        # Добавляем +1 очко за приём пищи
         await repo.add_points(db, user["id"], 1, local_date)
+        k_res = await karma_service.record_karma_event(
+            db,
+            user,
+            domain="food",
+            event_type="meal_confirm",
+            delta=3,
+            reason="Подтверждён приём пищи",
+        )
         await callback.message.edit_text(
-            "🎉 Отлично! Молодец что позаботился о себе. +1 очко!",
-            reply_markup=None
+            f"🎉 Отлично! Молодец что позаботился о себе. +1 очко, +3 кармы ({k_res['score_after']}/100)!",
+            reply_markup=None,
         )
         await callback.answer("Записано! +1 🌟")
     elif action == "later":
-        # TODO: можно добавить отложенное напоминание через 30-60 минут
-        await callback.message.edit_text(
-            "⏰ Ок, напомню попозже. Не забудь поесть!",
-            reply_markup=None
+        snooze = await pulse_service.schedule_adhoc_snooze(
+            db, user, "lunch_snooze", "food", 30, "Поесть"
         )
-        await callback.answer("Напомню позже")
+        await callback.message.edit_text(
+            f"⏰ Ок, поставила напоминание на {snooze['next_local_hhmm']} (+30 мин). Не забудь поесть!",
+            reply_markup=None,
+        )
+        await callback.answer(f"Напомню в {snooze['next_local_hhmm']}")
     else:
         await callback.answer()
 
@@ -390,25 +400,36 @@ async def water_confirm(callback: types.CallbackQuery, db) -> None:
     if len(parts) < 3:
         await callback.answer()
         return
-    
+
     local_date = parts[1]
     action = parts[2]
-    
+
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    
+
     if action == "yes":
         await repo.add_points(db, user["id"], 1, local_date)
+        k_res = await karma_service.record_karma_event(
+            db,
+            user,
+            domain="hygiene",
+            event_type="water_confirm",
+            delta=2,
+            reason="Выпит стакан воды",
+        )
         await callback.message.edit_text(
-            "💧 Умничка! Водный баланс — это важно. +1 очко!",
-            reply_markup=None
+            f"💧 Умничка! Водный баланс — это важно. +1 очко, +2 кармы ({k_res['score_after']}/100)!",
+            reply_markup=None,
         )
         await callback.answer("Записано! +1 🌟")
     elif action == "later":
-        await callback.message.edit_text(
-            "⏰ Ок, напомню попозже. Вода ждёт тебя!",
-            reply_markup=None
+        snooze = await pulse_service.schedule_adhoc_snooze(
+            db, user, "water_snooze", "hygiene", 30, "Выпить воды"
         )
-        await callback.answer("Напомню позже")
+        await callback.message.edit_text(
+            f"⏰ Ок, напомню о воде в {snooze['next_local_hhmm']} (+30 мин)!",
+            reply_markup=None,
+        )
+        await callback.answer(f"Напомню в {snooze['next_local_hhmm']}")
     else:
         await callback.answer()
 

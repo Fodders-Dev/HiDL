@@ -4,6 +4,7 @@ from typing import Tuple
 from aiogram import types
 
 from db import repositories as repo
+from services import karma_service
 from utils.finance import payday_summary
 from utils.time import local_date_str, format_date_display, format_time_local
 from utils.formatting import format_money
@@ -166,7 +167,18 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     important_total = min(3, len(routine_lines) + len(custom_lines) + len(regular_lines)) if adhd else total_today
     routine_done_cnt = sum(r["cnt"] for r in stats_r if r["status"] == "done")
     routine_total_cnt = sum(r["cnt"] for r in stats_r)
+    karma_state = await repo.get_or_create_karma_state(db, user["id"])
+    karma_score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
+    karma_mode = karma_service.get_karma_mode(karma_score)
+    checkins_today = await repo.list_pulse_checkins_for_date(db, user["id"], local_date)
+    std_slots = {"wake", "lunch", "afternoon", "dinner", "winddown", "bedtime"}
+    std_checkins = [c for c in checkins_today if c.get("slot_key") in std_slots]
+    pulse_done = sum(1 for c in std_checkins if c.get("status") == "done")
+    pulse_total = max(6, len(std_checkins))
+    sick_badge = " · 🤒 ЧП-заморозка" if karma_service.is_sick_freeze_active(user, now_utc) else ""
+
     summary_lines = [
+        f"{karma_mode['emoji']} Карма: {karma_score}/100 ({karma_mode['label']}) • Пульс дня: {pulse_done}/{pulse_total}{sick_badge}",
         f"✅ Прогресс: {done_today}/{important_total or total_today or 0} за сегодня",
         f"🌞 Рутины: {routine_done_cnt}/{routine_total_cnt}",
     ]
@@ -294,6 +306,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     kb_buttons = []
     if first_pending_routine_row:
         kb_buttons.append(first_pending_routine_row)
+    kb_buttons.append([types.InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")])
     has_any_reminders = bool(custom)
     kb_buttons.append([types.InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")])
     if has_any_reminders:

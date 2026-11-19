@@ -9,13 +9,31 @@ from aiogram.types import (
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="🍽 Еда")],
-            [KeyboardButton(text="💰 Деньги"), KeyboardButton(text="🧹 Дом")],
-            [KeyboardButton(text="🏋️ Спорт"), KeyboardButton(text="🛒 Покупки")],
-            [KeyboardButton(text="🗓 Расписание"), KeyboardButton(text="📓 Дневник")],
-            [KeyboardButton(text="⚙ Настройки"), KeyboardButton(text="☕ Кафе фокуса")],
+            [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="🍽 Еда и покупки")],
+            [KeyboardButton(text="🌙 Сон и карма"), KeyboardButton(text="🗓 Расписание")],
+            [KeyboardButton(text="📓 Дневник"), KeyboardButton(text="⚙ Ещё")],
         ],
         resize_keyboard=True,
+    )
+
+
+def more_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🧹 Дом", callback_data="more:home"),
+                InlineKeyboardButton(text="💰 Деньги", callback_data="more:money"),
+            ],
+            [
+                InlineKeyboardButton(text="🏋️ Спорт", callback_data="more:sport"),
+                InlineKeyboardButton(text="☕ Кафе фокуса", callback_data="more:focus"),
+            ],
+            [
+                InlineKeyboardButton(text="🤒 Болею / ЧП (24ч)", callback_data="pulse:sick:prompt"),
+                InlineKeyboardButton(text="⚙ Настройки", callback_data="settings:main"),
+            ],
+            [InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")],
+        ]
     )
 
 

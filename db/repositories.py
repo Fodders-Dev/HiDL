@@ -3417,3 +3417,439 @@ async def delete_user_personal_data(
         "journal_entries": int(c2.rowcount or 0),
         "inbox_messages": int(c3.rowcount or 0),
     }
+
+
+_KARMA_STATE_FIELDS = {
+    "score",
+    "sleep_debt",
+    "food_debt",
+    "tasks_debt",
+    "hygiene_debt",
+    "sleep_streak",
+    "food_streak",
+    "tasks_streak",
+    "hygiene_streak",
+    "last_event_summary",
+    "updated_at",
+}
+
+_PULSE_CHECKIN_FIELDS = {
+    "domain",
+    "status",
+    "ping_count",
+    "snooze_count",
+    "scheduled_at_utc",
+    "next_ping_at_utc",
+    "last_ping_at_utc",
+    "resolved_at_utc",
+    "meta_json",
+    "updated_at",
+}
+
+
+async def get_or_create_karma_state(
+    conn: aiosqlite.Connection, user_id: int
+) -> Dict[str, Any]:
+    """Вернуть состояние кармы пользователя, создав базовую запись при первом обращении."""
+    cur = await conn.execute(
+        "SELECT * FROM user_karma_state WHERE user_id = ?",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    if row:
+        return dict(row)
+    now = utc_now_str()
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO user_karma_state (user_id, updated_at)
+        VALUES (?, ?)
+        """,
+        (user_id, now),
+    )
+    await conn.commit()
+    cur = await conn.execute(
+        "SELECT * FROM user_karma_state WHERE user_id = ?",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else {"user_id": user_id, "score": 70}
+
+
+async def update_karma_state(
+    conn: aiosqlite.Connection, user_id: int, **fields: Any
+) -> None:
+    """Обновить разрешённые поля состояния кармы."""
+    await get_or_create_karma_state(conn, user_id)
+    filtered = {k: v for k, v in fields.items() if k in _KARMA_STATE_FIELDS}
+    if not filtered:
+        return
+    filtered.setdefault("updated_at", utc_now_str())
+    cols = ", ".join(f"{k} = ?" for k in filtered)
+    vals = list(filtered.values()) + [user_id]
+    await conn.execute(
+        f"UPDATE user_karma_state SET {cols} WHERE user_id = ?",
+        vals,
+    )
+    await conn.commit()
+
+
+async def insert_karma_event(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+    domain: str,
+    event_type: str,
+    delta: int,
+    score_after: int,
+    reason: str,
+    created_at: str | None = None,
+) -> int:
+    """Добавить событие изменения кармы."""
+    ts = created_at or utc_now_str()
+    cur = await conn.execute(
+        """
+        INSERT INTO karma_events
+        (user_id, local_date, domain, event_type, delta, score_after, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, local_date, domain, event_type, int(delta), int(score_after), reason, ts),
+    )
+    await conn.commit()
+    return int(cur.lastrowid)
+
+
+async def list_karma_events(
+    conn: aiosqlite.Connection, user_id: int, limit: int = 10
+) -> List[Dict[str, Any]]:
+    """Вернуть последние события кармы (сначала новые)."""
+    cur = await conn.execute(
+        """
+        SELECT * FROM karma_events
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, max(1, int(limit))),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def sum_karma_delta_for_date(
+    conn: aiosqlite.Connection, user_id: int, local_date: str
+) -> int:
+    """Посчитать суммарную дельту кармы пользователя за локальную дату."""
+    cur = await conn.execute(
+        """
+        SELECT COALESCE(SUM(delta), 0) AS total
+        FROM karma_events
+        WHERE user_id = ? AND local_date = ?
+        """,
+        (user_id, local_date),
+    )
+    row = await cur.fetchone()
+    return int(row["total"] or 0) if row else 0
+
+
+async def update_user_weekend_schedule(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    weekend_wake: str,
+    weekend_sleep: str,
+) -> None:
+    """Обновить расписание подъёма и отбоя на выходные."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE users
+        SET weekend_wake_up_time = ?, weekend_sleep_time = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (weekend_wake, weekend_sleep, now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_user_pulse_flags(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    pulse_enabled: Optional[bool] = None,
+    legacy_pings_enabled: Optional[bool] = None,
+) -> None:
+    """Обновить флаги Пульса дня и legacy-уведомлений."""
+    updates: Dict[str, Any] = {}
+    if pulse_enabled is not None:
+        updates["pulse_enabled"] = 1 if pulse_enabled else 0
+    if legacy_pings_enabled is not None:
+        updates["legacy_pings_enabled"] = 1 if legacy_pings_enabled else 0
+    if not updates:
+        return
+    updates["updated_at"] = utc_now_str()
+    cols = ", ".join(f"{k} = ?" for k in updates)
+    vals = list(updates.values()) + [user_id]
+    await conn.execute(f"UPDATE users SET {cols} WHERE id = ?", vals)
+    await conn.commit()
+
+
+async def update_user_sick_freeze(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    sick_until_utc: Optional[str],
+    sick_uses_month: str,
+    sick_uses_count: int,
+) -> None:
+    """Сохранить заморозку «Болею / форс-мажор» и месячный счётчик."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE users
+        SET sick_until_utc = ?, sick_uses_month = ?, sick_uses_count = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (sick_until_utc, sick_uses_month, int(sick_uses_count), now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_user_sleep_confirmed(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+    confirmed_at_utc: str,
+) -> None:
+    """Зафиксировать, что пользователь подтвердил отбой («убрал мобилу»)."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE users
+        SET sleep_confirmed_date = ?, sleep_confirmed_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (local_date, confirmed_at_utc, now, user_id),
+    )
+    await conn.commit()
+
+
+async def clear_user_sleep_confirmed(conn: aiosqlite.Connection, user_id: int) -> None:
+    """Сбросить активное состояние ночного отбоя при пробуждении."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE users
+        SET sleep_confirmed_date = NULL, sleep_confirmed_at = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (now, user_id),
+    )
+    await conn.commit()
+
+
+async def update_user_night_catch(
+    conn: aiosqlite.Connection, user_id: int, caught_at_utc: str
+) -> None:
+    """Сохранить время последнего ночного предупреждения."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET night_catch_last_at = ?, updated_at = ? WHERE id = ?",
+        (caught_at_utc, now, user_id),
+    )
+    await conn.commit()
+
+
+async def get_pulse_checkin(
+    conn: aiosqlite.Connection, user_id: int, local_date: str, slot_key: str
+) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute(
+        """
+        SELECT * FROM pulse_checkins
+        WHERE user_id = ? AND local_date = ? AND slot_key = ?
+        """,
+        (user_id, local_date, slot_key),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_pulse_checkin_by_id(
+    conn: aiosqlite.Connection, checkin_id: int
+) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT * FROM pulse_checkins WHERE id = ?",
+        (checkin_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def upsert_pulse_checkin(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+    slot_key: str,
+    domain: str,
+    scheduled_at_utc: str,
+    next_ping_at_utc: str,
+    status: str = "pending",
+    meta_json: str = "{}",
+) -> Dict[str, Any]:
+    """Создать чек-ин слота, если он ещё не создан (или вернуть существующий)."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO pulse_checkins
+        (user_id, local_date, slot_key, domain, status, ping_count, snooze_count,
+         scheduled_at_utc, next_ping_at_utc, meta_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            local_date,
+            slot_key,
+            domain,
+            status,
+            scheduled_at_utc,
+            next_ping_at_utc,
+            meta_json,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    row = await get_pulse_checkin(conn, user_id, local_date, slot_key)
+    return row or {}
+
+
+async def update_pulse_checkin(
+    conn: aiosqlite.Connection, checkin_id: int, **fields: Any
+) -> Optional[Dict[str, Any]]:
+    filtered = {k: v for k, v in fields.items() if k in _PULSE_CHECKIN_FIELDS}
+    if not filtered:
+        return await get_pulse_checkin_by_id(conn, checkin_id)
+    filtered.setdefault("updated_at", utc_now_str())
+    cols = ", ".join(f"{k} = ?" for k in filtered)
+    vals = list(filtered.values()) + [checkin_id]
+    await conn.execute(
+        f"UPDATE pulse_checkins SET {cols} WHERE id = ?",
+        vals,
+    )
+    await conn.commit()
+    return await get_pulse_checkin_by_id(conn, checkin_id)
+
+
+async def list_pulse_checkins_for_date(
+    conn: aiosqlite.Connection, user_id: int, local_date: str
+) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        """
+        SELECT * FROM pulse_checkins
+        WHERE user_id = ? AND local_date = ?
+        ORDER BY scheduled_at_utc ASC, id ASC
+        """,
+        (user_id, local_date),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def list_due_pulse_checkins(
+    conn: aiosqlite.Connection, now_utc_iso: str
+) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        """
+        SELECT * FROM pulse_checkins
+        WHERE status IN ('pending', 'snoozed') AND next_ping_at_utc <= ?
+        ORDER BY next_ping_at_utc ASC, id ASC
+        """,
+        (now_utc_iso,),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def rollover_unfinished_day_plan_items(
+    conn: aiosqlite.Connection, user_id: int, from_date: str, to_date: str
+) -> int:
+    """Перенести незавершённые дела дня с from_date на to_date без дублей."""
+    src_cur = await conn.execute(
+        """
+        SELECT dpi.id, dpi.title, dpi.category, dpi.is_important
+        FROM day_plans dp
+        JOIN day_plan_items dpi ON dpi.plan_id = dp.id
+        WHERE dp.user_id = ? AND dp.plan_date = ? AND COALESCE(dpi.done, 0) = 0
+        ORDER BY dpi.is_important DESC, dpi.id ASC
+        """,
+        (user_id, from_date),
+    )
+    src_rows = rows_to_dicts(await src_cur.fetchall())
+    if not src_rows:
+        return 0
+
+    now = utc_now_str()
+    plan_cur = await conn.execute(
+        "SELECT id FROM day_plans WHERE user_id = ? AND plan_date = ?",
+        (user_id, to_date),
+    )
+    plan_row = await plan_cur.fetchone()
+    if plan_row:
+        target_plan_id = int(plan_row["id"])
+        await conn.execute(
+            "UPDATE day_plans SET updated_at = ? WHERE id = ?",
+            (now, target_plan_id),
+        )
+    else:
+        ins_cur = await conn.execute(
+            """
+            INSERT INTO day_plans (user_id, plan_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, to_date, now, now),
+        )
+        target_plan_id = int(ins_cur.lastrowid)
+
+    existing_cur = await conn.execute(
+        """
+        SELECT dpi.title
+        FROM day_plans dp
+        JOIN day_plan_items dpi ON dpi.plan_id = dp.id
+        WHERE dp.user_id = ? AND dp.plan_date = ?
+        """,
+        (user_id, to_date),
+    )
+    existing_titles = {
+        str(r["title"] or "").strip().lower() for r in await existing_cur.fetchall()
+    }
+
+    moved_ids: list[int] = []
+    inserted = 0
+    for item in src_rows:
+        title = str(item.get("title") or "").strip()
+        norm = title.lower()
+        moved_ids.append(int(item["id"]))
+        if not title or norm in existing_titles:
+            continue
+        existing_titles.add(norm)
+        await conn.execute(
+            """
+            INSERT INTO day_plan_items
+            (plan_id, user_id, title, category, is_important, done, synced_to_today, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+            """,
+            (
+                target_plan_id,
+                user_id,
+                title,
+                item.get("category") or "misc",
+                1 if item.get("is_important") else 0,
+                now,
+                now,
+            ),
+        )
+        inserted += 1
+
+    if moved_ids:
+        placeholders = ",".join("?" for _ in moved_ids)
+        await conn.execute(
+            f"DELETE FROM day_plan_items WHERE user_id = ? AND id IN ({placeholders})",
+            (user_id, *moved_ids),
+        )
+    await conn.commit()
+    return inserted
+

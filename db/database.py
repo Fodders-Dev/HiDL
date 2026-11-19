@@ -111,6 +111,16 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             daily_brief_last_date TEXT,
             focus_strikes INTEGER DEFAULT 0,
             focus_cooldown_until TEXT,
+            weekend_wake_up_time TEXT DEFAULT '',
+            weekend_sleep_time TEXT DEFAULT '',
+            pulse_enabled INTEGER DEFAULT 1,
+            legacy_pings_enabled INTEGER DEFAULT 0,
+            sick_until_utc TEXT,
+            sick_uses_month TEXT DEFAULT '',
+            sick_uses_count INTEGER DEFAULT 0,
+            sleep_confirmed_date TEXT,
+            sleep_confirmed_at TEXT,
+            night_catch_last_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -520,6 +530,61 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             ON mcp_oauth_tokens(client_id, token_type);
         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_expires
             ON mcp_oauth_codes(expires_at);
+
+        CREATE TABLE IF NOT EXISTS user_karma_state (
+            user_id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL DEFAULT 70,
+            sleep_debt INTEGER NOT NULL DEFAULT 0,
+            food_debt INTEGER NOT NULL DEFAULT 0,
+            tasks_debt INTEGER NOT NULL DEFAULT 0,
+            hygiene_debt INTEGER NOT NULL DEFAULT 0,
+            sleep_streak INTEGER NOT NULL DEFAULT 0,
+            food_streak INTEGER NOT NULL DEFAULT 0,
+            tasks_streak INTEGER NOT NULL DEFAULT 0,
+            hygiene_streak INTEGER NOT NULL DEFAULT 0,
+            last_event_summary TEXT DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS karma_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            delta INTEGER NOT NULL,
+            score_after INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_karma_events_user_date
+            ON karma_events(user_id, local_date, id);
+
+        CREATE TABLE IF NOT EXISTS pulse_checkins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            slot_key TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            ping_count INTEGER NOT NULL DEFAULT 0,
+            snooze_count INTEGER NOT NULL DEFAULT 0,
+            scheduled_at_utc TEXT NOT NULL,
+            next_ping_at_utc TEXT NOT NULL,
+            last_ping_at_utc TEXT,
+            resolved_at_utc TEXT,
+            meta_json TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, local_date, slot_key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pulse_checkins_due
+            ON pulse_checkins(status, next_ping_at_utc);
         """
     )
     await ensure_columns(conn)
@@ -558,6 +623,20 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE users ADD COLUMN focus_strikes INTEGER DEFAULT 0;")
     if "focus_cooldown_until" not in user_cols:
         await conn.execute("ALTER TABLE users ADD COLUMN focus_cooldown_until TEXT;")
+    for col_name, col_def in (
+        ("weekend_wake_up_time", "TEXT DEFAULT ''"),
+        ("weekend_sleep_time", "TEXT DEFAULT ''"),
+        ("pulse_enabled", "INTEGER DEFAULT 1"),
+        ("legacy_pings_enabled", "INTEGER DEFAULT 0"),
+        ("sick_until_utc", "TEXT"),
+        ("sick_uses_month", "TEXT DEFAULT ''"),
+        ("sick_uses_count", "INTEGER DEFAULT 0"),
+        ("sleep_confirmed_date", "TEXT"),
+        ("sleep_confirmed_at", "TEXT"),
+        ("night_catch_last_at", "TEXT"),
+    ):
+        if col_name not in user_cols:
+            await conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")
 
     articles_info = await conn.execute_fetchall("PRAGMA table_info(knowledge_articles);")
     article_cols = {row["name"] for row in articles_info}
@@ -955,6 +1034,61 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             ON mcp_oauth_tokens(client_id, token_type);
         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_expires
             ON mcp_oauth_codes(expires_at);
+
+        CREATE TABLE IF NOT EXISTS user_karma_state (
+            user_id INTEGER PRIMARY KEY,
+            score INTEGER NOT NULL DEFAULT 70,
+            sleep_debt INTEGER NOT NULL DEFAULT 0,
+            food_debt INTEGER NOT NULL DEFAULT 0,
+            tasks_debt INTEGER NOT NULL DEFAULT 0,
+            hygiene_debt INTEGER NOT NULL DEFAULT 0,
+            sleep_streak INTEGER NOT NULL DEFAULT 0,
+            food_streak INTEGER NOT NULL DEFAULT 0,
+            tasks_streak INTEGER NOT NULL DEFAULT 0,
+            hygiene_streak INTEGER NOT NULL DEFAULT 0,
+            last_event_summary TEXT DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS karma_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            delta INTEGER NOT NULL,
+            score_after INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_karma_events_user_date
+            ON karma_events(user_id, local_date, id);
+
+        CREATE TABLE IF NOT EXISTS pulse_checkins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            slot_key TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            ping_count INTEGER NOT NULL DEFAULT 0,
+            snooze_count INTEGER NOT NULL DEFAULT 0,
+            scheduled_at_utc TEXT NOT NULL,
+            next_ping_at_utc TEXT NOT NULL,
+            last_ping_at_utc TEXT,
+            resolved_at_utc TEXT,
+            meta_json TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, local_date, slot_key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pulse_checkins_due
+            ON pulse_checkins(status, next_ping_at_utc);
         """
     )
 

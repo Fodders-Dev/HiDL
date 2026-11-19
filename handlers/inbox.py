@@ -15,7 +15,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import inbox_service
+from services import inbox_service, pulse_service
 from services.inbox_parser import resolve_temporal_expression
 from utils.menu_match import match_menu_label
 from utils.sender import safe_edit
@@ -50,6 +50,7 @@ def _load_payload(action: dict[str, Any]) -> dict[str, Any]:
 async def handle_free_text_inbox(message: types.Message, db) -> None:
     """Единая точка входа для произвольного текста из natural_handler."""
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    night_notice = await pulse_service.check_night_violation(db, user)
     outcome = await inbox_service.capture_and_process_text(
         db,
         user,
@@ -57,8 +58,9 @@ async def handle_free_text_inbox(message: types.Message, db) -> None:
         message_id=message.message_id,
         text=message.text or "",
     )
+    reply_text = f"{night_notice}\n\n{outcome.reply_text}" if night_notice else outcome.reply_text
     await message.answer(
-        outcome.reply_text,
+        reply_text,
         reply_markup=outcome.reply_markup or main_menu_keyboard(),
     )
 
@@ -76,6 +78,7 @@ async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> N
     if current and current.startswith("InboxEditState:"):
         await state.clear()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    night_notice = await pulse_service.check_night_violation(db, user)
     outcome = await inbox_service.capture_and_process_voice(
         db,
         message.bot,
@@ -84,8 +87,9 @@ async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> N
         message_id=message.message_id,
         voice=message.voice,
     )
+    reply_text = f"{night_notice}\n\n{outcome.reply_text}" if night_notice else outcome.reply_text
     await message.answer(
-        outcome.reply_text,
+        reply_text,
         reply_markup=outcome.reply_markup or main_menu_keyboard(),
     )
 
