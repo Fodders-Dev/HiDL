@@ -40,6 +40,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env_str(name).lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _resolve_provider_defaults(
     provider: str,
     *,
@@ -133,6 +144,22 @@ class STTSettings:
     timeout_sec: float
     max_duration_sec: int
     routes: list[STTRouteSettings] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MCPSettings:
+    """Runtime configuration for HiDL remote MCP server."""
+
+    host: str
+    port: int
+    public_base_url: str
+    owner_telegram_id: int
+    access_password: str
+    bearer_token: str
+    allow_diary: bool
+    readonly: bool
+    access_token_ttl_sec: int
+    refresh_token_ttl_sec: int
 
 
 def get_settings(require_bot_token: bool = True) -> Settings:
@@ -295,4 +322,24 @@ def get_stt_settings() -> STTSettings:
         timeout_sec=timeout_sec,
         max_duration_sec=max_duration_sec,
         routes=routes,
+    )
+
+
+def get_mcp_settings() -> MCPSettings:
+    """Build MCPSettings for Streamable HTTP server and OAuth 2.1 flow."""
+    host = _env_str("MCP_HOST", "127.0.0.1") or "127.0.0.1"
+    port = max(1, min(65535, _env_int("MCP_PORT", 8765)))
+    raw_public = _env_str("MCP_PUBLIC_BASE_URL", f"http://{host}:{port}").rstrip("/")
+    public_base_url = raw_public or f"http://{host}:{port}"
+    return MCPSettings(
+        host=host,
+        port=port,
+        public_base_url=public_base_url,
+        owner_telegram_id=max(0, _env_int("MCP_OWNER_TELEGRAM_ID", 0)),
+        access_password=_env_str("MCP_ACCESS_PASSWORD"),
+        bearer_token=_env_str("MCP_BEARER_TOKEN"),
+        allow_diary=_env_bool("MCP_ALLOW_DIARY", True),
+        readonly=_env_bool("MCP_READONLY", False),
+        access_token_ttl_sec=max(300, _env_int("MCP_ACCESS_TOKEN_TTL_SEC", 86400)),
+        refresh_token_ttl_sec=max(3600, _env_int("MCP_REFRESH_TOKEN_TTL_SEC", 7776000)),
     )

@@ -483,6 +483,43 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
             FOREIGN KEY (inbox_message_id) REFERENCES inbox_messages(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_secret_hash TEXT DEFAULT '',
+            client_name TEXT DEFAULT '',
+            redirect_uris_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_oauth_codes (
+            code_hash TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            code_challenge_method TEXT NOT NULL,
+            resource TEXT DEFAULT '',
+            scope TEXT DEFAULT '',
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            token_type TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            resource TEXT DEFAULT '',
+            scope TEXT DEFAULT '',
+            expires_at TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_client_type
+            ON mcp_oauth_tokens(client_id, token_type);
+        CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_expires
+            ON mcp_oauth_codes(expires_at);
         """
     )
     await ensure_columns(conn)
@@ -881,6 +918,43 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
             FOREIGN KEY (inbox_message_id) REFERENCES inbox_messages(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_secret_hash TEXT DEFAULT '',
+            client_name TEXT DEFAULT '',
+            redirect_uris_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_oauth_codes (
+            code_hash TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            code_challenge_method TEXT NOT NULL,
+            resource TEXT DEFAULT '',
+            scope TEXT DEFAULT '',
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            token_type TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            resource TEXT DEFAULT '',
+            scope TEXT DEFAULT '',
+            expires_at TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_client_type
+            ON mcp_oauth_tokens(client_id, token_type);
+        CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_expires
+            ON mcp_oauth_codes(expires_at);
         """
     )
 
