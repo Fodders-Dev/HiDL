@@ -676,6 +676,135 @@ class Sprint13CalendarMCP2Tests(unittest.IsolatedAsyncioTestCase):
         _, res_c = await _rpc("resources/read", {"uri": "hidl://calendar"})
         self.assertIn("Созвон Архитектура", res_c["result"]["contents"][0]["text"])
 
+    async def test_6_polish_voice_calendar_no_aiogram_mcp_and_privacy(self):
+        import datetime
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from config import GoogleCalendarSettings, MCPSettings
+        from db import repositories as repo
+        from mcp_server.app import create_mcp_app
+        from services import calendar_service, inbox_service
+
+        repo_root = Path(__file__).resolve().parents[1]
+
+        # 1. mcp_server.app must import cleanly with zero aiogram modules loaded
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-c",
+                "import sys, mcp_server.app; assert 'aiogram' not in sys.modules",
+            ],
+            cwd=str(repo_root),
+        )
+
+        # 2. GET / and GET /privacy return HTTP 200 HTML
+        mcp_settings = MCPSettings(
+            host="127.0.0.1",
+            port=8000,
+            public_base_url="https://example.test",
+            owner_telegram_id=123456,
+            access_password="pw",
+            bearer_token="tok",
+            allow_diary=True,
+            readonly=False,
+            access_token_ttl_sec=3600,
+            refresh_token_ttl_sec=86400,
+        )
+        app = create_mcp_app(self.db, mcp_settings)
+        async with TestClient(TestServer(app)) as client:
+            resp_index = await client.get("/")
+            self.assertEqual(resp_index.status, 200)
+            index_html = await resp_index.text()
+            self.assertIn("HiDL", index_html)
+            self.assertIn("/privacy", index_html)
+
+            resp_privacy = await client.get("/privacy")
+            self.assertEqual(resp_privacy.status, 200)
+            privacy_html = await resp_privacy.text()
+            self.assertIn("Google Calendar", privacy_html)
+            self.assertIn("/gcal", privacy_html)
+
+        # 3. Voice/text calendar_event creation + query + Undo Google Calendar deletion
+        user = getattr(self, "user", None)
+        if user is None:
+            cur = await self.db.execute("SELECT * FROM users ORDER BY id ASC LIMIT 1")
+            user = dict(await cur.fetchone())
+        user_id = int(user["id"])
+        chat_id = int(user.get("telegram_id") or 123456)
+
+        await repo.upsert_calendar_connection(
+            self.db,
+            user_id,
+            "google_oauth",
+            label="Google Calendar (OAuth)",
+            calendar_id="primary",
+            access_token="test-access-token",
+            refresh_token="test-refresh-token",
+            token_expires_at="2099-01-01T00:00:00+00:00",
+        )
+
+        posted = []
+        deleted = []
+
+        async def _fake_gcal_post(url: str, access_token: str, body: dict):
+            posted.append((url, access_token, body))
+            return {"id": "gcal-evt-polish-1", "iCalUID": "gcal-evt-polish-1@google.com"}
+
+        async def _fake_gcal_delete(url: str, access_token: str):
+            deleted.append((url, access_token))
+
+        gcal_cfg = GoogleCalendarSettings(
+            client_id="cid",
+            client_secret="csec",
+            redirect_uri="https://example.test/gcal/callback",
+            scopes="https://www.googleapis.com/auth/calendar.events",
+        )
+        now_utc = datetime.datetime(2026, 11, 20, 9, 0, 0)
+
+        with (
+            patch.dict(os.environ, {"LLM_ENABLED": "0"}, clear=False),
+            patch("services.calendar_service.get_gcal_settings", return_value=gcal_cfg),
+            patch("services.calendar_service._default_gcal_post", side_effect=_fake_gcal_post),
+            patch("services.calendar_service._default_gcal_delete", side_effect=_fake_gcal_delete),
+        ):
+            outcome = await inbox_service.capture_and_process_text(
+                self.db,
+                user,
+                chat_id=chat_id,
+                message_id=91001,
+                text="Запиши в календарь завтра в 15:00 стоматолог на час",
+                now_utc=now_utc,
+                llm_client_instance=None,
+            )
+            self.assertEqual(outcome.status, "processed")
+            self.assertIn("📅 Календарь:", outcome.reply_text)
+            self.assertIn("Стоматолог", outcome.reply_text)
+            self.assertEqual(len(posted), 1)
+            self.assertEqual(posted[0][2]["summary"], "Стоматолог")
+
+            query_outcome = await inbox_service.capture_and_process_text(
+                self.db,
+                user,
+                chat_id=chat_id,
+                message_id=91002,
+                text="Что у меня в календаре?",
+                now_utc=now_utc,
+                llm_client_instance=None,
+            )
+            self.assertIn("Стоматолог", query_outcome.reply_text)
+            self.assertEqual(len(await repo.list_journal_entries(self.db, user_id)), 0)
+
+            undone_count = await inbox_service.undo_inbox_message(self.db, user, outcome.inbox_id)
+            self.assertGreaterEqual(undone_count, 1)
+            self.assertEqual(len(deleted), 1)
+            self.assertIn("gcal-evt-polish-1", deleted[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

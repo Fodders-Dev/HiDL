@@ -5,15 +5,16 @@ from __future__ import annotations
 import datetime
 import html
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
-
-from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from services import calendar_service, karma_service
 from utils.time import format_time_local, local_date_str, parse_hhmm, tzinfo_from_string
+
+if TYPE_CHECKING:
+    from aiogram import Bot
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 SLOT_TITLES: Dict[str, str] = {
     "wake": "Подъём",
@@ -251,6 +252,8 @@ def build_pulse_message(
     context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     """Собрать текст и кнопки для чек-ина Пульса с учётом кармы и уровня эскалации."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
     cid = int(checkin["id"])
     slot_key = str(checkin.get("slot_key") or "")
     domain = str(checkin.get("domain") or "tasks")
@@ -413,10 +416,6 @@ def build_pulse_message(
             else:
                 intro = "🌙 <b>Отбой!</b> Убирай мобилу, ставь на зарядку и ложись спать."
             lines = [intro, header_badge]
-            planned_lunch = ctx.get("planned_meal")
-            if isinstance(planned_lunch, dict) and planned_lunch.get("title"):
-                t_lu = int(planned_lunch.get("time_minutes") or 20)
-                lines.append(f"🍽 По плану на обед: <b>{html.escape(str(planned_lunch['title']))}</b> ({t_lu} мин)")
             if debt_note:
                 lines.append(f"💬 {html.escape(debt_note)}")
             text = "\n".join(lines)
@@ -506,6 +505,8 @@ def build_pulse_message(
 
 
 def build_wake_checklist_keyboard(checkin_id: int, meta: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
     m = meta or {}
     water_mark = "✅" if m.get("water_done") else "⬜️"
     teeth_mark = "✅" if m.get("teeth_done") else "⬜️"

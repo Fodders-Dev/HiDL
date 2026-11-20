@@ -14,7 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
-from services import advice_service, context_builder, karma_service, kitchen_ai, pulse_service, stt
+from services import advice_service, calendar_service, context_builder, karma_service, kitchen_ai, pulse_service, stt
 from services.inbox_parser import (
     InboxParseResult,
     ParsedInboxItem,
@@ -23,11 +23,12 @@ from services.inbox_parser import (
 )
 from utils.pantry import format_quantity
 from utils.rows import rows_to_dicts
-from utils.time import format_date_display, local_date_str
+from utils.time import format_date_display, local_date_str, parse_hhmm
 
 KIND_LABELS = {
     "task": ("✅", "Задача"),
     "reminder": ("🔔", "Напоминание"),
+    "calendar_event": ("📅", "Календарь"),
     "shopping": ("🛒", "Покупки"),
     "shopping_remove": ("🗑", "Убрано из покупок"),
     "pantry_add": ("🧊", "В холодильник"),
@@ -95,6 +96,14 @@ def _format_action_line(action: dict[str, Any]) -> str:
         t = payload.get("resolved_time")
         when = f"{format_date_display(d)} {t}".strip() if d else (t or "")
         return f"{icon} {label}: {title}" + (f" — {when}" if when else "")
+    if kind == "calendar_event":
+        d = payload.get("resolved_date")
+        st_t = payload.get("start_time") or ""
+        en_t = payload.get("end_time") or ""
+        span = f"{st_t}–{en_t}" if st_t and en_t else st_t
+        when = f"{format_date_display(d)} {span}".strip() if d else span
+        g_note = " (Google Calendar)" if payload.get("google_synced") else ""
+        return f"{icon} {label}: {title}" + (f" — {when}" if when else "") + g_note
     if kind == "shopping":
         qty = payload.get("quantity", 1)
         unit = payload.get("unit", "шт")
@@ -283,6 +292,16 @@ def render_inbox_summary(
         intent=intent,
     )
     return "\n".join(lines), (kb if kb.inline_keyboard else None)
+
+
+def _compute_end_hhmm(start_hhmm: str, duration_minutes: int) -> str:
+    st_t = parse_hhmm(start_hhmm) or datetime.time(9, 0)
+    st_min = st_t.hour * 60 + st_t.minute
+    dur = max(15, min(720, int(duration_minutes or 60)))
+    en_min = min(23 * 60 + 59, st_min + dur)
+    if en_min <= st_min:
+        en_min = min(23 * 60 + 59, st_min + 15)
+    return f"{en_min // 60:02d}:{en_min % 60:02d}"
 
 
 async def _persist_parsed_items(
@@ -631,6 +650,71 @@ async def _persist_parsed_items(
                     "ambiguity_reason": sched.ambiguity_reason if sched else "vague_when",
                     "candidate_times": sched.candidate_times if sched else [],
                     "question": sched.question if sched else "На какую дату и время поставить напоминание?",
+                    "model_note": item.model_note,
+                }
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="pending_clarification",
+                    target_table="pending",
+                    target_id=None,
+                    title=item.title,
+                    source_quote=item.source_quote,
+                    payload=payload,
+                    status="clarifying",
+                )
+        elif kind == "calendar_event":
+            sched = item.schedule
+            if sched and not sched.is_ambiguous and sched.resolved_date and sched.resolved_time:
+                st_hhmm = sched.resolved_time
+                en_hhmm = _compute_end_hhmm(st_hhmm, item.duration_minutes)
+                cal_res = await calendar_service.create_unified_event(
+                    db,
+                    user,
+                    title=item.title,
+                    event_date=sched.resolved_date,
+                    start_time=st_hhmm,
+                    end_time=en_hhmm,
+                    location=item.location,
+                    category="inbox",
+                    push_to_google=True,
+                    now_utc=now,
+                )
+                ev_obj = cal_res.get("event") or {}
+                ev_id = int(ev_obj["id"]) if ev_obj.get("id") else None
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="calendar_event",
+                    target_table="calendar_event_created",
+                    target_id=ev_id,
+                    title=item.title,
+                    source_quote=item.source_quote,
+                    payload={
+                        "storage": cal_res.get("storage") or "local",
+                        "google_synced": bool(cal_res.get("google_synced")),
+                        "google_event_id": str(cal_res.get("google_event_id") or ""),
+                        "external_uid": str(ev_obj.get("external_uid") or ""),
+                        "resolved_date": sched.resolved_date,
+                        "start_time": st_hhmm,
+                        "end_time": en_hhmm,
+                        "location": item.location,
+                        "model_note": item.model_note,
+                    },
+                    status="active",
+                )
+            else:
+                payload = {
+                    "title": item.title,
+                    "is_calendar_event": True,
+                    "duration_minutes": int(item.duration_minutes or 60),
+                    "location": item.location,
+                    "resolved_date": sched.resolved_date if sched else None,
+                    "ambiguity_reason": sched.ambiguity_reason if sched else "vague_when",
+                    "candidate_times": sched.candidate_times if sched else [],
+                    "question": sched.question if sched else "На какую дату и время добавить событие в календарь?",
                     "model_note": item.model_note,
                 }
                 action_id = await repo.create_inbox_action(
@@ -1086,6 +1170,38 @@ async def _build_query_response(
 
         txt, kb = await render_today(db, user)
         return txt, kb, {"query_type": "today"}
+
+    if qt == "calendar":
+        now = now_utc or datetime.datetime.utcnow()
+        tz = user.get("timezone") or "UTC"
+        d_today = local_date_str(now, tz)
+        d_tomorrow = (datetime.date.fromisoformat(d_today) + datetime.timedelta(days=1)).isoformat()
+        events = await calendar_service.get_unified_events_range(db, int(user["id"]), d_today, d_tomorrow)
+        today_evs = [e for e in events if e.get("event_date") == d_today]
+        tom_evs = [e for e in events if e.get("event_date") == d_tomorrow]
+        lines = [f"🗓 <b>Календарь на {format_date_display(d_today)} и завтра</b>"]
+        if not events:
+            lines.append("\nНа ближайшие два дня событий не запланировано.")
+        if today_evs:
+            lines.append("\n<b>Сегодня:</b>")
+            for ev in today_evs[:8]:
+                when = "Весь день" if ev.get("is_all_day") else f"{ev.get('start_time')}–{ev.get('end_time')}"
+                lines.append(f"• {when} — {_esc(ev.get('title'))}")
+        if tom_evs:
+            lines.append("\n<b>Завтра:</b>")
+            for ev in tom_evs[:8]:
+                when = "Весь день" if ev.get("is_all_day") else f"{ev.get('start_time')}–{ev.get('end_time')}"
+                lines.append(f"• {when} — {_esc(ev.get('title'))}")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🗓 Расписание", callback_data="sched:home"),
+                    InlineKeyboardButton(text="🔄 Синхр.", callback_data="sched:sync"),
+                ],
+                [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
+            ]
+        )
+        return "\n".join(lines), kb, {"query_type": "calendar"}
 
     if qt == "karma":
         now = now_utc or datetime.datetime.utcnow()
@@ -1606,6 +1722,19 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
                 scope=str(synced_shop.get("scope") or "household"),
             )
         return
+    if table == "calendar_event_created":
+        user_row = await repo.get_user(db, user_id)
+        await calendar_service.delete_unified_event(
+            db,
+            dict(user_row) if user_row else {"id": user_id},
+            storage=str(payload.get("storage") or "local"),
+            event_id=int(tid) if tid else None,
+            google_event_id=str(payload.get("google_event_id") or ""),
+            external_uid=str(payload.get("external_uid") or ""),
+            event_date=str(payload.get("resolved_date") or ""),
+            start_time=str(payload.get("start_time") or ""),
+        )
+        return
     if not tid:
         return
     tid_int = int(tid)
@@ -1896,6 +2025,48 @@ async def resolve_clarification_action(
     eff_time = resolved_time
     if not eff_time:
         return None
+
+    if payload.get("is_calendar_event"):
+        en_hhmm = _compute_end_hhmm(eff_time, int(payload.get("duration_minutes") or 60))
+        loc = str(payload.get("location") or "")
+        cal_res = await calendar_service.create_unified_event(
+            db,
+            user,
+            title=title,
+            event_date=eff_date,
+            start_time=eff_time,
+            end_time=en_hhmm,
+            location=loc,
+            category="inbox",
+            push_to_google=True,
+            now_utc=now,
+        )
+        ev_obj = cal_res.get("event") or {}
+        ev_id = int(ev_obj["id"]) if ev_obj.get("id") else None
+        new_payload = {
+            "storage": cal_res.get("storage") or "local",
+            "google_synced": bool(cal_res.get("google_synced")),
+            "google_event_id": str(cal_res.get("google_event_id") or ""),
+            "external_uid": str(ev_obj.get("external_uid") or ""),
+            "resolved_date": eff_date,
+            "start_time": eff_time,
+            "end_time": en_hhmm,
+            "location": loc,
+            "model_note": payload.get("model_note", ""),
+        }
+        await repo.update_inbox_action(
+            db,
+            user["id"],
+            action_id,
+            item_kind="calendar_event",
+            target_table="calendar_event_created",
+            target_id=ev_id,
+            title=title,
+            payload_json=json.dumps(new_payload, ensure_ascii=False),
+            status="active",
+        )
+        await _sync_parent_inbox_status(db, user["id"], inbox_id)
+        return await repo.get_inbox_action(db, user["id"], action_id)
 
     rem_id = await repo.create_custom_reminder(
         db,

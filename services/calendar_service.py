@@ -578,6 +578,16 @@ async def _default_gcal_post(url: str, access_token: str, body: Dict[str, Any]) 
             return data
 
 
+async def _default_gcal_delete(url: str, access_token: str) -> None:
+    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.delete(url, headers=headers) as resp:
+            if resp.status in {200, 204, 404, 410}:
+                return
+            raise RuntimeError(f"Google Calendar DELETE HTTP {resp.status}")
+
+
 def _map_google_api_items(
     items: List[Dict[str, Any]],
     tz_str: str,
@@ -1018,7 +1028,8 @@ async def create_unified_event(
                 access_token,
                 body,
             )
-            ext_uid = str(created.get("iCalUID") or created.get("id") or f"gcal_{secrets.token_hex(6)}")
+            google_event_id = str(created.get("id") or "").strip()
+            ext_uid = str(created.get("iCalUID") or google_event_id or f"gcal_{secrets.token_hex(6)}")
             cached = await repo.upsert_single_calendar_event(
                 db,
                 user_id,
@@ -1039,6 +1050,7 @@ async def create_unified_event(
                 "ok": True,
                 "storage": "google_oauth",
                 "google_synced": True,
+                "google_event_id": google_event_id,
                 "google_error": "",
                 "event": cached,
             }
@@ -1059,6 +1071,7 @@ async def create_unified_event(
         "ok": True,
         "storage": "local",
         "google_synced": False,
+        "google_event_id": "",
         "google_error": google_error,
         "event": {
             "id": ev_id,
@@ -1073,6 +1086,67 @@ async def create_unified_event(
             "is_busy": 1,
         },
     }
+
+
+async def delete_unified_event(
+    db,
+    user: Dict[str, Any],
+    *,
+    storage: str,
+    event_id: Optional[int] = None,
+    google_event_id: str = "",
+    external_uid: str = "",
+    event_date: str = "",
+    start_time: str = "",
+    deleter: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    token_exchanger: Optional[_OAUTH_EXCHANGER] = None,
+    settings: Optional[GoogleCalendarSettings] = None,
+    now_utc: Optional[datetime.datetime] = None,
+) -> bool:
+    """Удалить событие локально (schedule_events) и при необходимости из Google Calendar (для Undo)."""
+    user_id = int(user["id"])
+    now = _naive_utc(now_utc)
+    if storage == "google_oauth":
+        if event_id:
+            await db.execute(
+                "DELETE FROM calendar_events WHERE id = ? AND user_id = ? AND source = 'google_oauth'",
+                (int(event_id), user_id),
+            )
+        elif external_uid and event_date and start_time:
+            await db.execute(
+                """
+                DELETE FROM calendar_events
+                WHERE user_id = ? AND source = 'google_oauth'
+                  AND external_uid = ? AND event_date = ? AND start_time = ?
+                """,
+                (user_id, external_uid, event_date, start_time),
+            )
+        await db.commit()
+
+        if google_event_id:
+            conns = await repo.list_user_calendar_connections(db, user_id, enabled_only=True)
+            oauth_conn = next((c for c in conns if c.get("provider") == "google_oauth"), None)
+            if oauth_conn:
+                try:
+                    cfg = settings or get_gcal_settings()
+                    access_token = await _ensure_valid_google_token(
+                        db, oauth_conn, settings=cfg, token_exchanger=token_exchanger, now_utc=now
+                    )
+                    if access_token:
+                        cal_id = str(oauth_conn.get("calendar_id") or "primary").strip() or "primary"
+                        api_del = deleter or _default_gcal_delete
+                        await api_del(
+                            f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events/{google_event_id}",
+                            access_token,
+                        )
+                except Exception:
+                    pass
+        return True
+
+    if event_id:
+        await repo.delete_schedule_event(db, user_id, int(event_id))
+        return True
+    return False
 
 
 def _merge_unified_events(

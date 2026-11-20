@@ -140,6 +140,41 @@ async def cors_middleware(request: web.Request, handler) -> web.StreamResponse:
     return resp
 
 
+async def handle_index(request: web.Request) -> web.Response:
+    body = (
+        "<!doctype html><html lang='ru'><meta charset='utf-8'>"
+        "<title>HiDL — Personal Assistant</title>"
+        "<body style='font-family:system-ui,sans-serif;max-width:680px;margin:48px auto;padding:0 20px;line-height:1.6'>"
+        "<h1>HiDL — персональный ассистент</h1>"
+        "<p>Помощник для распорядка дня, задач, умной кухни и синхронизации с Google Calendar (Telegram + MCP).</p>"
+        "<p><a href='/privacy'>Политика конфиденциальности / Privacy Policy</a> · "
+        "<a href='/health'>Статус сервиса</a></p>"
+        "</body></html>"
+    )
+    return web.Response(text=body, content_type="text/html", status=200)
+
+
+async def handle_privacy(request: web.Request) -> web.Response:
+    body = (
+        "<!doctype html><html lang='ru'><meta charset='utf-8'>"
+        "<title>HiDL Privacy Policy</title>"
+        "<body style='font-family:system-ui,sans-serif;max-width:720px;margin:48px auto;padding:0 20px;line-height:1.6'>"
+        "<h1>Политика конфиденциальности / Privacy Policy — HiDL</h1>"
+        "<p><strong>Данные Google Calendar:</strong> при подключении Google OAuth 2.0 HiDL запрашивает доступ "
+        "к событиям вашего календаря исключительно для их отображения в боте и создания новых событий по вашему прямому запросу.</p>"
+        "<p><strong>Хранение и передача:</strong> токены доступа и кэш событий хранятся локально в защищённой базе данных "
+        "сервера, не передаются третьим лицам и не используются для рекламы.</p>"
+        "<p><strong>Удаление и отзыв доступа:</strong> вы можете отключить интеграцию в любой момент командой <code>/gcal</code> "
+        "(кнопка «Отключить» удаляет токены и кэш событий из БД) либо в настройках безопасности вашего аккаунта Google.</p>"
+        "<hr>"
+        "<p><strong>English summary:</strong> HiDL accesses Google Calendar data solely to display upcoming events, "
+        "protect busy meeting slots from notifications, and create events requested by the user. Data is never sold or shared "
+        "and can be disconnected at any time via Telegram (<code>/gcal</code>) or Google Account permissions.</p>"
+        "</body></html>"
+    )
+    return web.Response(text=body, content_type="text/html", status=200)
+
+
 async def handle_health(request: web.Request) -> web.Response:
     settings: MCPSettings = request.app["mcp_settings"]
     return web.json_response(
@@ -275,6 +310,8 @@ def create_mcp_app(
 
     app.on_shutdown.append(_on_shutdown)
 
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/privacy", handle_privacy)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/gcal/callback", handle_gcal_callback)
 

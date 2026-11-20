@@ -18,6 +18,7 @@ from utils.time import format_date_display, parse_hhmm, tzinfo_from_string
 VALID_KINDS = {
     "task",
     "reminder",
+    "calendar_event",
     "shopping",
     "shopping_remove",
     "expense",
@@ -31,7 +32,7 @@ VALID_KINDS = {
     "shift_bedtime",
 }
 VALID_INTENTS = {"capture", "query", "chat", "support"}
-VALID_QUERY_TYPES = {"none", "today", "shopping", "food", "diary", "karma", "pantry", "advice"}
+VALID_QUERY_TYPES = {"none", "today", "calendar", "shopping", "food", "diary", "karma", "pantry", "advice"}
 
 WEEKDAY_STEMS = {
     "понедель": 0,
@@ -148,6 +149,7 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 
 Допустимые query_type (для intent="query", иначе "none"):
 - "today": планы, дела, напоминания на сегодня.
+- "calendar": события в календаре / расписание / встречи на сегодня и ближайшие дни.
 - "shopping": список покупок / что купить.
 - "food": что приготовить / поесть / на ужин, обед, завтрак.
 - "diary": поиск в записях дневника/входящих (в query_term укажи ключевую тему, например "папа").
@@ -157,7 +159,8 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 
 Допустимые типы элементов (kind):
 - "task": конкретное дело/задача с явным намерением сделать.
-- "reminder": поручение напомнить к дате/времени.
+- "reminder": поручение напомнить к дате/времени ("напомни выпить таблетку").
+- "calendar_event": встреча/событие для записи в Google Calendar ("запиши в календарь завтра в 15:00 стоматолог на час", "поставь встречу..."). Передай "date_hint", "time_hint", "duration_minutes" (по умолчанию 60) и "location".
 - "shopping": что нужно купить или что закончилось дома.
 - "shopping_remove": убрать товар из списка покупок ("гречка нашлась, убери из покупок" -> title="Гречка").
 - "pantry_add": купленный или имеющийся дома продукт в холодильник ("купил тофу" -> title="Тофу"). Не используй для будущих покупок ("надо купить") или трат с суммой.
@@ -178,22 +181,24 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 5. Чистые мечты и задумки ("хочу когда-нибудь...") -> только kind="idea", НИКОГДА "task" или "reminder".
 6. Сохраняй "source_quote" дословным фрагментом исходного текста. В "model_note" пиши только пометку-гипотезу, не выдумывай факты.
 7. Для "shopping", "shopping_remove", "pantry_add", "pantry_remove" в "title" пиши чистое название товара (например "Гречка", "Овсяное молоко", "Тофу").
-8. Для "reminder" и "shift_bedtime" передай "date_hint" ("завтра", "19.11.2026") и "time_hint" ("12:00", "00:30", "в 8", "утром") без вычисления дат.
+8. Для "reminder", "calendar_event" и "shift_bedtime" передай "date_hint" ("завтра", "19.11.2026") и "time_hint" ("12:00", "00:30", "в 8", "утром") без вычисления дат.
 9. Если дан "Недавний контекст диалога", используй его для коротких продолжений вроде "а ещё?", "другое", "без картошки", "побыстрее". Если в предыдущем ответе обсуждалась еда/рецепты, а пользователь просит "а ещё?" или уточняет пожелание — возвращай intent="query", query_type="food", query_term="more" (или текст фильтра, например "без картошки"), НЕ "diary"!
 10. Отвечай строго валидным JSON объектом формата:
 {
   "intent": "capture|query|chat|support",
   "reply": "короткий ответ 1-2 предложения (для chat/support или пустого)",
-  "query_type": "none|today|shopping|food|diary|karma|pantry|advice",
+  "query_type": "none|today|calendar|shopping|food|diary|karma|pantry|advice",
   "query_term": "",
   "items": [
     {
-      "kind": "task|reminder|shopping|shopping_remove|pantry_add|pantry_remove|pulse_log|rollover_tasks|shift_bedtime|expense|diary|idea|done",
+      "kind": "task|reminder|calendar_event|shopping|shopping_remove|pantry_add|pantry_remove|pulse_log|rollover_tasks|shift_bedtime|expense|diary|idea|done",
       "title": "...",
       "source_quote": "...",
       "model_note": "",
       "date_hint": "",
       "time_hint": "",
+      "duration_minutes": 60,
+      "location": "",
       "quantity": 1,
       "unit": "шт",
       "amount": 0,
@@ -226,6 +231,8 @@ class ParsedInboxItem:
     schedule: Optional[ResolvedSchedule] = None
     amount: float = 0.0
     category: str = ""
+    duration_minutes: int = 60
+    location: str = ""
 
 
 @dataclass
@@ -756,6 +763,79 @@ def _clean_reminder_title(raw: str, resolved_time: Optional[str]) -> str:
     return _capitalize_first(txt) or "Напоминание"
 
 
+_CALENDAR_EVENT_TRIGGER_RE = re.compile(
+    r"(?iu)(?:\b(?:запиш[иь]|добав[иь]|постав[иь]|внес[иь]|занес[иь]|сохран[иь])\s+в\s+(?:google\s+|гугл\s+)?календар\w*|"
+    r"\bв\s+(?:google\s+|гугл\s+)?календар\w*\s+(?:на|в|завтра|сегодня|послезавтра|\d)|"
+    r"\b(?:постав[иь]|запланируй|назнач[иь])\s+(?:встречу|созвон|событие)\b)"
+)
+
+_QUERY_CALENDAR_RE = re.compile(
+    r"(?iu)^(?:а\s+)?(?:покажи\s+|подскажи\s+|скажи\s+|глянь\s+)?"
+    r"(?:что\s+(?:у\s+меня\s+)?в\s+(?:google\s+|гугл\s+)?календар\w*|"
+    r"какие\s+(?:у\s+меня\s+)?(?:встречи|события|планы\s+в\s+календаре)|"
+    r"(?:мой\s+)?(?:google\s+|гугл\s+)?календарь|"
+    r"(?:мо[её]\s+)?расписание(?:\s+на\s+\S+)?)\b"
+)
+
+
+def _extract_time_range(raw: str) -> Optional[tuple[str, str, int]]:
+    m = re.search(
+        r"(?iu)(?:с\s*)?(\d{1,2})\s*[:.]\s*(\d{2})\s*(?:-|–|—|\bдо\b)\s*(\d{1,2})\s*[:.]\s*(\d{2})",
+        raw or "",
+    )
+    if not m:
+        return None
+    h1, m1, h2, m2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    if h1 > 23 or m1 > 59 or h2 > 23 or m2 > 59:
+        return None
+    s_min = h1 * 60 + m1
+    e_min = h2 * 60 + m2
+    if e_min <= s_min:
+        return None
+    return f"{h1:02d}:{m1:02d}", f"{h2:02d}:{m2:02d}", max(15, min(720, e_min - s_min))
+
+
+def _extract_duration_minutes(raw: str, default: int = 60) -> int:
+    rng = _extract_time_range(raw)
+    if rng is not None:
+        return rng[2]
+    txt = (raw or "").lower()
+    if re.search(r"\b(?:на\s+)?полтора\s+часа\b|\b1[.,]5\s*час", txt):
+        return 90
+    if re.search(r"\b(?:на\s+)?полчаса\b", txt):
+        return 30
+    m_hr = re.search(r"\bна\s+(\d+(?:[.,]\d+)?)\s*(?:час\w*|ч)\b", txt)
+    if m_hr:
+        val = float(m_hr.group(1).replace(",", "."))
+        return max(15, min(720, int(round(val * 60))))
+    if re.search(r"\bна\s+(?:один\s+)?час\b", txt):
+        return 60
+    m_min = re.search(r"\bна\s+(\d+)\s*(?:мин\w*|м)\b", txt)
+    if m_min:
+        return max(15, min(720, int(m_min.group(1))))
+    return max(15, min(720, int(default or 60)))
+
+
+def _clean_calendar_event_title(raw: str, resolved_time: Optional[str]) -> str:
+    txt = (raw or "").strip()
+    patterns = [
+        r"(?iu)^(?:пожалуйста\s+)?(?:запиш[иь]|добав[иь]|постав[иь]|внес[иь]|занес[иь]|сохран[иь])(?:\s+мне)?\s+",
+        r"(?iu)\bв\s+(?:google\s+|гугл\s+)?календар\w*\b",
+        r"(?iu)\b(?:сегодня|завтра|послезавтра|потом|позже|утром|днём|вечером|ночью)\b",
+        r"(?iu)\b(?:в|во)\s+(?:понедель\w*|вторник\w*|сред\w*|четвер\w*|пятниц\w*|суббот\w*|воскрес\w*)\b",
+        r"(?iu)\b(?:с\s*)?\d{1,2}\s*[:.]\s*\d{2}\s*(?:-|–|—|\bдо\b)\s*\d{1,2}\s*[:.]\s*\d{2}\b",
+        r"(?iu)\b(?:в|на|к)\s*\d{1,2}\s*[:.]\s*\d{2}\b",
+        r"(?iu)\b(?:в|на|к)\s*\d{1,2}(?:\s*час\w*)?(?:\s*(?:утра|дня|вечера|ночи))?\b",
+        r"(?iu)\bна\s+(?:полтора\s+часа|полчаса|(?:один\s+)?час|\d+(?:[.,]\d+)?\s*(?:час\w*|ч|мин\w*|м))\b",
+        r"(?iu)\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b",
+    ]
+    for pat in patterns:
+        txt = re.sub(pat, " ", txt)
+    if resolved_time:
+        txt = txt.replace(resolved_time, " ")
+    return _capitalize_first(txt) or "Событие"
+
+
 def _split_clauses(raw_text: str) -> list[str]:
     text = (raw_text or "").strip()
     if not text:
@@ -846,6 +926,23 @@ def _apply_guardrails(
             item.title = _clean_reminder_title(quote, schedule.resolved_time)
         else:
             item.title = _clean_reminder_title(item.title, schedule.resolved_time)
+    elif kind == "calendar_event":
+        rng = _extract_time_range(quote)
+        eff_time_hint = rng[0] if rng else time_hint
+        schedule = resolve_temporal_expression(
+            date_hint=date_hint,
+            time_hint=eff_time_hint,
+            raw_fragment=quote,
+            now_utc=now_utc,
+            tz_str=tz_str,
+        )
+        item.schedule = schedule
+        item.duration_minutes = _extract_duration_minutes(quote, item.duration_minutes or 60)
+        raw_t = (item.title or "").strip()
+        if not raw_t or "календар" in raw_t.lower() or raw_t.lower() == quote.lower():
+            item.title = _clean_calendar_event_title(quote, schedule.resolved_time)
+        else:
+            item.title = _clean_calendar_event_title(raw_t, schedule.resolved_time)
     elif kind in {"pantry_add", "pantry_remove"}:
         item.title = _capitalize_first(_nominative_shopping_phrase(item.title or quote))
     elif kind == "pulse_log":
@@ -951,7 +1048,23 @@ def parse_inbox_fallback(
                 )
                 continue
 
-        if _REMINDER_TRIGGER_RE.search(clause):
+        if _CALENDAR_EVENT_TRIGGER_RE.search(clause):
+            rng = _extract_time_range(clause)
+            schedule = resolve_temporal_expression(
+                date_hint="",
+                time_hint=(rng[0] if rng else ""),
+                raw_fragment=clause,
+                now_utc=now_utc,
+                tz_str=tz_str,
+            )
+            item = ParsedInboxItem(
+                kind="calendar_event",
+                title=_clean_calendar_event_title(clause, schedule.resolved_time),
+                source_quote=clause,
+                schedule=schedule,
+                duration_minutes=_extract_duration_minutes(clause, 60),
+            )
+        elif _REMINDER_TRIGGER_RE.search(clause):
             schedule = resolve_temporal_expression(
                 date_hint="",
                 time_hint="",
@@ -1180,7 +1293,7 @@ def _latest_assistant_query_type(recent_context: Optional[list[dict[str, Any]]])
         if turn.get("role") == "assistant":
             meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
             qt = str(meta.get("query_type") or "").strip().lower()
-            if qt in {"food", "shopping", "today", "diary", "karma", "pantry", "advice"}:
+            if qt in {"food", "shopping", "today", "calendar", "diary", "karma", "pantry", "advice"}:
                 return qt
             return None
     return None
@@ -1252,6 +1365,8 @@ def _try_deterministic_intent(
             query_term=stripped_punct,
         )
 
+    if _QUERY_CALENDAR_RE.search(raw):
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="calendar")
     if _QUERY_TODAY_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="today")
     if _QUERY_KARMA_RE.search(raw):
@@ -1313,6 +1428,11 @@ _KIND_ALIASES = {
     "задача": "task",
     "дело": "task",
     "напоминание": "reminder",
+    "календарь": "calendar_event",
+    "в календарь": "calendar_event",
+    "событие": "calendar_event",
+    "встреча": "calendar_event",
+    "google calendar": "calendar_event",
     "покупка": "shopping",
     "покупки": "shopping",
     "список покупок": "shopping",
@@ -1370,6 +1490,11 @@ _QUERY_TYPE_ALIASES = {
     "план": "today",
     "план на сегодня": "today",
     "дела": "today",
+    "calendar": "calendar",
+    "календарь": "calendar",
+    "расписание": "calendar",
+    "встречи": "calendar",
+    "события": "calendar",
     "shopping": "shopping",
     "покупки": "shopping",
     "список покупок": "shopping",
@@ -1456,6 +1581,11 @@ def validate_and_normalize_llm_items(
         except (TypeError, ValueError):
             amount = 0.0
         category = str(entry.get("category") or "").strip()
+        try:
+            dur_min = max(15, min(720, int(entry.get("duration_minutes") or 60)))
+        except (TypeError, ValueError):
+            dur_min = 60
+        location = str(entry.get("location") or "").strip()
 
         item = ParsedInboxItem(
             kind=kind,
@@ -1467,6 +1597,8 @@ def validate_and_normalize_llm_items(
             unit=unit,
             amount=amount,
             category=category,
+            duration_minutes=dur_min,
+            location=location,
         )
         out.append(
             _apply_guardrails(
