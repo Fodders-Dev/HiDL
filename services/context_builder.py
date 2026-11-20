@@ -212,6 +212,7 @@ async def build_user_day_snapshot(
         r for r in rows_to_dicts(await repo.list_shopping_items(db, user_id, scope="household"))
         if not r.get("is_bought")
     ]
+    meal_plan_today = await repo.get_meal_plan_for_date(db, user_id, local_date)
     wellness = await repo.get_wellness(db, user_id)
     meal_profile = str((dict(wellness) if wellness else {}).get("meal_profile") or "omnivore")
 
@@ -244,6 +245,7 @@ async def build_user_day_snapshot(
         "events_today": events_today[:5],
         "pantry_items": pantry_rows,
         "shopping_unbought": shopping_rows,
+        "meal_plan_today": meal_plan_today,
         "meal_profile": meal_profile,
         "portrait_text": memory.get("portrait_text") or "",
         "patterns": patterns,
@@ -301,6 +303,17 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         f"Задачи на сегодня (открыто {len(snapshot['pending_tasks'])}, закрыто {snapshot['done_tasks_count']}): {pending_str}.",
         f"Питание: {DIET_LABELS.get(snapshot['meal_profile'], snapshot['meal_profile'])}. Холодильник: {pantry_str}. Покупки: {shop_str}.",
     ]
+    meal_plan_today = snapshot.get("meal_plan_today") or []
+    if meal_plan_today:
+        slot_names = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин"}
+        meal_parts = [
+            f"{slot_names.get(str(m.get('meal_slot')), m.get('meal_slot'))} — {m.get('title')}"
+            + (" ✓" if m.get("status") == "cooked" else "")
+            for m in meal_plan_today
+            if m.get("title")
+        ]
+        if meal_parts:
+            lines.append("Меню на сегодня: " + ", ".join(meal_parts) + ".")
     last_ev = str(state.get("last_event_summary") or "").strip()
     if last_ev:
         lines.append(f"Последнее событие кармы: {last_ev}.")

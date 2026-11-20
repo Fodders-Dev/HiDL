@@ -41,6 +41,7 @@ def food_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
+            [InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan")],
             [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
             [InlineKeyboardButton(text="📖 Книга рецептов", callback_data="kitchen:recipes")],
             [InlineKeyboardButton(text="🛒 Список покупок", callback_data="kitchen:shoplist")],

@@ -223,6 +223,22 @@ async def _gather_slot_context(
         shop_rows = await repo.list_shopping_items(db, int(user["id"]), scope="household")
         unbought = [dict(r) for r in shop_rows if not r["is_bought"]]
         ctx["unbought_count"] = len(unbought)
+    if slot_key in {"wake", "lunch", "dinner"}:
+        meal_rows = await repo.get_meal_plan_for_date(db, int(user["id"]), local_date)
+        if slot_key == "wake":
+            bfast = next(
+                (m for m in meal_rows if m.get("meal_slot") == "breakfast" and m.get("status") != "cooked"),
+                None,
+            )
+            if bfast:
+                ctx["planned_breakfast"] = bfast
+        else:
+            meal = next(
+                (m for m in meal_rows if m.get("meal_slot") == slot_key and m.get("status") != "cooked"),
+                None,
+            )
+            if meal:
+                ctx["planned_meal"] = meal
     return ctx
 
 
@@ -277,6 +293,10 @@ def build_pulse_message(
             if pending_titles:
                 shown = ", ".join(html.escape(t) for t in pending_titles[:3])
                 lines.append(f"📌 В плане: {shown}")
+            planned_bf = ctx.get("planned_breakfast")
+            if isinstance(planned_bf, dict) and planned_bf.get("title"):
+                t_bf = int(planned_bf.get("time_minutes") or 10)
+                lines.append(f"🥣 Завтрак по плану: <b>{html.escape(str(planned_bf['title']))}</b> ({t_bf} мин)")
             text = "\n".join(lines)
         elif level == 2:
             text = (
@@ -296,6 +316,10 @@ def build_pulse_message(
                 else "🍽 <b>ОБЕД. Не вздумай пропустить приём пищи.</b>"
             )
             lines = [intro, header_badge]
+            planned_lunch = ctx.get("planned_meal")
+            if isinstance(planned_lunch, dict) and planned_lunch.get("title"):
+                t_lu = int(planned_lunch.get("time_minutes") or 20)
+                lines.append(f"🍽 По плану на обед: <b>{html.escape(str(planned_lunch['title']))}</b> ({t_lu} мин)")
             if debt_note:
                 lines.append(f"💬 {html.escape(debt_note)}")
             text = "\n".join(lines)
@@ -338,6 +362,10 @@ def build_pulse_message(
                 else "🍽 <b>УЖИН!</b> Надо нормально поесть, чтобы не срываться ночью к холодильнику."
             )
             lines = [intro, header_badge]
+            planned_dinner = ctx.get("planned_meal")
+            if isinstance(planned_dinner, dict) and planned_dinner.get("title"):
+                t_din = int(planned_dinner.get("time_minutes") or 20)
+                lines.append(f"🍽 По плану на ужин: <b>{html.escape(str(planned_dinner['title']))}</b> ({t_din} мин)")
             if unbought_count:
                 lines.append(f"🛒 В списке покупок сейчас пунктов: {unbought_count}.")
             if debt_note:
@@ -385,6 +413,10 @@ def build_pulse_message(
             else:
                 intro = "🌙 <b>Отбой!</b> Убирай мобилу, ставь на зарядку и ложись спать."
             lines = [intro, header_badge]
+            planned_lunch = ctx.get("planned_meal")
+            if isinstance(planned_lunch, dict) and planned_lunch.get("title"):
+                t_lu = int(planned_lunch.get("time_minutes") or 20)
+                lines.append(f"🍽 По плану на обед: <b>{html.escape(str(planned_lunch['title']))}</b> ({t_lu} мин)")
             if debt_note:
                 lines.append(f"💬 {html.escape(debt_note)}")
             text = "\n".join(lines)

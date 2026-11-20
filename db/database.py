@@ -595,6 +595,25 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS meal_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan_date TEXT NOT NULL,
+            meal_slot TEXT NOT NULL,
+            title TEXT NOT NULL,
+            recipe_id TEXT DEFAULT '',
+            time_minutes INTEGER DEFAULT 20,
+            ingredients_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'planned',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, plan_date, meal_slot),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_meal_plans_user_date
+            ON meal_plans(user_id, plan_date);
         """
     )
     await ensure_columns(conn)
@@ -1109,6 +1128,25 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS meal_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan_date TEXT NOT NULL,
+            meal_slot TEXT NOT NULL,
+            title TEXT NOT NULL,
+            recipe_id TEXT DEFAULT '',
+            time_minutes INTEGER DEFAULT 20,
+            ingredients_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'planned',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, plan_date, meal_slot),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_meal_plans_user_date
+            ON meal_plans(user_id, plan_date);
         """
     )
 

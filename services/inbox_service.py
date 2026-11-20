@@ -14,7 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
-from services import advice_service, context_builder, karma_service, pulse_service, stt
+from services import advice_service, context_builder, karma_service, kitchen_ai, pulse_service, stt
 from services.inbox_parser import (
     InboxParseResult,
     ParsedInboxItem,
@@ -125,6 +125,12 @@ def _format_action_line(action: dict[str, Any]) -> str:
         if action.get("status") == "awaiting_confirm":
             return f"⏳ Подтвердить: {title}"
         return f"{icon} Выполнено: {title}"
+    if kind == "done" and payload.get("completed_task_id"):
+        delta = int(payload.get("karma_delta") or 0)
+        score_after = payload.get("score_after")
+        if delta > 0 and score_after is not None:
+            return f"{icon} {label}: {title} (задача закрыта, +{delta} кармы → {score_after}/100)"
+        return f"{icon} {label}: {title} (задача закрыта)"
     return f"{icon} {label}: {title}"
 
 
@@ -641,6 +647,39 @@ async def _persist_parsed_items(
                 )
         else:
             entry_type = kind if kind in {"diary", "idea", "done"} else "diary"
+            action_payload: dict[str, Any] = {
+                "model_note": item.model_note,
+                "tags": item.tags,
+            }
+            action_title = item.title
+            if entry_type == "done":
+                matched_task = await repo.find_open_day_plan_item_by_title(
+                    db, user["id"], item.title or item.source_quote, local_date
+                )
+                if matched_task is None and item.source_quote and item.source_quote != item.title:
+                    matched_task = await repo.find_open_day_plan_item_by_title(
+                        db, user["id"], item.source_quote, local_date
+                    )
+                if matched_task:
+                    task_id = int(matched_task["id"])
+                    task_title = str(matched_task.get("title") or item.title)
+                    await repo.mark_day_plan_item_done(db, task_id, done=True)
+                    karma_res = await karma_service.record_karma_event(
+                        db,
+                        user,
+                        domain="tasks",
+                        event_type="task_done",
+                        delta=2,
+                        reason=f"Выполнена задача «{task_title}»",
+                        now_utc=now,
+                    )
+                    action_payload["completed_task_id"] = task_id
+                    action_payload["completed_task_title"] = task_title
+                    action_payload["karma_delta"] = int(karma_res.get("delta") or 0)
+                    action_payload["score_after"] = karma_res.get("score_after")
+                    if not repo._normalize_task_tokens(item.title)[1]:
+                        action_title = task_title
+
             entry_id = await repo.create_journal_entry(
                 db,
                 user_id=user["id"],
@@ -648,7 +687,7 @@ async def _persist_parsed_items(
                 entry_date=local_date,
                 source=source,
                 user_text=item.source_quote,
-                title=item.title,
+                title=action_title,
                 model_note=item.model_note,
                 tags=item.tags,
                 inbox_message_id=inbox_id,
@@ -660,9 +699,9 @@ async def _persist_parsed_items(
                 item_kind=entry_type,
                 target_table="journal_entries",
                 target_id=entry_id,
-                title=item.title,
+                title=action_title,
                 source_quote=item.source_quote,
-                payload={"model_note": item.model_note, "tags": item.tags},
+                payload=action_payload,
                 status="active",
             )
 
@@ -799,10 +838,6 @@ async def _render_food_suggestions_with_meta(
     already_titles: list[str] = list(prev_meta.get("shown_titles") or []) if is_more else []
 
     profile = await kitchen._get_meal_profile(db, uid)
-    allowed = [
-        r for r in kitchen.load_recipes() if kitchen._recipe_allowed_for_profile(r, profile)
-    ]
-
     tag_pref = (
         "breakfast"
         if "завтрак" in q_lower
@@ -813,28 +848,38 @@ async def _render_food_suggestions_with_meta(
         else (prev_meta.get("tag_pref") if is_more else None)
     )
     excluded = _extract_excluded_terms(f"{raw_text} {query_term}")
-    if excluded:
-        allowed = [r for r in allowed if not _recipe_matches_exclusion(r, excluded)]
-
     fast_only = any(w in q_lower for w in ("побыстрее", "быстрее", "до 15", "до 20"))
     max_fast_min = 20 if ("побыстрее" in q_lower or "быстрее" in q_lower) else 30
+    energy = (
+        "low"
+        if (fast_only or any(w in q_lower for w in ("нет сил", "лень", "устал")))
+        else ("shop" if "докупить" in q_lower else "normal")
+    )
 
-    tier_pref_fast: list[dict[str, Any]] = []
-    tier_other_fast: list[dict[str, Any]] = []
-    tier_rest: list[dict[str, Any]] = []
-    for r in allowed:
-        t_min = int(r.get("time_minutes") or 999)
-        tags = r.get("tags") or []
-        if tag_pref and tag_pref in tags and t_min <= max_fast_min:
-            tier_pref_fast.append(r)
-        elif t_min <= max_fast_min:
-            tier_other_fast.append(r)
-        elif not fast_only:
-            tier_rest.append(r)
+    sug_res = await kitchen_ai.suggest_meals_now(
+        db,
+        user,
+        energy=energy,
+        meal_slot=tag_pref,
+        exclude_ids=already_ids,
+        excluded_terms=excluded,
+        limit=(50 if fast_only else 3),
+        now_utc=now,
+    )
+    candidates_info = list(sug_res["suggestions"])
+    if fast_only:
+        candidates_info = [
+            s for s in candidates_info if int(s["recipe"].get("time_minutes") or 999) <= max_fast_min
+        ][:3]
+    else:
+        candidates_info = candidates_info[:3]
 
-    ordered = tier_pref_fast + tier_other_fast + tier_rest
-    shown_id_set = set(already_ids)
-    candidates = [r for r in ordered if str(r.get("id") or "") not in shown_id_set][:3]
+    total_allowed = sum(
+        1
+        for r in kitchen.load_recipes()
+        if kitchen._recipe_allowed_for_profile(r, profile)
+        and (not excluded or not _recipe_matches_exclusion(r, excluded))
+    )
 
     btn_rows: list[list[InlineKeyboardButton]] = []
     new_meta: dict[str, Any] = {
@@ -844,24 +889,62 @@ async def _render_food_suggestions_with_meta(
         "shown_titles": list(already_titles),
     }
 
-    if candidates:
-        header = "🍳 <b>Ещё подходящие варианты:</b>" if is_more else "🍳 <b>Быстрые варианты (до 30 мин):</b>"
+    if candidates_info:
+        header = (
+            "🍳 <b>Ещё подходящие варианты:</b>"
+            if is_more
+            else (
+                f"🍳 <b>Что приготовить ({_esc(sug_res['meal_slot_label'])}, дома {int(sug_res['pantry_count'])} поз.):</b>"
+                if sug_res.get("pantry_count")
+                else "🍳 <b>Быстрые варианты (до 30 мин):</b>"
+            )
+        )
         lines = [header]
-        for idx, r in enumerate(candidates, 1):
+        for idx, item in enumerate(candidates_info, 1):
+            r = item["recipe"]
             t = int(r.get("time_minutes") or 0)
             desc = (r.get("desc") or "").strip()
             title = str(r.get("title") or "Рецепт")
             rid = str(r.get("id") or "")
+            have = item.get("have") or []
+            missing = item.get("missing") or []
+
             line = f"{idx}. <b>{_esc(title)}</b> · {t} мин"
             if desc:
                 line += f" — {_esc(desc)}"
             lines.append(line)
+
+            if not missing:
+                lines.append("   ✅ <i>Всё нужное есть дома</i>")
+            elif have:
+                have_str = ", ".join(_esc(h["name"]) for h in have[:2])
+                miss_str = ", ".join(_esc(m["name"]) for m in missing[:3])
+                if len(missing) > 3:
+                    miss_str += f" и ещё {len(missing) - 3}"
+                lines.append(f"   ✅ дома: {have_str} · 🛒 докупить: {miss_str}")
+            elif sug_res.get("pantry_count"):
+                miss_str = ", ".join(_esc(m["name"]) for m in missing[:3])
+                lines.append(f"   🛒 докупить: {miss_str}")
+
+            short_title = title[:20] + ("…" if len(title) > 20 else "")
+            action_btn = (
+                InlineKeyboardButton(
+                    text=f"🛒 Докупить ({len(missing)})",
+                    callback_data=f"kitchen:add_miss:{rid}:2",
+                )
+                if missing
+                else InlineKeyboardButton(
+                    text="✅ Приготовил",
+                    callback_data=f"kitchen:cook_fast:{rid}:2",
+                )
+            )
             btn_rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"🍳 {title} · {t}м",
+                        text=f"🍳 {short_title} · {t}м",
                         callback_data=f"kitchen:cook_view:{rid}:2:all:0",
-                    )
+                    ),
+                    action_btn,
                 ]
             )
             if rid and rid not in new_meta["shown_recipe_ids"]:
@@ -869,7 +952,12 @@ async def _render_food_suggestions_with_meta(
             if title and title not in new_meta["shown_titles"]:
                 new_meta["shown_titles"].append(title)
         text = "\n".join(lines)
-        btn_rows.append([InlineKeyboardButton(text="🔄 Ещё варианты", callback_data="kitchen:more_food")])
+        btn_rows.append(
+            [
+                InlineKeyboardButton(text="🔄 Ещё варианты", callback_data="kitchen:more_food"),
+                InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+            ]
+        )
     else:
         client = llm_client_instance or default_llm_client
         if client.is_configured():
@@ -903,21 +991,40 @@ async def _render_food_suggestions_with_meta(
                     if name_part and name_part not in new_meta["shown_titles"]:
                         new_meta["shown_titles"].append(name_part)
                 text = f"🍳 <b>Новые идеи:</b>\n{_esc(raw_ideas)}"
-                btn_rows.append([InlineKeyboardButton(text="🔄 Ещё варианты", callback_data="kitchen:more_food")])
+                btn_rows.append(
+                    [
+                        InlineKeyboardButton(text="🔄 Ещё варианты", callback_data="kitchen:more_food"),
+                        InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+                    ]
+                )
             else:
                 new_meta["shown_recipe_ids"] = []
                 text = "🍳 Варианты из книги рецептов закончились — можешь начать круг заново или открыть всю книгу."
-                btn_rows.append([InlineKeyboardButton(text="🔄 Показать сначала", callback_data="kitchen:more_food")])
+                btn_rows.append(
+                    [
+                        InlineKeyboardButton(text="🔄 Показать сначала", callback_data="kitchen:more_food"),
+                        InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+                    ]
+                )
         else:
             new_meta["shown_recipe_ids"] = []
             text = (
-                f"🍳 Все подходящие рецепты из книги ({len(allowed)}) уже показаны — "
+                f"🍳 Все подходящие рецепты из книги ({total_allowed}) уже показаны — "
                 "можешь открыть всю книгу или начать круг заново."
             )
-            btn_rows.append([InlineKeyboardButton(text="🔄 Показать сначала", callback_data="kitchen:more_food")])
+            btn_rows.append(
+                [
+                    InlineKeyboardButton(text="🔄 Показать сначала", callback_data="kitchen:more_food"),
+                    InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+                ]
+            )
 
-    btn_rows.append([InlineKeyboardButton(text="📖 Все рецепты", callback_data="kitchen:recipes")])
-    btn_rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")])
+    btn_rows.append(
+        [
+            InlineKeyboardButton(text="📖 Все рецепты", callback_data="kitchen:recipes"),
+            InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu"),
+        ]
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=btn_rows)
 
     if record_history:
@@ -1510,6 +1617,9 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
         await repo.delete_custom_reminder(db, user_id, tid_int)
     elif table == "journal_entries":
         await repo.delete_journal_entry(db, user_id, tid_int, hard=False)
+        completed_task_id = payload.get("completed_task_id")
+        if completed_task_id:
+            await repo.mark_day_plan_item_done(db, int(completed_task_id), done=False)
     elif table == "expenses":
         await repo.delete_expense(db, user_id, tid_int)
 

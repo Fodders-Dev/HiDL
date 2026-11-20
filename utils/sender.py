@@ -18,10 +18,13 @@ async def safe_edit(
     parse_mode: Optional[str] = None,
 ) -> None:
     """Попробовать отредактировать сообщение, если не получилось — отправить новое."""
+    kwargs: dict[str, object] = {"reply_markup": reply_markup}
+    if parse_mode is not None:
+        kwargs["parse_mode"] = parse_mode
     try:
-        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        await message.edit_text(text, **kwargs)
     except Exception:
-        await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        await message.answer(text, **kwargs)
 
 
 async def safe_edit_markup(

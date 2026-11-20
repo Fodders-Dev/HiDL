@@ -1,4 +1,5 @@
 import datetime
+import html
 from typing import Tuple
 
 from aiogram import types
@@ -213,6 +214,17 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         summary_lines.append(finance_line)
     if home_summary:
         summary_lines.append(home_summary)
+    meal_plan_today = await repo.get_meal_plan_for_date(db, user["id"], local_date)
+    if meal_plan_today:
+        m_icons = {"breakfast": "🥣", "lunch": "🍲", "dinner": "🍽"}
+        meal_parts = [
+            ("✅" if m.get("status") == "cooked" else m_icons.get(str(m.get("meal_slot")), "🍽"))
+            + f" {html.escape(str(m.get('title') or ''))}"
+            for m in meal_plan_today
+            if m.get("title")
+        ]
+        if meal_parts:
+            summary_lines.append("🍽 Меню дня: " + " · ".join(meal_parts[:3]))
     if plan_items:
         summary_lines.append(
             f"🎯 План на день: выполнено {len(plan_done)}/{len(plan_items)} дел "

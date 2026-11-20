@@ -4023,3 +4023,243 @@ async def restore_pantry_item(
     )
 
 
+_TASK_FILLER_WORDS = {
+    "задача",
+    "задачу",
+    "задачка",
+    "дело",
+    "выполнена",
+    "выполнено",
+    "выполнил",
+    "выполнила",
+    "сделано",
+    "сделал",
+    "сделала",
+    "готово",
+    "только",
+    "что",
+    "уже",
+    "я",
+    "все",
+    "всё",
+    "пункт",
+}
+
+
+def _normalize_task_tokens(text: str) -> tuple[str, list[str]]:
+    """Нормализовать текст задачи и вернуть очищенную строку и основы слов."""
+    norm = re.sub(r"[^a-zа-я0-9ё\s-]+", " ", (text or "").strip().casefold()).replace("ё", "е")
+    words = [w.strip("-") for w in norm.split() if w.strip("-")]
+    filtered: list[str] = []
+    stems: list[str] = []
+    for w in words:
+        if w in _TASK_FILLER_WORDS:
+            continue
+        filtered.append(w)
+        base = w
+        for suffix in ("ться", "тся", "лся", "лась", "лись", "лось", "ся", "сь"):
+            if base.endswith(suffix) and len(base) - len(suffix) >= 3:
+                base = base[: -len(suffix)]
+                break
+        stem = _ru_stem(base) or base
+        if len(stem) >= 2:
+            stems.append(stem)
+    return " ".join(filtered), stems
+
+
+async def find_open_day_plan_item_by_title(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    query: str,
+    local_date: str,
+) -> Optional[Dict[str, Any]]:
+    """Найти незакрытый пункт плана дня за сегодня (или вчера) по названию/основе."""
+    q_clean, q_stems = _normalize_task_tokens(query)
+    if not q_clean and not q_stems:
+        return None
+
+    dates_to_check = [local_date]
+    try:
+        prev_date = (datetime.date.fromisoformat(local_date) - datetime.timedelta(days=1)).isoformat()
+        dates_to_check.append(prev_date)
+    except Exception:
+        pass
+
+    q_stem_set = set(q_stems)
+    for d in dates_to_check:
+        rows = [row_to_dict(r) for r in await list_day_plan_items(conn, user_id, d) if not r["done"]]
+        if not rows:
+            continue
+        # 1. Точное нормализованное совпадение
+        for row in rows:
+            t_clean, _ = _normalize_task_tokens(str(row.get("title") or ""))
+            if t_clean and t_clean == q_clean:
+                return row
+        # 2. Подстрока / поиск по основам существующего хелпера
+        for row in rows:
+            title_raw = str(row.get("title") or "")
+            t_clean, _ = _normalize_task_tokens(title_raw)
+            if q_clean and t_clean and (q_clean in t_clean or t_clean in q_clean):
+                return row
+            if q_clean and _haystack_matches_query(title_raw, q_clean):
+                return row
+        # 3. Пересечение основ с учётом возвратных глаголов (Искупаться <-> искупался)
+        if q_stem_set:
+            for row in rows:
+                _, t_stems = _normalize_task_tokens(str(row.get("title") or ""))
+                t_stem_set = set(t_stems)
+                if not t_stem_set:
+                    continue
+                if q_stem_set.issubset(t_stem_set) or t_stem_set.issubset(q_stem_set):
+                    return row
+    return None
+
+
+# --- Меню на несколько дней (meal_plans) ---
+
+
+_MEAL_SLOT_ORDER = {"breakfast": 1, "lunch": 2, "dinner": 3}
+
+
+def _decode_meal_plan_row(row: aiosqlite.Row) -> Dict[str, Any]:
+    d = row_to_dict(row)
+    try:
+        ings = json.loads(d.get("ingredients_json") or "[]")
+        d["ingredients"] = ings if isinstance(ings, list) else []
+    except Exception:
+        d["ingredients"] = []
+    return d
+
+
+async def upsert_meal_plan_slot(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    plan_date: str,
+    meal_slot: str,
+    *,
+    title: str,
+    recipe_id: str = "",
+    time_minutes: int = 20,
+    ingredients: Optional[List[Dict[str, Any]]] = None,
+    status: str = "planned",
+) -> Dict[str, Any]:
+    """Создать или обновить слот питания (breakfast/lunch/dinner) на дату."""
+    now = utc_now_str()
+    ing_json = json.dumps(list(ingredients or []), ensure_ascii=False)
+    await conn.execute(
+        """
+        INSERT INTO meal_plans
+        (user_id, plan_date, meal_slot, title, recipe_id, time_minutes, ingredients_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, plan_date, meal_slot) DO UPDATE SET
+            title = excluded.title,
+            recipe_id = excluded.recipe_id,
+            time_minutes = excluded.time_minutes,
+            ingredients_json = excluded.ingredients_json,
+            status = excluded.status,
+            updated_at = excluded.updated_at
+        """,
+        (
+            user_id,
+            plan_date,
+            meal_slot,
+            title.strip(),
+            str(recipe_id or ""),
+            int(time_minutes or 20),
+            ing_json,
+            status,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    cur = await conn.execute(
+        "SELECT * FROM meal_plans WHERE user_id = ? AND plan_date = ? AND meal_slot = ?",
+        (user_id, plan_date, meal_slot),
+    )
+    row = await cur.fetchone()
+    return _decode_meal_plan_row(row) if row else {}
+
+
+async def list_meal_plans_range(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    start_date: str,
+    end_date: str,
+) -> List[Dict[str, Any]]:
+    """Получить расписание блюд в диапазоне дат, отсортированное по дате и слоту."""
+    cur = await conn.execute(
+        """
+        SELECT * FROM meal_plans
+        WHERE user_id = ? AND plan_date >= ? AND plan_date <= ?
+        ORDER BY plan_date ASC, id ASC
+        """,
+        (user_id, start_date, end_date),
+    )
+    items = [_decode_meal_plan_row(r) for r in await cur.fetchall()]
+    items.sort(key=lambda r: (str(r.get("plan_date") or ""), _MEAL_SLOT_ORDER.get(str(r.get("meal_slot") or ""), 9)))
+    return items
+
+
+async def get_meal_plan_for_date(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    plan_date: str,
+) -> List[Dict[str, Any]]:
+    """Получить меню на конкретную дату."""
+    return await list_meal_plans_range(conn, user_id, plan_date, plan_date)
+
+
+async def mark_meal_plan_status(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    plan_date: str,
+    meal_slot: str,
+    status: str,
+) -> bool:
+    """Обновить статус блюда в меню (planned/cooked/skipped)."""
+    now = utc_now_str()
+    cur = await conn.execute(
+        """
+        UPDATE meal_plans
+        SET status = ?, updated_at = ?
+        WHERE user_id = ? AND plan_date = ? AND meal_slot = ?
+        """,
+        (status, now, user_id, plan_date, meal_slot),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+async def get_recent_meal_recipe_ids(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    since_date: str,
+) -> List[str]:
+    """Вернуть список ID рецептов из недавнего/текущего меню с даты since_date."""
+    cur = await conn.execute(
+        """
+        SELECT DISTINCT recipe_id FROM meal_plans
+        WHERE user_id = ? AND plan_date >= ? AND recipe_id != ''
+        """,
+        (user_id, since_date),
+    )
+    return [str(r["recipe_id"]) for r in await cur.fetchall() if r["recipe_id"]]
+
+
+async def clear_meal_plans_range(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    start_date: str,
+    end_date: str,
+) -> int:
+    """Удалить слоты меню в диапазоне дат (например, при пересборке)."""
+    cur = await conn.execute(
+        "DELETE FROM meal_plans WHERE user_id = ? AND plan_date >= ? AND plan_date <= ?",
+        (user_id, start_date, end_date),
+    )
+    await conn.commit()
+    return int(cur.rowcount or 0)
+
+
+
