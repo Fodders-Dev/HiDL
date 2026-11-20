@@ -4262,4 +4262,384 @@ async def clear_meal_plans_range(
     return int(cur.rowcount or 0)
 
 
+# --- Внешний календарь (Google Calendar .ics / OAuth 2.0) ---
+
+
+async def upsert_calendar_connection(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    provider: str,
+    *,
+    label: str = "Google Calendar",
+    ics_url: str = "",
+    calendar_id: str = "primary",
+    access_token: str = "",
+    refresh_token: str = "",
+    token_expires_at: Optional[str] = None,
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    """Создать или обновить подключение внешнего календаря (одна запись на user_id + provider)."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        INSERT INTO user_calendar_connections
+        (user_id, provider, label, ics_url, calendar_id, access_token, refresh_token, token_expires_at,
+         enabled, last_sync_at, last_error, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?, ?)
+        ON CONFLICT(user_id, provider) DO UPDATE SET
+            label = excluded.label,
+            ics_url = CASE WHEN excluded.ics_url != '' THEN excluded.ics_url ELSE user_calendar_connections.ics_url END,
+            calendar_id = excluded.calendar_id,
+            access_token = CASE WHEN excluded.access_token != '' THEN excluded.access_token ELSE user_calendar_connections.access_token END,
+            refresh_token = CASE WHEN excluded.refresh_token != '' THEN excluded.refresh_token ELSE user_calendar_connections.refresh_token END,
+            token_expires_at = COALESCE(excluded.token_expires_at, user_calendar_connections.token_expires_at),
+            enabled = excluded.enabled,
+            last_error = '',
+            updated_at = excluded.updated_at
+        """,
+        (
+            user_id,
+            provider,
+            label.strip() or "Google Calendar",
+            ics_url.strip(),
+            calendar_id.strip() or "primary",
+            access_token.strip(),
+            refresh_token.strip(),
+            token_expires_at,
+            1 if enabled else 0,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    cur = await conn.execute(
+        "SELECT * FROM user_calendar_connections WHERE user_id = ? AND provider = ?",
+        (user_id, provider),
+    )
+    row = await cur.fetchone()
+    return row_to_dict(row) if row else {}
+
+
+async def list_user_calendar_connections(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    enabled_only: bool = True,
+) -> List[Dict[str, Any]]:
+    """Вернуть подключения календарей пользователя."""
+    sql = "SELECT * FROM user_calendar_connections WHERE user_id = ?"
+    if enabled_only:
+        sql += " AND enabled = 1"
+    sql += " ORDER BY id ASC"
+    cur = await conn.execute(sql, (user_id,))
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def list_all_enabled_calendar_connections(
+    conn: aiosqlite.Connection,
+) -> List[Dict[str, Any]]:
+    """Вернуть все активные подключения календарей для фоновой синхронизации."""
+    cur = await conn.execute(
+        "SELECT * FROM user_calendar_connections WHERE enabled = 1 ORDER BY user_id ASC, id ASC"
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def update_calendar_connection_sync(
+    conn: aiosqlite.Connection,
+    conn_id: int,
+    *,
+    last_sync_at: Optional[str] = None,
+    last_error: str = "",
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    token_expires_at: Optional[str] = None,
+) -> None:
+    """Обновить статус синхронизации и/или OAuth-токены подключения."""
+    now = utc_now_str()
+    fields = ["last_error = ?", "updated_at = ?"]
+    params: List[Any] = [str(last_error or ""), now]
+    if last_sync_at is not None:
+        fields.append("last_sync_at = ?")
+        params.append(last_sync_at)
+    if access_token is not None:
+        fields.append("access_token = ?")
+        params.append(access_token)
+    if refresh_token is not None:
+        fields.append("refresh_token = ?")
+        params.append(refresh_token)
+    if token_expires_at is not None:
+        fields.append("token_expires_at = ?")
+        params.append(token_expires_at)
+    params.append(int(conn_id))
+    await conn.execute(
+        f"UPDATE user_calendar_connections SET {', '.join(fields)} WHERE id = ?",
+        tuple(params),
+    )
+    await conn.commit()
+
+
+async def delete_calendar_connections(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    provider: Optional[str] = None,
+) -> int:
+    """Удалить подключения календаря (и кэшированные события этого источника)."""
+    if provider:
+        cur = await conn.execute(
+            "DELETE FROM user_calendar_connections WHERE user_id = ? AND provider = ?",
+            (user_id, provider),
+        )
+        await conn.execute(
+            "DELETE FROM calendar_events WHERE user_id = ? AND source = ?",
+            (user_id, provider),
+        )
+    else:
+        cur = await conn.execute(
+            "DELETE FROM user_calendar_connections WHERE user_id = ?",
+            (user_id,),
+        )
+        await conn.execute(
+            "DELETE FROM calendar_events WHERE user_id = ?",
+            (user_id,),
+        )
+    await conn.commit()
+    return int(cur.rowcount or 0)
+
+
+async def replace_calendar_events_window(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    source: str,
+    start_date: str,
+    end_date: str,
+    events: List[Dict[str, Any]],
+) -> int:
+    """Заменить кэш событий в окне [start_date, end_date], сохраняя pre_alert_sent для неизменных событий."""
+    now = utc_now_str()
+    cur = await conn.execute(
+        """
+        SELECT external_uid, event_date, start_time
+        FROM calendar_events
+        WHERE user_id = ? AND source = ? AND event_date >= ? AND event_date <= ? AND pre_alert_sent = 1
+        """,
+        (user_id, source, start_date, end_date),
+    )
+    alerted_keys = {
+        (str(r["external_uid"]), str(r["event_date"]), str(r["start_time"]))
+        for r in await cur.fetchall()
+    }
+
+    await conn.execute(
+        """
+        DELETE FROM calendar_events
+        WHERE user_id = ? AND source = ? AND event_date >= ? AND event_date <= ?
+        """,
+        (user_id, source, start_date, end_date),
+    )
+
+    inserted = 0
+    seen_keys: set[tuple[str, str, str]] = set()
+    for ev in events:
+        uid = str(ev.get("external_uid") or "").strip()
+        ev_date = str(ev.get("event_date") or "").strip()
+        st = str(ev.get("start_time") or "00:00").strip()
+        en = str(ev.get("end_time") or st).strip()
+        title = str(ev.get("title") or "Событие").strip() or "Событие"
+        if not uid or not ev_date or ev_date < start_date or ev_date > end_date:
+            continue
+        key = (uid, ev_date, st)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        pre_sent = 1 if key in alerted_keys else int(ev.get("pre_alert_sent") or 0)
+        await conn.execute(
+            """
+            INSERT INTO calendar_events
+            (user_id, source, external_uid, event_date, start_time, end_time,
+             is_all_day, title, location, description, is_busy, pre_alert_sent, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                source,
+                uid,
+                ev_date,
+                st,
+                en,
+                1 if ev.get("is_all_day") else 0,
+                title,
+                str(ev.get("location") or "").strip(),
+                str(ev.get("description") or "").strip(),
+                1 if ev.get("is_busy", 1) else 0,
+                pre_sent,
+                now,
+            ),
+        )
+        inserted += 1
+
+    await conn.commit()
+    return inserted
+
+
+async def upsert_single_calendar_event(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    source: str,
+    event: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Добавить или обновить одно событие в кэше calendar_events."""
+    now = utc_now_str()
+    uid = str(event.get("external_uid") or "").strip()
+    ev_date = str(event.get("event_date") or "").strip()
+    st = str(event.get("start_time") or "00:00").strip()
+    en = str(event.get("end_time") or st).strip()
+    await conn.execute(
+        """
+        INSERT INTO calendar_events
+        (user_id, source, external_uid, event_date, start_time, end_time,
+         is_all_day, title, location, description, is_busy, pre_alert_sent, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, source, external_uid, event_date, start_time) DO UPDATE SET
+            end_time = excluded.end_time,
+            is_all_day = excluded.is_all_day,
+            title = excluded.title,
+            location = excluded.location,
+            description = excluded.description,
+            is_busy = excluded.is_busy,
+            updated_at = excluded.updated_at
+        """,
+        (
+            user_id,
+            source,
+            uid,
+            ev_date,
+            st,
+            en,
+            1 if event.get("is_all_day") else 0,
+            str(event.get("title") or "Событие").strip() or "Событие",
+            str(event.get("location") or "").strip(),
+            str(event.get("description") or "").strip(),
+            1 if event.get("is_busy", 1) else 0,
+            int(event.get("pre_alert_sent") or 0),
+            now,
+        ),
+    )
+    await conn.commit()
+    cur = await conn.execute(
+        """
+        SELECT * FROM calendar_events
+        WHERE user_id = ? AND source = ? AND external_uid = ? AND event_date = ? AND start_time = ?
+        """,
+        (user_id, source, uid, ev_date, st),
+    )
+    row = await cur.fetchone()
+    return row_to_dict(row) if row else {}
+
+
+async def list_calendar_events_range(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    start_date: str,
+    end_date: str,
+) -> List[Dict[str, Any]]:
+    """Получить события внешнего календаря в диапазоне дат."""
+    cur = await conn.execute(
+        """
+        SELECT * FROM calendar_events
+        WHERE user_id = ? AND event_date >= ? AND event_date <= ?
+        ORDER BY event_date ASC, is_all_day DESC, start_time ASC, id ASC
+        """,
+        (user_id, start_date, end_date),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def mark_calendar_event_alert_sent(conn: aiosqlite.Connection, event_id: int) -> None:
+    """Отметить, что пред-событийное предупреждение уже отправлено."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE calendar_events SET pre_alert_sent = 1, updated_at = ? WHERE id = ?",
+        (now, int(event_id)),
+    )
+    await conn.commit()
+
+
+async def create_gcal_oauth_state(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    state_token: str,
+    expires_at: str,
+) -> None:
+    """Сохранить одноразовый OAuth state для авторизации Google Calendar."""
+    now = utc_now_str()
+    await conn.execute(
+        """
+        INSERT INTO gcal_oauth_states (state_token, user_id, expires_at, used, created_at)
+        VALUES (?, ?, ?, 0, ?)
+        """,
+        (state_token, user_id, expires_at, now),
+    )
+    await conn.commit()
+
+
+async def consume_gcal_oauth_state(
+    conn: aiosqlite.Connection,
+    state_token: str,
+    now_iso: str,
+) -> Optional[int]:
+    """Проверить и однократно погасить OAuth state, вернув user_id."""
+    cur = await conn.execute(
+        "SELECT * FROM gcal_oauth_states WHERE state_token = ?",
+        (state_token,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    d = row_to_dict(row)
+    if d.get("used") or str(d.get("expires_at") or "") < now_iso:
+        return None
+    cur_upd = await conn.execute(
+        "UPDATE gcal_oauth_states SET used = 1 WHERE state_token = ? AND used = 0",
+        (state_token,),
+    )
+    await conn.commit()
+    if (cur_upd.rowcount or 0) <= 0:
+        return None
+    return int(d["user_id"])
+
+
+async def update_user_early_wake_alert_date(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+) -> None:
+    """Сохранить дату последнего вечернего напоминания о раннем подъёме."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET early_wake_alert_date = ?, updated_at = ? WHERE id = ?",
+        (local_date, now, user_id),
+    )
+    await conn.commit()
+
+
+async def list_schedule_events_range(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    start_date: str,
+    end_date: str,
+) -> List[Dict[str, Any]]:
+    """Получить локальные события расписания за диапазон дат."""
+    cur = await conn.execute(
+        """
+        SELECT * FROM schedule_events
+        WHERE user_id = ? AND event_date >= ? AND event_date <= ?
+        ORDER BY event_date ASC, start_time ASC, id ASC
+        """,
+        (user_id, start_date, end_date),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+
 

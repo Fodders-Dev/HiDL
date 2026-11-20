@@ -614,6 +614,56 @@ async def init_db(conn: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_meal_plans_user_date
             ON meal_plans(user_id, plan_date);
+
+        CREATE TABLE IF NOT EXISTS user_calendar_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT 'Google Calendar',
+            ics_url TEXT DEFAULT '',
+            calendar_id TEXT DEFAULT 'primary',
+            access_token TEXT DEFAULT '',
+            refresh_token TEXT DEFAULT '',
+            token_expires_at TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_sync_at TEXT,
+            last_error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, provider),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            external_uid TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            is_all_day INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL,
+            location TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            is_busy INTEGER NOT NULL DEFAULT 1,
+            pre_alert_sent INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, source, external_uid, event_date, start_time),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_user_date
+            ON calendar_events(user_id, event_date, start_time);
+
+        CREATE TABLE IF NOT EXISTS gcal_oauth_states (
+            state_token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
     await ensure_columns(conn)
@@ -663,6 +713,7 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         ("sleep_confirmed_date", "TEXT"),
         ("sleep_confirmed_at", "TEXT"),
         ("night_catch_last_at", "TEXT"),
+        ("early_wake_alert_date", "TEXT DEFAULT ''"),
     ):
         if col_name not in user_cols:
             await conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")
@@ -1147,6 +1198,56 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_meal_plans_user_date
             ON meal_plans(user_id, plan_date);
+
+        CREATE TABLE IF NOT EXISTS user_calendar_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT 'Google Calendar',
+            ics_url TEXT DEFAULT '',
+            calendar_id TEXT DEFAULT 'primary',
+            access_token TEXT DEFAULT '',
+            refresh_token TEXT DEFAULT '',
+            token_expires_at TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_sync_at TEXT,
+            last_error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, provider),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            external_uid TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            is_all_day INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL,
+            location TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            is_busy INTEGER NOT NULL DEFAULT 1,
+            pre_alert_sent INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, source, external_uid, event_date, start_time),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_user_date
+            ON calendar_events(user_id, event_date, start_time);
+
+        CREATE TABLE IF NOT EXISTS gcal_oauth_states (
+            state_token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
 

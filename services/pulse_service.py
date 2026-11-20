@@ -12,7 +12,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
-from services import karma_service
+from services import calendar_service, karma_service
 from utils.time import format_time_local, local_date_str, parse_hhmm, tzinfo_from_string
 
 SLOT_TITLES: Dict[str, str] = {
@@ -1093,6 +1093,17 @@ async def process_pulse_tick(
         slot_key = str(checkin.get("slot_key") or "")
         if _confirmed_sleep_active(user, now) and slot_key != "wake":
             continue
+
+        if slot_key in {"lunch", "afternoon", "dinner", "winddown"}:
+            busy_ev = await calendar_service.get_active_busy_event(db, user, now)
+            if busy_ev and busy_ev.get("end_utc"):
+                end_utc = busy_ev["end_utc"]
+                defer_utc = end_utc + datetime.timedelta(minutes=5)
+                if defer_utc > now:
+                    await repo.update_pulse_checkin(
+                        db, int(checkin["id"]), next_ping_at_utc=defer_utc.isoformat()
+                    )
+                    continue
 
         status = str(checkin.get("status") or "pending")
         ping_count = int(checkin.get("ping_count") or 0)

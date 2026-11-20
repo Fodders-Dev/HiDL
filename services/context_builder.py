@@ -8,7 +8,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from db import repositories as repo
-from services import karma_service, pulse_service
+from services import calendar_service, karma_service, pulse_service
 from utils.rows import rows_to_dicts
 from utils.time import format_time_local, local_date_str, parse_hhmm
 
@@ -206,7 +206,9 @@ async def build_user_day_snapshot(
     done_tasks_count = sum(1 for p in plan_rows if p.get("done"))
 
     reminders = rows_to_dicts(await repo.list_custom_reminders(db, user_id))
-    events_today = rows_to_dicts(await repo.list_schedule_events(db, user_id, local_date))
+    events_today = await calendar_service.get_unified_events_for_date(db, user_id, local_date)
+    tomorrow_date = (datetime.date.fromisoformat(local_date) + datetime.timedelta(days=1)).isoformat()
+    events_tomorrow = await calendar_service.get_unified_events_for_date(db, user_id, tomorrow_date)
     pantry_rows = rows_to_dicts(await repo.list_pantry_items(db, user_id))
     shopping_rows = [
         r for r in rows_to_dicts(await repo.list_shopping_items(db, user_id, scope="household"))
@@ -242,7 +244,8 @@ async def build_user_day_snapshot(
         "pending_tasks": pending_tasks,
         "done_tasks_count": done_tasks_count,
         "reminders": reminders[:5],
-        "events_today": events_today[:5],
+        "events_today": events_today[:8],
+        "events_tomorrow": events_tomorrow[:5],
         "pantry_items": pantry_rows,
         "shopping_unbought": shopping_rows,
         "meal_plan_today": meal_plan_today,
@@ -314,6 +317,22 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         ]
         if meal_parts:
             lines.append("Меню на сегодня: " + ", ".join(meal_parts) + ".")
+    events_today = snapshot.get("events_today") or []
+    if events_today:
+        ev_parts = [
+            ("весь день" if e.get("is_all_day") else f"{e.get('start_time')}–{e.get('end_time')}")
+            + f" {e.get('title')}"
+            for e in events_today[:5]
+        ]
+        lines.append("Календарь сегодня: " + "; ".join(ev_parts) + ".")
+    early_tom = [
+        e
+        for e in (snapshot.get("events_tomorrow") or [])
+        if not e.get("is_all_day") and str(e.get("start_time") or "99:99") < "10:00"
+    ]
+    if early_tom:
+        e0 = early_tom[0]
+        lines.append(f"Раннее событие завтра: {e0.get('start_time')} {e0.get('title')}.")
     last_ev = str(state.get("last_event_summary") or "").strip()
     if last_ev:
         lines.append(f"Последнее событие кармы: {last_ev}.")

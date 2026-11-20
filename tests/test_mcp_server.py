@@ -466,7 +466,17 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
         # Resources list/read
         _, res_list = await self._rpc(client, tok, "resources/list", session_id=sid)
         uris = {r["uri"] for r in res_list["result"]["resources"]}
-        self.assertEqual(uris, {"hidl://today", "hidl://shopping", "hidl://pantry", "hidl://diary/recent"})
+        self.assertEqual(
+            uris,
+            {
+                "hidl://today",
+                "hidl://shopping",
+                "hidl://pantry",
+                "hidl://karma",
+                "hidl://calendar",
+                "hidl://diary/recent",
+            },
+        )
         _, res_read = await self._rpc(client, tok, "resources/read", {"uri": "hidl://today"}, session_id=sid)
         self.assertIn("Забрать заказ из ПВЗ", res_read["result"]["contents"][0]["text"])
 
@@ -520,6 +530,8 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             "hidl_add_pantry_item",
             "hidl_add_expense",
             "hidl_add_diary_entry",
+            "hidl_add_calendar_event",
+            "hidl_set_meal_plan",
         ):
             self.assertNotIn(write_name, ro_names)
 

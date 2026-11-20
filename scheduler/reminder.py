@@ -8,7 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import repositories as repo
-from services import pulse_service
+from services import calendar_service, pulse_service
 from utils.time import format_date_display, local_date_str, should_trigger, tzinfo_from_string
 from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
@@ -80,6 +80,8 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_sleep_mode, "interval", minutes=5, id="sleep_mode_tick")
         self.scheduler.add_job(self._tick_daily_brief, "interval", minutes=5, id="daily_brief_tick")
         self.scheduler.add_job(self._tick_pulse, "interval", seconds=60, id="pulse_tick")
+        self.scheduler.add_job(self._tick_calendar_sync, "interval", minutes=15, id="calendar_sync_tick")
+        self.scheduler.add_job(self._tick_calendar_alerts, "interval", seconds=60, id="calendar_alerts_tick")
         self.scheduler.start()
 
     @staticmethod
@@ -91,6 +93,12 @@ class ReminderScheduler:
 
     async def _tick_pulse(self) -> None:
         await pulse_service.process_pulse_tick(self.conn, self.bot)
+
+    async def _tick_calendar_sync(self) -> None:
+        await calendar_service.process_calendar_sync_tick(self.conn)
+
+    async def _tick_calendar_alerts(self) -> None:
+        await calendar_service.process_calendar_alerts_tick(self.conn, self.bot)
 
     async def _safe_send_message(
         self,

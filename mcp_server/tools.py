@@ -12,6 +12,7 @@ import aiosqlite
 
 from config import MCPSettings
 from db import repositories as repo
+from services import calendar_service, context_builder, karma_service, kitchen_ai, pulse_service
 from services.inbox_parser import compute_one_time_last_sent
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_time_local, local_date_str, parse_hhmm
@@ -140,6 +141,11 @@ async def _tool_get_today(
     wellness = await repo.get_wellness(db, user["id"])
     window_days = int((wellness or {}).get("expiring_window_days", 3))
     soon_pantry, expired_pantry = await repo.pantry_expiring(db, user["id"], local_date, window_days=window_days)
+    karma_state = await repo.get_or_create_karma_state(db, user["id"])
+    karma_score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
+    karma_mode = karma_service.get_karma_mode(karma_score)
+    cal_events_today = await calendar_service.get_unified_events_for_date(db, user["id"], local_date)
+    meal_plan_today = await repo.get_meal_plan_for_date(db, user["id"], local_date)
 
     payload: dict[str, Any] = {
         "local_date": local_date,
@@ -147,6 +153,41 @@ async def _tool_get_today(
         "timezone": tz,
         "wake_up_time": user.get("wake_up_time"),
         "sleep_time": user.get("sleep_time"),
+        "karma": {
+            "score": karma_score,
+            "mode": karma_mode["code"],
+            "label": karma_mode["label"],
+            "debts": {
+                "sleep": int(karma_state.get("sleep_debt") or 0),
+                "food": int(karma_state.get("food_debt") or 0),
+                "tasks": int(karma_state.get("tasks_debt") or 0),
+                "hygiene": int(karma_state.get("hygiene_debt") or 0),
+            },
+            "sick_freeze_active": karma_service.is_sick_freeze_active(user, now_utc),
+        },
+        "calendar_events": [
+            {
+                "event_date": e.get("event_date"),
+                "start_time": e.get("start_time"),
+                "end_time": e.get("end_time"),
+                "is_all_day": bool(e.get("is_all_day")),
+                "title": e.get("title"),
+                "location": e.get("location") or "",
+                "source": e.get("source"),
+                "is_busy": bool(e.get("is_busy", 1)),
+            }
+            for e in cal_events_today
+        ],
+        "meal_plan_today": [
+            {
+                "meal_slot": m.get("meal_slot"),
+                "title": m.get("title"),
+                "recipe_id": m.get("recipe_id") or "",
+                "time_minutes": int(m.get("time_minutes") or 20),
+                "status": m.get("status") or "planned",
+            }
+            for m in meal_plan_today
+        ],
         "routines": [
             {
                 "routine_id": r.get("routine_id"),
@@ -788,6 +829,261 @@ async def _tool_add_diary_entry(
     }
 
 
+async def _tool_get_karma(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    now_utc = _now_utc_naive()
+    tz = user.get("timezone") or "UTC"
+    local_date = _validate_iso_date(args.get("date")) or local_date_str(now_utc, tz)
+    uid = int(user["id"])
+    state = await repo.get_or_create_karma_state(db, uid)
+    score = int(state.get("score") if state.get("score") is not None else 70)
+    mode = karma_service.get_karma_mode(score)
+    events = await repo.list_karma_events(db, uid, limit=10)
+    checkins = await repo.list_pulse_checkins_for_date(db, uid, local_date)
+    return {
+        "local_date": local_date,
+        "score": score,
+        "mode": mode["code"],
+        "label": mode["label"],
+        "sick_freeze_active": karma_service.is_sick_freeze_active(user, now_utc),
+        "sick_until_utc": user.get("sick_until_utc"),
+        "debts": {
+            "sleep": int(state.get("sleep_debt") or 0),
+            "food": int(state.get("food_debt") or 0),
+            "tasks": int(state.get("tasks_debt") or 0),
+            "hygiene": int(state.get("hygiene_debt") or 0),
+        },
+        "streaks": {
+            "sleep": int(state.get("sleep_streak") or 0),
+            "food": int(state.get("food_streak") or 0),
+            "tasks": int(state.get("tasks_streak") or 0),
+            "hygiene": int(state.get("hygiene_streak") or 0),
+        },
+        "pulse_checkins": [
+            {
+                "slot_key": c.get("slot_key"),
+                "domain": c.get("domain"),
+                "status": c.get("status"),
+                "snooze_count": int(c.get("snooze_count") or 0),
+            }
+            for c in checkins
+        ],
+        "recent_events": [
+            {
+                "local_date": e.get("local_date"),
+                "domain": e.get("domain"),
+                "event_type": e.get("event_type"),
+                "delta": int(e.get("delta") or 0),
+                "score_after": int(e.get("score_after") or 0),
+                "reason": e.get("reason") or "",
+            }
+            for e in events
+        ],
+    }
+
+
+async def _tool_get_portrait(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    now_utc = _now_utc_naive()
+    uid = int(user["id"])
+    memory = await context_builder.refresh_user_portrait_if_needed(db, user, now_utc=now_utc)
+    karma_state = await repo.get_or_create_karma_state(db, uid)
+    wellness = await repo.get_wellness(db, uid)
+    meal_profile = str((dict(wellness) if wellness else {}).get("meal_profile") or "omnivore")
+    try:
+        patterns = json.loads(memory.get("patterns_json") or "[]")
+        if not isinstance(patterns, list):
+            patterns = []
+    except Exception:
+        patterns = []
+    score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
+    return {
+        "karma_score": score,
+        "karma_mode": karma_service.get_karma_mode(score)["code"],
+        "meal_profile": meal_profile,
+        "schedule": {
+            "weekday_wake": user.get("wake_up_time") or "08:00",
+            "weekday_sleep": user.get("sleep_time") or "23:00",
+            "weekend_wake": user.get("weekend_wake_up_time") or user.get("wake_up_time") or "08:00",
+            "weekend_sleep": user.get("weekend_sleep_time") or user.get("sleep_time") or "23:00",
+        },
+        "patterns": patterns,
+        "portrait_text": memory.get("portrait_text") or "",
+        "last_refreshed_at": memory.get("last_refreshed_at"),
+    }
+
+
+async def _tool_get_calendar(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    now_utc = _now_utc_naive()
+    tz = user.get("timezone") or "UTC"
+    start_date = _validate_iso_date(args.get("date")) or local_date_str(now_utc, tz)
+    days = max(1, min(14, int(args.get("days") or 3)))
+    end_date = (datetime.date.fromisoformat(start_date) + datetime.timedelta(days=days - 1)).isoformat()
+
+    conns = await repo.list_user_calendar_connections(db, int(user["id"]), enabled_only=False)
+    events = await calendar_service.get_unified_events_range(db, int(user["id"]), start_date, end_date)
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": days,
+        "connections": [
+            {
+                "provider": c.get("provider"),
+                "label": c.get("label"),
+                "enabled": bool(c.get("enabled")),
+                "last_sync_at": c.get("last_sync_at"),
+                "last_error": c.get("last_error") or "",
+            }
+            for c in conns
+        ],
+        "events": [
+            {
+                "event_date": e.get("event_date"),
+                "start_time": e.get("start_time"),
+                "end_time": e.get("end_time"),
+                "is_all_day": bool(e.get("is_all_day")),
+                "title": e.get("title"),
+                "location": e.get("location") or "",
+                "source": e.get("source"),
+                "is_busy": bool(e.get("is_busy", 1)),
+            }
+            for e in events
+        ],
+    }
+
+
+async def _tool_add_calendar_event(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    title = str(args.get("title") or "").strip()
+    if not title:
+        raise ToolError("Параметр title обязателен.")
+    event_date = _validate_iso_date(args.get("date"))
+    if not event_date:
+        raise ToolError("Параметр date (YYYY-MM-DD) обязателен.")
+    st_raw = str(args.get("start_time") or "").strip()
+    en_raw = str(args.get("end_time") or "").strip()
+    st_t = parse_hhmm(st_raw)
+    en_t = parse_hhmm(en_raw)
+    if not st_t or not en_t:
+        raise ToolError("Параметры start_time и end_time обязательны в формате HH:MM.")
+    if en_t <= st_t:
+        raise ToolError("end_time должен быть позже start_time.")
+
+    res = await calendar_service.create_unified_event(
+        db,
+        user,
+        title=title,
+        event_date=event_date,
+        start_time=st_t.strftime("%H:%M"),
+        end_time=en_t.strftime("%H:%M"),
+        location=str(args.get("location") or "").strip(),
+        description=str(args.get("description") or "").strip(),
+        category="mcp_chatgpt",
+        push_to_google=True,
+    )
+    return res
+
+
+async def _tool_get_meal_plan(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    now_utc = _now_utc_naive()
+    tz = user.get("timezone") or "UTC"
+    start_date = _validate_iso_date(args.get("date")) or local_date_str(now_utc, tz)
+    days = max(1, min(7, int(args.get("days") or 3)))
+    return await kitchen_ai.get_meal_plan_view(
+        db, user, days=days, start_date=start_date, auto_generate=False, now_utc=now_utc
+    )
+
+
+async def _tool_set_meal_plan(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    now_utc = _now_utc_naive()
+    tz = user.get("timezone") or "UTC"
+    mode = str(args.get("mode") or "generate").strip().lower()
+    add_missing = bool(args.get("add_missing_to_shopping", False))
+
+    if mode == "generate":
+        days = 4 if int(args.get("days") or 3) == 4 else 3
+        start_date = _validate_iso_date(args.get("start_date") or args.get("date")) or local_date_str(now_utc, tz)
+        plan_data = await kitchen_ai.generate_meal_plan(
+            db, user, days=days, start_date=start_date, now_utc=now_utc
+        )
+        out: dict[str, Any] = {"ok": True, "mode": "generate", **plan_data}
+        if add_missing and plan_data.get("missing_shopping"):
+            shop_res = await kitchen_ai.add_missing_ingredients_to_shopping(
+                db, int(user["id"]), plan_data["missing_shopping"], scope="household"
+            )
+            out["added_to_shopping"] = shop_res["added"]
+        return out
+
+    if mode == "set_slot":
+        target_date = _validate_iso_date(args.get("date") or args.get("start_date")) or local_date_str(now_utc, tz)
+        meal_slot = str(args.get("meal_slot") or "").strip().lower()
+        if meal_slot not in {"breakfast", "lunch", "dinner"}:
+            raise ToolError("meal_slot должен быть 'breakfast', 'lunch' или 'dinner'.")
+        title = str(args.get("title") or "").strip()
+        recipe_id = str(args.get("recipe_id") or "").strip()
+        rec = kitchen_ai.get_recipe(recipe_id) if recipe_id else None
+        if not title and rec:
+            title = str(rec.get("title") or "")
+        if not title:
+            raise ToolError("Параметр title (или валидный recipe_id) обязателен.")
+        t_min = int(args.get("time_minutes") or (rec.get("time_minutes") if rec else 20) or 20)
+        raw_ings = args.get("ingredients")
+        if isinstance(raw_ings, list):
+            ingredients = [i for i in raw_ings if isinstance(i, dict) and i.get("name")]
+        elif rec:
+            ingredients = list(rec.get("ingredients") or [])
+        else:
+            ingredients = []
+        row = await repo.upsert_meal_plan_slot(
+            db,
+            int(user["id"]),
+            target_date,
+            meal_slot,
+            title=title,
+            recipe_id=recipe_id,
+            time_minutes=t_min,
+            ingredients=ingredients,
+            status="planned",
+        )
+        missing = await kitchen_ai.compute_meal_plan_missing_shopping(db, user, [row])
+        out = {"ok": True, "mode": "set_slot", "slot": row, "missing_shopping": missing}
+        if add_missing and missing:
+            shop_res = await kitchen_ai.add_missing_ingredients_to_shopping(
+                db, int(user["id"]), missing, scope="household"
+            )
+            out["added_to_shopping"] = shop_res["added"]
+        return out
+
+    raise ToolError("mode должен быть 'generate' или 'set_slot'.")
+
+
 ToolHandler = Callable[[aiosqlite.Connection, dict[str, Any], MCPSettings, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 _TOOL_REGISTRY: list[dict[str, Any]] = [
@@ -1036,6 +1332,99 @@ _TOOL_REGISTRY: list[dict[str, Any]] = [
         "requires_write": True,
         "requires_diary": True,
     },
+    {
+        "name": "hidl_get_karma",
+        "description": "Получить карму HiDL (0–100), режим строгости мамы, долги, серии, ЧП-заморозку и статус Пульса дня.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"date": {"type": "string", "description": "Дата YYYY-MM-DD (по умолчанию сегодня)."}},
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "handler": _tool_get_karma,
+        "requires_write": False,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_get_portrait",
+        "description": "Получить обновлённый портрет привычек пользователя (паттерны сна, еды, переносов и расписание подъёма/отбоя).",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "handler": _tool_get_portrait,
+        "requires_write": False,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_get_calendar",
+        "description": "Получить расписание и события Google Calendar + локального расписания за выбранный период (без секретных ссылок).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Начальная дата YYYY-MM-DD (по умолчанию сегодня)."},
+                "days": {"type": "integer", "minimum": 1, "maximum": 14, "description": "Число дней (по умолчанию 3)."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "handler": _tool_get_calendar,
+        "requires_write": False,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_add_calendar_event",
+        "description": "Создать событие в расписании HiDL (и отправить в Google Calendar, если подключён OAuth).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "date": {"type": "string", "description": "Дата YYYY-MM-DD."},
+                "start_time": {"type": "string", "description": "Время начала HH:MM."},
+                "end_time": {"type": "string", "description": "Время окончания HH:MM."},
+                "location": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["title", "date", "start_time", "end_time"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "handler": _tool_add_calendar_event,
+        "requires_write": True,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_get_meal_plan",
+        "description": "Получить текущее меню питания на несколько дней и недостающие продукты за вычетом холодильника.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Начальная дата YYYY-MM-DD (по умолчанию сегодня)."},
+                "days": {"type": "integer", "minimum": 1, "maximum": 7, "description": "Дней (по умолчанию 3)."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "handler": _tool_get_meal_plan,
+        "requires_write": False,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_set_meal_plan",
+        "description": "Сгенерировать меню на 3–4 дня под диету/холодильник или задать конкретное блюдо в слот, с опцией добавления покупок.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["generate", "set_slot"]},
+                "days": {"type": "integer", "minimum": 3, "maximum": 4},
+                "date": {"type": "string", "description": "YYYY-MM-DD."},
+                "meal_slot": {"type": "string", "enum": ["breakfast", "lunch", "dinner"]},
+                "title": {"type": "string"},
+                "recipe_id": {"type": "string"},
+                "time_minutes": {"type": "integer"},
+                "ingredients": {"type": "array", "items": {"type": "object"}},
+                "add_missing_to_shopping": {"type": "boolean"},
+            },
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "handler": _tool_set_meal_plan,
+        "requires_write": True,
+        "requires_diary": False,
+    },
 ]
 
 
@@ -1109,6 +1498,18 @@ def list_enabled_resources(settings: MCPSettings) -> list[dict[str, Any]]:
             "description": "Запасы продуктов, профиль питания и подходящие рецепты.",
             "mimeType": "application/json",
         },
+        {
+            "uri": "hidl://karma",
+            "name": "Карма и Пульс дня HiDL",
+            "description": "Балл кармы, долги по доменам, статус чек-инов Пульса и история событий.",
+            "mimeType": "application/json",
+        },
+        {
+            "uri": "hidl://calendar",
+            "name": "Календарь HiDL на 3 дня",
+            "description": "Ближайшие события из Google Calendar и локального расписания.",
+            "mimeType": "application/json",
+        },
     ]
     if settings.allow_diary:
         resources.append(
@@ -1135,6 +1536,10 @@ async def read_mcp_resource(
         data = await _tool_list_shopping(db, user, settings, {"scope": "all"})
     elif uri == "hidl://pantry":
         data = await _tool_get_kitchen(db, user, settings, {"servings": 2})
+    elif uri == "hidl://karma":
+        data = await _tool_get_karma(db, user, settings, {})
+    elif uri == "hidl://calendar":
+        data = await _tool_get_calendar(db, user, settings, {"days": 3})
     elif uri == "hidl://diary/recent":
         if not settings.allow_diary:
             raise ToolError("Доступ к личному дневнику отключён (MCP_ALLOW_DIARY=0).")

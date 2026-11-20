@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import secrets
 from typing import Any, Optional
@@ -11,6 +12,7 @@ from aiohttp import web
 import aiosqlite
 
 from config import MCPSettings, get_mcp_settings
+from services import calendar_service
 from mcp_server.oauth import (
     handle_authorization_server_metadata,
     handle_oauth_authorize_get,
@@ -77,10 +79,11 @@ async def _dispatch_jsonrpc(
                         "tools": {"listChanged": False},
                         "resources": {"listChanged": False},
                     },
-                    "serverInfo": {"name": "hidl-mcp", "version": "1.0.0"},
+                    "serverInfo": {"name": "hidl-mcp", "version": "2.0.0"},
                     "instructions": (
-                        "Персональный ассистент HiDL: можно читать и обновлять задачи на день, "
-                        "напоминания, список покупок, холодильник/рецепты, расходы и (если разрешено) дневник."
+                        "Персональный ассистент HiDL 2.0: можно читать и обновлять задачи на день, "
+                        "напоминания, расписание и Google Calendar, меню на 3–4 дня, карму и портрет привычек, "
+                        "список покупок, холодильник/рецепты, расходы и (если разрешено) дневник."
                     ),
                 },
             ),
@@ -147,6 +150,29 @@ async def handle_health(request: web.Request) -> web.Response:
             "readonly": settings.readonly,
         }
     )
+
+
+async def handle_gcal_callback(request: web.Request) -> web.Response:
+    db: aiosqlite.Connection = request.app["db_conn"]
+    err = (request.query.get("error") or "").strip()
+    if err:
+        body = (
+            "<!doctype html><html lang='ru'><meta charset='utf-8'><body>"
+            f"<h2>Авторизация Google Calendar отменена</h2><p>{html.escape(err)}</p>"
+            "</body></html>"
+        )
+        return web.Response(text=body, content_type="text/html", status=400)
+
+    code = (request.query.get("code") or "").strip()
+    state = (request.query.get("state") or "").strip()
+    ok, msg = await calendar_service.complete_gcal_oauth_callback(db, code=code, state=state)
+    title = "Google Calendar подключён" if ok else "Ошибка подключения Google Calendar"
+    body = (
+        "<!doctype html><html lang='ru'><meta charset='utf-8'><body>"
+        f"<h2>{title}</h2><p>{html.escape(msg)}</p>"
+        "</body></html>"
+    )
+    return web.Response(text=body, content_type="text/html", status=200 if ok else 400)
 
 
 async def handle_mcp_post(request: web.Request) -> web.Response:
@@ -250,6 +276,7 @@ def create_mcp_app(
     app.on_shutdown.append(_on_shutdown)
 
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/gcal/callback", handle_gcal_callback)
 
     # RFC 9728 Protected Resource Metadata & RFC 8414 Authorization Server Metadata
     app.router.add_get("/.well-known/oauth-protected-resource", handle_protected_resource_metadata)

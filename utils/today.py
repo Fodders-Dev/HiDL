@@ -5,7 +5,7 @@ from typing import Tuple
 from aiogram import types
 
 from db import repositories as repo
-from services import karma_service
+from services import calendar_service, karma_service
 from utils.finance import payday_summary
 from utils.time import local_date_str, format_date_display, format_time_local
 from utils.formatting import format_money
@@ -143,6 +143,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
 
     # day plan (важные/дополнительные дела)
     plan_items = rows_to_dicts(await repo.list_day_plan_items(db, user["id"], local_date))
+    cal_events_today = await calendar_service.get_unified_events_for_date(db, user["id"], local_date)
     important_plan = [p for p in plan_items if p.get("is_important")]
     extra_plan = [p for p in plan_items if not p.get("is_important")]
     plan_done = [p for p in plan_items if p.get("done")]
@@ -291,6 +292,12 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         blocks.append("<b>🔁 Регулярка по дому:</b>\n" + "\n".join(regular_lines))
     if bills_lines:
         blocks.append("<b>📅 Счета в ближайшие дни:</b>\n" + "\n".join(bills_lines))
+    if cal_events_today:
+        cal_lines = []
+        for ev in cal_events_today[:5]:
+            when = "Весь день" if ev.get("is_all_day") else f"{ev.get('start_time')}–{ev.get('end_time')}"
+            cal_lines.append(f"• {when} · {html.escape(str(ev.get('title') or ''))}")
+        blocks.append("<b>🗓 Календарь на сегодня:</b>\n" + "\n".join(cal_lines))
     if plan_items:
         # Если слишком много пунктов, прячем детали (особенно в ADHD-режиме)
         show_details = True

@@ -162,6 +162,20 @@ class MCPSettings:
     refresh_token_ttl_sec: int
 
 
+@dataclass(frozen=True)
+class GoogleCalendarSettings:
+    """Runtime configuration for Google Calendar OAuth 2.0 integration."""
+
+    client_id: str
+    client_secret: str
+    redirect_uri: str
+    scopes: str
+
+    @property
+    def oauth_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret and self.redirect_uri)
+
+
 def get_settings(require_bot_token: bool = True) -> Settings:
     """Return settings from environment variables."""
     bot_token = os.getenv("BOT_TOKEN", "")
@@ -342,4 +356,27 @@ def get_mcp_settings() -> MCPSettings:
         readonly=_env_bool("MCP_READONLY", False),
         access_token_ttl_sec=max(300, _env_int("MCP_ACCESS_TOKEN_TTL_SEC", 86400)),
         refresh_token_ttl_sec=max(3600, _env_int("MCP_REFRESH_TOKEN_TTL_SEC", 7776000)),
+    )
+
+
+_DEFAULT_GCAL_SCOPES = (
+    "https://www.googleapis.com/auth/calendar.events "
+    "https://www.googleapis.com/auth/calendar.readonly"
+)
+
+
+def get_gcal_settings() -> GoogleCalendarSettings:
+    """Build GoogleCalendarSettings from environment variables."""
+    client_id = _env_str("GCAL_CLIENT_ID")
+    client_secret = _env_str("GCAL_CLIENT_SECRET")
+    raw_redirect = _env_str("GCAL_REDIRECT_URI")
+    if not raw_redirect:
+        raw_base = _env_str("MCP_PUBLIC_BASE_URL").rstrip("/")
+        raw_redirect = f"{raw_base}/gcal/callback" if raw_base else ""
+    scopes = _env_str("GCAL_SCOPES") or _DEFAULT_GCAL_SCOPES
+    return GoogleCalendarSettings(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=raw_redirect,
+        scopes=scopes,
     )
