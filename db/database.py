@@ -671,6 +671,9 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             description TEXT DEFAULT '',
             is_busy INTEGER NOT NULL DEFAULT 1,
             pre_alert_sent INTEGER NOT NULL DEFAULT 0,
+            alert_chat_id INTEGER,
+            alert_message_id INTEGER,
+            alert_end_utc TEXT,
             updated_at TEXT NOT NULL,
             UNIQUE(user_id, source, external_uid, event_date, start_time),
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -883,6 +886,13 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
                 await add_column_if_missing(table, col_name, definition)
     await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_day_plan_items_external ON day_plan_items(user_id, external_key) WHERE external_key != '';" )
     await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_events_external ON schedule_events(user_id, external_key) WHERE external_key != '';" )
+
+    calendar_info = await conn.execute_fetchall("PRAGMA table_info(calendar_events);")
+    if calendar_info:
+        calendar_cols = {row["name"] for row in calendar_info}
+        for col_name, definition in (("alert_chat_id", "INTEGER"), ("alert_message_id", "INTEGER"), ("alert_end_utc", "TEXT")):
+            if col_name not in calendar_cols:
+                await add_column_if_missing("calendar_events", col_name, definition)
 
     pulse_info = await conn.execute_fetchall("PRAGMA table_info(pulse_checkins);")
     if pulse_info:
@@ -1345,6 +1355,9 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             description TEXT DEFAULT '',
             is_busy INTEGER NOT NULL DEFAULT 1,
             pre_alert_sent INTEGER NOT NULL DEFAULT 0,
+            alert_chat_id INTEGER,
+            alert_message_id INTEGER,
+            alert_end_utc TEXT,
             updated_at TEXT NOT NULL,
             UNIQUE(user_id, source, external_uid, event_date, start_time),
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE

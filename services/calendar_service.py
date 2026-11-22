@@ -17,6 +17,7 @@ import aiohttp
 from config import GoogleCalendarSettings, get_gcal_settings
 from db import repositories as repo
 from utils.rows import rows_to_dicts
+from utils.sender import safe_delete_or_clear_markup
 from utils.time import format_time_local, local_date_str, parse_hhmm, tzinfo_from_string
 
 _MAX_ICS_BYTES = 5 * 1024 * 1024
@@ -501,6 +502,12 @@ def parse_ics_events(
                         )
                 else:
                     # Событие через полночь — разбиваем на дни окна
+                    alert_end_utc = (
+                        (occ_dt + duration)
+                        .astimezone(datetime.timezone.utc)
+                        .replace(tzinfo=None)
+                        .isoformat()
+                    )
                     if window_start <= d_start <= window_end:
                         normalized.append(
                             {
@@ -513,6 +520,7 @@ def parse_ics_events(
                                 "location": location,
                                 "description": description,
                                 "is_busy": is_busy,
+                                "alert_end_utc": alert_end_utc,
                             }
                         )
                     if window_start <= d_end <= window_end and occ_local_end.strftime("%H:%M") != "00:00":
@@ -667,6 +675,15 @@ def _map_google_api_items(
                     "location": location,
                     "description": description,
                     "is_busy": 0 if transp == "transparent" else 1,
+                    **(
+                        {
+                            "alert_end_utc": en_dt.astimezone(datetime.timezone.utc)
+                            .replace(tzinfo=None)
+                            .isoformat()
+                        }
+                        if loc_en.date() != ev_date
+                        else {}
+                    ),
                 }
             )
     return out
@@ -1387,7 +1404,47 @@ async def process_calendar_alerts_tick(
     """60-секундный тик пред-событийных предупреждений и вечернего предложения сдвинуть отбой."""
     now = _naive_utc(now_utc)
     users = rows_to_dicts(await repo.list_users(db))
+    users_by_id = {int(user["id"]): user for user in users if user.get("id") is not None}
     sent_count = 0
+
+    # Remove expired alert cards before quiet/pause filtering: cleanup never sends
+    # a notification, and must also see events from earlier local dates.
+    active_alerts = await repo.list_calendar_events_with_active_alert(db)
+    for raw_event in active_alerts:
+        ev = dict(raw_event)
+        try:
+            event_id = int(ev["id"])
+            uid = int(ev["user_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        user = users_by_id.get(uid)
+        if user is None:
+            row = await repo.get_user(db, uid)
+            if not row:
+                continue
+            user = dict(row)
+            users_by_id[uid] = user
+        bounds = _event_utc_bounds(ev, str(user.get("timezone") or "UTC"))
+        alert_end_utc = bounds[1] if bounds is not None else None
+        if bounds is not None and ev.get("alert_end_utc"):
+            try:
+                alert_end_utc = _naive_utc(
+                    datetime.datetime.fromisoformat(str(ev["alert_end_utc"]))
+                )
+            except (TypeError, ValueError):
+                pass
+        if bounds is not None and alert_end_utc is not None and now < alert_end_utc:
+            continue
+        try:
+            await safe_delete_or_clear_markup(
+                bot,
+                ev.get("alert_chat_id"),
+                ev.get("alert_message_id"),
+            )
+        finally:
+            # Telegram's 48-hour deletion limit and already-deleted cards should
+            # not cause this alert to be retried on every scheduler tick.
+            await repo.clear_calendar_event_alert_message(db, event_id)
 
     for user in users:
         uid = int(user["id"])
@@ -1422,8 +1479,13 @@ async def process_calendar_alerts_tick(
                 if has_loc:
                     lines.append(f"📍 {html.escape(str(ev['location']))} (с запасом на дорогу)")
                 try:
-                    await bot.send_message(chat_id=tg_id, text="\n".join(lines), parse_mode="HTML")
-                    await repo.mark_calendar_event_alert_sent(db, int(ev["id"]))
+                    sent_msg = await bot.send_message(chat_id=tg_id, text="\n".join(lines), parse_mode="HTML")
+                    await repo.mark_calendar_event_alert_sent(
+                        db,
+                        int(ev["id"]),
+                        chat_id=getattr(getattr(sent_msg, "chat", None), "id", None),
+                        message_id=getattr(sent_msg, "message_id", None),
+                    )
                     sent_count += 1
                 except Exception:
                     pass

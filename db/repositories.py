@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiosqlite
 
 from utils.rows import row_to_dict, rows_to_dicts
+from db.database import independent_connection
 
 
 def utc_now_str() -> str:
@@ -4477,29 +4478,9 @@ async def replace_calendar_events_window(
 ) -> int:
     """Заменить кэш событий в окне [start_date, end_date], сохраняя pre_alert_sent для неизменных событий."""
     now = utc_now_str()
-    cur = await conn.execute(
-        """
-        SELECT external_uid, event_date, start_time
-        FROM calendar_events
-        WHERE user_id = ? AND source = ? AND event_date >= ? AND event_date <= ? AND pre_alert_sent = 1
-        """,
-        (user_id, source, start_date, end_date),
-    )
-    alerted_keys = {
-        (str(r["external_uid"]), str(r["event_date"]), str(r["start_time"]))
-        for r in await cur.fetchall()
-    }
-
-    await conn.execute(
-        """
-        DELETE FROM calendar_events
-        WHERE user_id = ? AND source = ? AND event_date >= ? AND event_date <= ?
-        """,
-        (user_id, source, start_date, end_date),
-    )
-
     inserted = 0
     seen_keys: set[tuple[str, str, str]] = set()
+    prepared: List[tuple[tuple[str, str, str], Dict[str, Any]]] = []
     for ev in events:
         uid = str(ev.get("external_uid") or "").strip()
         ev_date = str(ev.get("event_date") or "").strip()
@@ -4512,33 +4493,62 @@ async def replace_calendar_events_window(
         if key in seen_keys:
             continue
         seen_keys.add(key)
-        pre_sent = 1 if key in alerted_keys else int(ev.get("pre_alert_sent") or 0)
-        await conn.execute(
-            """
-            INSERT INTO calendar_events
-            (user_id, source, external_uid, event_date, start_time, end_time,
-             is_all_day, title, location, description, is_busy, pre_alert_sent, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                source,
-                uid,
-                ev_date,
-                st,
-                en,
-                1 if ev.get("is_all_day") else 0,
-                title,
-                str(ev.get("location") or "").strip(),
-                str(ev.get("description") or "").strip(),
-                1 if ev.get("is_busy", 1) else 0,
-                pre_sent,
-                now,
-            ),
-        )
-        inserted += 1
+        prepared.append((key, {
+            "end_time": en,
+            "is_all_day": 1 if ev.get("is_all_day") else 0,
+            "title": title,
+            "location": str(ev.get("location") or "").strip(),
+            "description": str(ev.get("description") or "").strip(),
+            "is_busy": 1 if ev.get("is_busy", 1) else 0,
+            "pre_alert_sent": int(ev.get("pre_alert_sent") or 0),
+            "alert_end_utc": ev.get("alert_end_utc"),
+        }))
 
-    await conn.commit()
+    # Keep stable row IDs so a concurrent scheduler delete/mark refers to the
+    # same event while calendar sync refreshes its details.
+    async with independent_connection(conn) as writer:
+        await writer.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await writer.execute(
+                "SELECT id, external_uid, event_date, start_time, pre_alert_sent, alert_chat_id, alert_message_id "
+                "FROM calendar_events WHERE user_id = ? AND source = ? AND event_date >= ? AND event_date <= ?",
+                (user_id, source, start_date, end_date),
+            )
+            old_rows = await cur.fetchall()
+            old_ids: Dict[tuple[str, str, str], int] = {}
+            alerted_keys: Dict[tuple[str, str, str], tuple[Optional[int], Optional[int]]] = {}
+            for row in old_rows:
+                key = (str(row["external_uid"]), str(row["event_date"]), str(row["start_time"]))
+                old_ids[key] = int(row["id"])
+                if row["pre_alert_sent"]:
+                    alerted_keys[key] = (row["alert_chat_id"], row["alert_message_id"])
+
+            await writer.execute(
+                "DELETE FROM calendar_events WHERE user_id = ? AND source = ? AND event_date >= ? AND event_date <= ?",
+                (user_id, source, start_date, end_date),
+            )
+            for key, values in prepared:
+                uid, ev_date, st = key
+                alert_chat_id, alert_message_id = alerted_keys.get(key, (None, None))
+                pre_alert_sent = 1 if key in alerted_keys else values["pre_alert_sent"]
+                await writer.execute(
+                    """
+                    INSERT INTO calendar_events
+                    (id, user_id, source, external_uid, event_date, start_time, end_time,
+                     is_all_day, title, location, description, is_busy, pre_alert_sent,
+                     alert_chat_id, alert_message_id, alert_end_utc, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (old_ids.get(key), user_id, source, uid, ev_date, st, values["end_time"],
+                     values["is_all_day"], values["title"], values["location"],
+                     values["description"], values["is_busy"], pre_alert_sent,
+                     alert_chat_id, alert_message_id, values["alert_end_utc"], now),
+                )
+                inserted += 1
+            await writer.commit()
+        except Exception:
+            await writer.rollback()
+            raise
     return inserted
 
 
@@ -4554,12 +4564,13 @@ async def upsert_single_calendar_event(
     ev_date = str(event.get("event_date") or "").strip()
     st = str(event.get("start_time") or "00:00").strip()
     en = str(event.get("end_time") or st).strip()
+    alert_end_utc = event.get("alert_end_utc")
     await conn.execute(
         """
         INSERT INTO calendar_events
         (user_id, source, external_uid, event_date, start_time, end_time,
-         is_all_day, title, location, description, is_busy, pre_alert_sent, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         is_all_day, title, location, description, is_busy, pre_alert_sent, alert_end_utc, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, source, external_uid, event_date, start_time) DO UPDATE SET
             end_time = excluded.end_time,
             is_all_day = excluded.is_all_day,
@@ -4567,6 +4578,7 @@ async def upsert_single_calendar_event(
             location = excluded.location,
             description = excluded.description,
             is_busy = excluded.is_busy,
+            alert_end_utc = excluded.alert_end_utc,
             updated_at = excluded.updated_at
         """,
         (
@@ -4582,6 +4594,7 @@ async def upsert_single_calendar_event(
             str(event.get("description") or "").strip(),
             1 if event.get("is_busy", 1) else 0,
             int(event.get("pre_alert_sent") or 0),
+            alert_end_utc,
             now,
         ),
     )
@@ -4615,14 +4628,37 @@ async def list_calendar_events_range(
     return rows_to_dicts(await cur.fetchall())
 
 
-async def mark_calendar_event_alert_sent(conn: aiosqlite.Connection, event_id: int) -> None:
+async def mark_calendar_event_alert_sent(
+    conn: aiosqlite.Connection,
+    event_id: int,
+    *,
+    chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+) -> None:
     """Отметить, что пред-событийное предупреждение уже отправлено."""
     now = utc_now_str()
     await conn.execute(
-        "UPDATE calendar_events SET pre_alert_sent = 1, updated_at = ? WHERE id = ?",
-        (now, int(event_id)),
+        "UPDATE calendar_events SET pre_alert_sent = 1, alert_chat_id = ?, alert_message_id = ?, updated_at = ? WHERE id = ?",
+        (chat_id, message_id, now, int(event_id)),
     )
     await conn.commit()
+
+
+async def clear_calendar_event_alert_message(conn: aiosqlite.Connection, event_id: int) -> None:
+    """Forget a Telegram alert reference without allowing the alert to resend."""
+    await conn.execute(
+        "UPDATE calendar_events SET alert_chat_id = NULL, alert_message_id = NULL, updated_at = ? WHERE id = ?",
+        (utc_now_str(), int(event_id)),
+    )
+    await conn.commit()
+
+
+async def list_calendar_events_with_active_alert(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    """List active Telegram alert refs, including events from previous dates."""
+    cur = await conn.execute(
+        "SELECT * FROM calendar_events WHERE alert_message_id IS NOT NULL ORDER BY event_date, start_time, id"
+    )
+    return rows_to_dicts(await cur.fetchall())
 
 
 async def create_gcal_oauth_state(
