@@ -272,7 +272,7 @@ def _to_local_now(now_utc: datetime.datetime, tz_str: str) -> datetime.datetime:
 
 def _extract_relative_delta(src: str) -> Optional[datetime.timedelta]:
     txt = src.lower()
-    if "полчас" in txt:
+    if re.search(r"\bчерез\s+полчас\w*\b", txt):
         return datetime.timedelta(minutes=30)
     m = re.search(r"через\s+(\d+)\s*(мин\w*|м)\b", txt)
     if m:

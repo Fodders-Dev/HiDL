@@ -38,7 +38,7 @@ def more_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="☕ Кафе фокуса", callback_data="more:focus"),
             ],
             [
-                InlineKeyboardButton(text="🤒 Болею / ЧП (24ч)", callback_data="pulse:sick:prompt"),
+                InlineKeyboardButton(text="🤒 Болею / ЧП (24ч)", callback_data="pulse:sick:prompt:more"),
                 InlineKeyboardButton(text="⚙ Настройки", callback_data="settings:main"),
             ],
             [InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")],
@@ -52,9 +52,9 @@ def food_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
             [InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan")],
             [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
-            [InlineKeyboardButton(text="📖 Книга рецептов", callback_data="kitchen:recipes")],
+            [InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes")],
             [InlineKeyboardButton(text="🛒 Список покупок", callback_data="kitchen:shoplist")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
         ]
     )
 
@@ -62,11 +62,12 @@ def food_menu_keyboard() -> InlineKeyboardMarkup:
 def money_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Записать трату", callback_data="money:spent")],
-            [InlineKeyboardButton(text="Отчёт за неделю", callback_data="money:report")],
-            [InlineKeyboardButton(text="Лимиты", callback_data="money:cat")],
-            [InlineKeyboardButton(text="Счета", callback_data="money:bills")],
-            [InlineKeyboardButton(text="Советы", callback_data="money:tips")],
+            [InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
+            [InlineKeyboardButton(text="📊 Отчёт за неделю", callback_data="money:report")],
+            [InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
+            [InlineKeyboardButton(text="⏳ До зарплаты", callback_data="money:payday")],
+            [InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
+            [InlineKeyboardButton(text="💡 Советы", callback_data="money:tips")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
         ]
     )

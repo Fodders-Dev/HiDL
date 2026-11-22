@@ -185,9 +185,9 @@ async def get_user_meal_profile(db, user_id: int) -> str:
 
 def infer_meal_slot(local_hour: int) -> str:
     """Определить текущий слот приёма пищи по локальному часу."""
-    if local_hour < 11:
+    if 5 <= local_hour < 11:
         return "breakfast"
-    if local_hour < 16:
+    if 11 <= local_hour < 16:
         return "lunch"
     return "dinner"
 

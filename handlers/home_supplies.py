@@ -91,9 +91,17 @@ async def supplies_command(message: types.Message, db) -> None:
     await _render_supplies(message, supplies)
 
 
-async def supplies_menu(message: types.Message, db) -> None:
+async def supplies_menu(
+    message: types.Message,
+    db,
+    *,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
     """Вход из раздела Дом."""
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    uid = tg_user_id if tg_user_id is not None else message.from_user.id
+    uname = tg_full_name if tg_full_name is not None else message.from_user.full_name
+    user = await ensure_user(db, uid, uname)
     await repo.ensure_supplies(db, user["id"])
     supplies_rows = await repo.list_supplies(db, user["id"])
     supplies = rows_to_dicts(supplies_rows)

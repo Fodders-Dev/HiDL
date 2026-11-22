@@ -8,9 +8,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
 from db import repositories as repo
-from keyboards.common import main_menu_keyboard
+from keyboards.common import main_menu_keyboard, money_menu_keyboard
 from utils.menu_match import looks_like_expense, match_menu_label
 from utils.rows import row_to_dict
+from utils.sender import safe_edit
 from utils.time import local_date_str
 from utils.tone import tone_message
 from utils.finance import payday_summary
@@ -260,27 +261,18 @@ async def tone_select(message: types.Message, db) -> None:
             ]
         ),
     )
+_MONEY_MENU_TEXT = (
+    "Финансы — это не страшно. Я помогу следить за расходами, чтобы деньги не "
+    "исчезали в неизвестность.\n\nВыбери действие:"
+)
+
+
 @router.message(Command("finance"))
 @router.message(lambda m: match_menu_label(m.text, {"деньги", "финансы"}))
 async def money_menu_entry(message: types.Message, state: FSMContext, db) -> None:
     await _ensure_user(db, message.from_user.id, message.from_user.full_name)
     await state.clear()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
-            [types.InlineKeyboardButton(text="📊 Отчёт за неделю", callback_data="money:report")],
-            [types.InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
-            [types.InlineKeyboardButton(text="⏳ До зарплаты", callback_data="money:payday")],
-            [types.InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
-            [types.InlineKeyboardButton(text="💡 Советы", callback_data="money:tips")],
-            [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
-        ]
-    )
-    await message.answer(
-        "Финансы — это не страшно. Я помогу следить за расходами, чтобы деньги не "
-        "исчезали в неизвестность.\n\nВыбери действие:",
-        reply_markup=kb,
-    )
+    await message.answer(_MONEY_MENU_TEXT, reply_markup=money_menu_keyboard())
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("money:"))
@@ -296,7 +288,10 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         await callback.message.answer("Отменила.", reply_markup=main_menu_keyboard())
         await callback.answer("Отменила.")
         return
-    if action == "spent":
+    if action == "menu":
+        await state.clear()
+        await safe_edit(callback.message, _MONEY_MENU_TEXT, reply_markup=money_menu_keyboard())
+    elif action == "spent":
         await state.set_state(SpendState.amount)
         await callback.message.answer(
             "Сколько ушло? Напиши сумму, или сразу сумму и категорию (например «500 еда»).",
@@ -315,10 +310,10 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
                 [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
                 [types.InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
                 [types.InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
-                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
+                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")],
             ]
         )
-        await callback.message.answer(text, reply_markup=kb)
+        await safe_edit(callback.message, text, reply_markup=kb)
     elif action == "cat":
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -327,12 +322,19 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
                 [types.InlineKeyboardButton(text="Жильё", callback_data="limit:cat:жильё")],
                 [types.InlineKeyboardButton(text="Развлечения", callback_data="limit:cat:развлечения")],
                 [types.InlineKeyboardButton(text="Другое", callback_data="limit:cat:другое")],
-                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
+                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")],
             ]
         )
-        await callback.message.answer("Выбери категорию лимита:", reply_markup=kb)
+        await safe_edit(callback.message, "Выбери категорию лимита:", reply_markup=kb)
     elif action == "bills":
-        await bills_menu(callback.message, state, db)
+        await bills_menu(
+            callback.message,
+            state,
+            db,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+            use_edit=True,
+        )
     elif action == "payday":
         user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
@@ -354,7 +356,10 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
             "• План: сначала обязательные траты, потом хотелки.\n"
             "• Сделай лимит по категориям — кнопка «Лимиты» рядом."
         )
-        await callback.message.answer(tips_text, reply_markup=main_menu_keyboard())
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")]]
+        )
+        await safe_edit(callback.message, tips_text, reply_markup=kb)
     await callback.answer()
 
 
@@ -522,8 +527,18 @@ async def _render_bills(db, user_id: int) -> str:
     return "Счета:\n" + "\n".join(lines)
 
 
-async def bills_menu(message: types.Message, state: FSMContext, db) -> None:
-    user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def bills_menu(
+    message: types.Message,
+    state: FSMContext,
+    db,
+    *,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+    use_edit: bool = False,
+) -> None:
+    uid = tg_user_id if tg_user_id is not None else message.from_user.id
+    uname = tg_full_name if tg_full_name is not None else message.from_user.full_name
+    user = await _ensure_user(db, uid, uname)
     await state.clear()
     text = await _render_bills(db, user["id"])
     kb_rows = []
@@ -539,9 +554,12 @@ async def bills_menu(message: types.Message, state: FSMContext, db) -> None:
             ]
         )
     kb_rows.append([types.InlineKeyboardButton(text="➕ Добавить счёт", callback_data="bill:add")])
-    kb_rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")])
+    kb_rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    await message.answer(text, reply_markup=kb)
+    if use_edit:
+        await safe_edit(message, text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("bill:add"))

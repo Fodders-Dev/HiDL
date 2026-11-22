@@ -24,6 +24,7 @@ def _pause_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🧘 Пауза на сегодня", callback_data="pause:one_day")],
         [InlineKeyboardButton(text="🌙 Настроить сон", callback_data="sleep:menu:pause")],
         [InlineKeyboardButton(text="▶️ Снять паузу", callback_data="pause:resume")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
     ])
 
 

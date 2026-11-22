@@ -280,6 +280,21 @@ def _scope_switch_row(current: str) -> list[InlineKeyboardButton]:
         InlineKeyboardButton(text=("✅ 👤 Личный" if current == "personal" else "👤 Личный"), callback_data="kitchen:shoplist:personal"),
     ]
 
+async def _safe_answer_callback(
+    callback: types.CallbackQuery,
+    text: Optional[str] = None,
+    *,
+    show_alert: bool = False,
+) -> None:
+    try:
+        if text is None and not show_alert:
+            await callback.answer()
+        else:
+            await callback.answer(text, show_alert=show_alert)
+    except Exception:
+        pass
+
+
 # --- HANDLERS: MAIN ---
 @router.message(Command("kitchen"))
 async def kitchen_cmd(message: types.Message):
@@ -287,8 +302,8 @@ async def kitchen_cmd(message: types.Message):
 
 @router.callback_query(lambda c: c.data == "kitchen:main")
 async def kitchen_home(callback: types.CallbackQuery):
-    await callback.message.edit_text("🍽 <b>Умная кухня</b>", reply_markup=kitchen_main_keyboard(), parse_mode="HTML")
-    await callback.answer()
+    await _safe_answer_callback(callback)
+    await safe_edit(callback.message, "🍽 <b>Умная кухня</b>", reply_markup=kitchen_main_keyboard(), parse_mode="HTML")
 
 # --- HANDLERS: SHOPPING LIST ---
 async def _render_shoplist(callback: types.CallbackQuery, db, scope: str) -> None:
@@ -458,6 +473,7 @@ def _suggestion_action_row(item: dict) -> list[InlineKeyboardButton]:
     lambda c: c.data and (c.data == "kitchen:quick_pick" or c.data.startswith("kitchen:quick_pick:"))
 )
 async def quick_pick_recipes(callback: types.CallbackQuery, db):
+    await _safe_answer_callback(callback)
     parts = (callback.data or "").split(":")
     energy = parts[2] if len(parts) > 2 and parts[2] in kitchen_ai.ENERGY_MODES else "normal"
     page = _safe_int(parts[3], 0) if len(parts) > 3 else 0
@@ -514,7 +530,6 @@ async def quick_pick_recipes(callback: types.CallbackQuery, db):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode="HTML",
     )
-    await callback.answer()
 
 
 @router.callback_query(lambda c: c.data == "kitchen:more_food")
@@ -927,6 +942,13 @@ async def mealplan_callbacks(callback: types.CallbackQuery, db):
     days = _safe_int(parts[3], 3) if len(parts) > 3 else 3
     days = 4 if days == 4 else 3
 
+    if action != "shop":
+        early_toast = {
+            "gen": "Меню обновлено ✨",
+            "days": f"Собрала меню на {days} дн. 📅",
+        }.get(action)
+        await _safe_answer_callback(callback, early_toast)
+
     user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
     tz = user.get("timezone") or "UTC"
     start_date = local_date_str(datetime.datetime.utcnow(), tz)
@@ -937,7 +959,8 @@ async def mealplan_callbacks(callback: types.CallbackQuery, db):
         missing = await kitchen_ai.compute_meal_plan_missing_shopping(db, user, plan_rows)
         res = await kitchen_ai.add_missing_ingredients_to_shopping(db, user["id"], missing, scope="household")
         added_cnt = len(res["added"])
-        await callback.answer(
+        await _safe_answer_callback(
+            callback,
             f"🛒 Добавила в список покупок: {added_cnt} поз." if added_cnt else "Всё уже в покупках 👍",
             show_alert=True,
         )
@@ -946,13 +969,10 @@ async def mealplan_callbacks(callback: types.CallbackQuery, db):
         cur_rows = await repo.list_meal_plans_range(db, user["id"], start_date, end_date)
         excl = [str(r.get("recipe_id") or "") for r in cur_rows if r.get("recipe_id")]
         plan_data = await kitchen_ai.generate_meal_plan(db, user, days=days, exclude_ids=excl)
-        await callback.answer("Меню обновлено ✨")
     elif action == "days":
         plan_data = await kitchen_ai.generate_meal_plan(db, user, days=days)
-        await callback.answer(f"Собрала меню на {days} дн. 📅")
     else:
         plan_data = await kitchen_ai.get_meal_plan_view(db, user, days=days, auto_generate=True)
-        await callback.answer()
 
     text, kb = _render_meal_plan_payload(plan_data)
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")

@@ -215,7 +215,11 @@ async def cmd_sick(message: types.Message, state: FSMContext, db) -> None:
     await message.answer(text, reply_markup=kb)
 
 
-def _build_sick_prompt(user: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+def _build_sick_prompt(
+    user: Dict[str, Any], origin: str = "hub"
+) -> Tuple[str, InlineKeyboardMarkup]:
+    back_cb = "more:menu" if origin == "more" else "pulse:hub"
+    confirm_cb = f"pulse:sick:confirm:{origin}" if origin == "more" else "pulse:sick:confirm"
     now = datetime.datetime.utcnow()
     if karma_service.is_sick_freeze_active(user, now):
         text = (
@@ -223,7 +227,7 @@ def _build_sick_prompt(user: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]
             "Штрафы кармы и жёсткие дожимы временно отключены на 24 часа."
         )
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="pulse:hub")]]
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)]]
         )
         return text, kb
 
@@ -235,7 +239,7 @@ def _build_sick_prompt(user: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]
             "Используй честные переносы или 🔕 Тихий режим в настройках."
         )
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="pulse:hub")]]
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)]]
         )
         return text, kb
 
@@ -247,8 +251,8 @@ def _build_sick_prompt(user: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Включить на 24 часа", callback_data="pulse:sick:confirm")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="pulse:hub")],
+            [InlineKeyboardButton(text="✅ Включить на 24 часа", callback_data=confirm_cb)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
         ]
     )
     return text, kb
@@ -498,16 +502,22 @@ async def cb_pulse_rollover(callback: types.CallbackQuery, db) -> None:
     await callback.answer(toast)
 
 
-@router.callback_query(lambda c: c.data == "pulse:sick:prompt")
+@router.callback_query(lambda c: c.data and (c.data == "pulse:sick:prompt" or c.data.startswith("pulse:sick:prompt:")))
 async def cb_pulse_sick_prompt(callback: types.CallbackQuery, db) -> None:
+    parts = callback.data.split(":")
+    origin = parts[3] if len(parts) > 3 else "hub"
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    text, kb = _build_sick_prompt(user)
+    text, kb = _build_sick_prompt(user, origin=origin)
     await safe_edit(callback.message, text, reply_markup=kb)
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data == "pulse:sick:confirm")
+@router.callback_query(lambda c: c.data and (c.data == "pulse:sick:confirm" or c.data.startswith("pulse:sick:confirm:")))
 async def cb_pulse_sick_confirm(callback: types.CallbackQuery, db) -> None:
+    parts = callback.data.split(":")
+    origin = parts[3] if len(parts) > 3 else "hub"
+    back_cb = "more:menu" if origin == "more" else "pulse:hub"
+    back_label = "⬅️ Назад" if origin == "more" else "⬅️ В «Сон и карма»"
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     res = await karma_service.activate_sick_freeze(db, user)
     if not res.get("ok"):
@@ -521,7 +531,7 @@ async def cb_pulse_sick_confirm(callback: types.CallbackQuery, db) -> None:
             f"Штрафы кармы и эскалация приостановлены. Осталось использований в этом месяце: {res['remaining']}/{res['limit']}."
         )
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ В «Сон и карма»", callback_data="pulse:hub")]]
+        inline_keyboard=[[InlineKeyboardButton(text=back_label, callback_data=back_cb)]]
     )
     await safe_edit(callback.message, text, reply_markup=kb)
     await callback.answer("Обновлено.")

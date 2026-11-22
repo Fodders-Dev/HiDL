@@ -62,7 +62,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
                     callback_data=f"routine:{r.get('routine_id')}:{local_date}:done",
                 ),
                 types.InlineKeyboardButton(
-                    text=f"⏭ {title_short}",
+                    text="⏭ Пропустить",
                     callback_data=f"routine:{r.get('routine_id')}:{local_date}:skip",
                 ),
             ]

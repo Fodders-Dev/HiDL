@@ -78,9 +78,10 @@ def _all_tasks_keyboard(tasks):
         row = row_to_dict(t)
         zone = row.get("zone") or "misc"
         short = _zone_icon(zone)
+        title_short = str(row.get("title") or "Дело")[:18]
         rows.append(
             [
-                InlineKeyboardButton(text=f"{short} ✅", callback_data=f"hall:done:{row['id']}"),
+                InlineKeyboardButton(text=f"{short} ✅ {title_short}", callback_data=f"hall:done:{row['id']}"),
                 InlineKeyboardButton(text="⚙️ Частота", callback_data=f"hall:freq:{row['id']}"),
                 InlineKeyboardButton(text="🗑", callback_data=f"hall:hide:{row['id']}"),
             ]
@@ -101,9 +102,10 @@ def _paginate_tasks(tasks: list[dict], page: int, per_page: int = 6) -> tuple[li
     for t in slice_tasks:
         zone = t.get("zone") or "misc"
         short = _zone_icon(zone)
+        title_short = str(t.get("title") or "Дело")[:18]
         kb_rows.append(
             [
-                InlineKeyboardButton(text=f"{short} ✅", callback_data=f"hall:done:{t['id']}"),
+                InlineKeyboardButton(text=f"{short} ✅ {title_short}", callback_data=f"hall:done:{t['id']}"),
                 InlineKeyboardButton(text="⚙️ Частота", callback_data=f"hall:freq:{t['id']}"),
                 InlineKeyboardButton(text="🗑", callback_data=f"hall:hide:{t['id']}"),
             ]

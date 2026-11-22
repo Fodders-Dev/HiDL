@@ -232,7 +232,12 @@ async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
     elif action == "supplies":
         from handlers import home_supplies
 
-        await home_supplies.supplies_menu(callback.message, db)
+        await home_supplies.supplies_menu(
+            callback.message,
+            db,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+        )
     elif action == "smell":
         from handlers import home_tasks
 

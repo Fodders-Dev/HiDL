@@ -208,9 +208,14 @@ async def _render_schedule_text(db, user: dict, local_date: str) -> tuple[str, l
     all_day_lines: list[str] = []
     timed_event_lines: list[tuple[int, str]] = []
     for e in unified_events:
-        title_esc = html.escape(str(e.get("title") or "Событие"))
+        title_str = str(e.get("title") or "Событие")
+        title_esc = html.escape(title_str)
         loc = str(e.get("location") or "").strip()
-        loc_suffix = f" ({html.escape(loc)})" if loc else ""
+        loc_suffix = (
+            f" ({html.escape(loc)})"
+            if loc and loc.casefold() not in title_str.casefold()
+            else ""
+        )
         icon = "📅" if e.get("is_external") else "•"
         if e.get("is_all_day"):
             all_day_lines.append(f"{icon} Весь день — {title_esc}{loc_suffix}")

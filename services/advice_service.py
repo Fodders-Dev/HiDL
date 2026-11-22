@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import html
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -173,6 +174,21 @@ def format_advice_card_html(snapshot: Dict[str, Any], card: Dict[str, Any]) -> s
     return "\n".join(line for line in lines if line is not None).strip()
 
 
+def _llm_text_to_safe_html(text: str) -> str:
+    """Конвертировать ответ LLM (с возможным Markdown) в безопасный Telegram HTML."""
+    escaped = html.escape(str(text or "").strip())
+    lines: List[str] = []
+    for raw_line in escaped.splitlines():
+        line = re.sub(r"^#{1,3}\s+(.+)$", r"<b>\1</b>", raw_line)
+        line = re.sub(r"^\*\s+", "• ", line)
+        lines.append(line)
+    out = "\n".join(lines)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"__(.+?)__", r"<b>\1</b>", out)
+    out = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", out)
+    return out
+
+
 async def build_situational_advice_reply(
     db,
     user: Dict[str, Any],
@@ -198,6 +214,7 @@ async def build_situational_advice_reply(
         sys_prompt = (
             "Ты — карманная помощница HiDL. Дай короткий, практичный, приземлённый совет по ситуации "
             "(3–5 предложений + 1 конкретный микро-шаг прямо сейчас). "
+            "Пиши простым текстом без Markdown-разметки (без ** и ##). "
             "Опирайся ТОЛЬКО на факты из снимка дня (время, отбой, задачи, холодильник, карма) "
             "и строго держи тон, указанный в режиме кармы. Не выдумывай несуществующие события или рецепты."
         )
@@ -210,6 +227,6 @@ async def build_situational_advice_reply(
         if res.ok and res.text.strip():
             mode = snapshot["karma_mode"]
             header = f"💡 <b>Совет HiDL</b> ({mode['emoji']} {snapshot['karma_score']}/100)\n\n"
-            return header + html.escape(res.text.strip()), {"card": card, "snapshot": snapshot, "used_llm": True}
+            return header + _llm_text_to_safe_html(res.text), {"card": card, "snapshot": snapshot, "used_llm": True}
 
     return format_advice_card_html(snapshot, card), {"card": card, "snapshot": snapshot, "used_llm": False}
