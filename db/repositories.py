@@ -3454,6 +3454,8 @@ _PULSE_CHECKIN_FIELDS = {
     "next_ping_at_utc",
     "last_ping_at_utc",
     "resolved_at_utc",
+    "card_chat_id",
+    "card_message_id",
     "meta_json",
     "updated_at",
 }
@@ -3746,6 +3748,52 @@ async def update_pulse_checkin(
     )
     await conn.commit()
     return await get_pulse_checkin_by_id(conn, checkin_id)
+
+
+async def transition_pulse_checkin(
+    conn: aiosqlite.Connection,
+    checkin_id: int,
+    *,
+    allowed_statuses,
+    user_id: int | None = None,
+    expected_fields: Dict[str, Any] | None = None,
+    **fields: Any,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Atomically transition a Pulse row if its current state still matches."""
+    filtered = {key: value for key, value in fields.items() if key in _PULSE_CHECKIN_FIELDS}
+    expected = dict(expected_fields or {})
+    unknown_expected = set(expected) - _PULSE_CHECKIN_FIELDS
+    if unknown_expected:
+        raise ValueError(f"unsupported expected Pulse fields: {', '.join(sorted(unknown_expected))}")
+    statuses = tuple(str(status) for status in allowed_statuses)
+    if not statuses:
+        row = await get_pulse_checkin_by_id(conn, checkin_id)
+        if row and user_id is not None and int(row["user_id"]) != int(user_id):
+            return False, None
+        return False, row
+
+    filtered.setdefault("updated_at", utc_now_str())
+    assignments = ", ".join(f"{key} = ?" for key in filtered)
+    conditions = ["id = ?", f"status IN ({','.join('?' for _ in statuses)})"]
+    params: list[Any] = [*filtered.values(), int(checkin_id), *statuses]
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(int(user_id))
+    for key, value in expected.items():
+        conditions.append(f"{key} IS ?")
+        params.append(value)
+
+    updated_rows = await conn.execute_fetchall(
+        f"UPDATE pulse_checkins SET {assignments} WHERE {' AND '.join(conditions)} RETURNING *",
+        params,
+    )
+    await conn.commit()
+    if len(updated_rows) == 1:
+        return True, dict(updated_rows[0])
+    row = await get_pulse_checkin_by_id(conn, checkin_id)
+    if row and user_id is not None and int(row["user_id"]) != int(user_id):
+        return False, None
+    return False, row
 
 
 async def list_pulse_checkins_for_date(

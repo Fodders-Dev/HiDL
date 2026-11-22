@@ -597,6 +597,8 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             next_ping_at_utc TEXT NOT NULL,
             last_ping_at_utc TEXT,
             resolved_at_utc TEXT,
+            card_chat_id INTEGER,
+            card_message_id INTEGER,
             meta_json TEXT DEFAULT '{}',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -881,6 +883,13 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
                 await add_column_if_missing(table, col_name, definition)
     await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_day_plan_items_external ON day_plan_items(user_id, external_key) WHERE external_key != '';" )
     await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_events_external ON schedule_events(user_id, external_key) WHERE external_key != '';" )
+
+    pulse_info = await conn.execute_fetchall("PRAGMA table_info(pulse_checkins);")
+    if pulse_info:
+        pulse_cols = {row["name"] for row in pulse_info}
+        for col_name in ("card_chat_id", "card_message_id"):
+            if col_name not in pulse_cols:
+                await add_column_if_missing("pulse_checkins", col_name, "INTEGER")
 
     weights_info = await conn.execute_fetchall("PRAGMA table_info(weights);")
     if not weights_info:
@@ -1262,6 +1271,8 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             next_ping_at_utc TEXT NOT NULL,
             last_ping_at_utc TEXT,
             resolved_at_utc TEXT,
+            card_chat_id INTEGER,
+            card_message_id INTEGER,
             meta_json TEXT DEFAULT '{}',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,

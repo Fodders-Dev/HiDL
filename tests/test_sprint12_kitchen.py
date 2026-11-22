@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from aiogram.methods import (
     AnswerCallbackQuery,
@@ -459,7 +460,8 @@ class Sprint12KitchenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Гречка с тофу", llm_ctx)
 
         # /today dashboard mentions Меню дня
-        today_text, _ = await render_today(self.db, user)
+        with patch("utils.today.local_date_str", return_value=local_date):
+            today_text, _ = await render_today(self.db, user)
         self.assertIn("Меню дня:", today_text)
         self.assertIn("Гречка с тофу", today_text)
 

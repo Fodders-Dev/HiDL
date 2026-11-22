@@ -16,11 +16,111 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from services import context_builder, karma_service, pulse_service
 from utils.menu_match import match_menu_label
-from utils.sender import safe_edit
+from utils.sender import safe_delete_or_clear_markup, safe_edit
 from utils.time import local_date_str, parse_hhmm
 from utils.user import ensure_user
 
 router = Router()
+
+
+def _message_pair(chat_id, message_id) -> tuple[int, int] | None:
+    if chat_id is None or message_id is None:
+        return None
+    try:
+        return int(chat_id), int(message_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _callback_pair(callback: types.CallbackQuery) -> tuple[int, int] | None:
+    message = getattr(callback, "message", None)
+    chat = getattr(message, "chat", None)
+    return _message_pair(getattr(chat, "id", None), getattr(message, "message_id", None))
+
+
+async def _clear_callback_markup(callback: types.CallbackQuery) -> None:
+    message = getattr(callback, "message", None)
+    edit_markup = getattr(message, "edit_reply_markup", None)
+    if not callable(edit_markup):
+        return
+    try:
+        await edit_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+def _has_wake_checklist(message) -> bool:
+    markup = getattr(message, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None) or []
+    return any(
+        str(getattr(button, "callback_data", "") or "").startswith("pulse:hygiene:")
+        for row in rows
+        for button in row
+    )
+
+
+async def _handle_already_resolved(
+    callback: types.CallbackQuery,
+    result: dict[str, Any],
+    *,
+    preserve_hub: bool = False,
+) -> bool:
+    if not result.get("already_resolved"):
+        return False
+    checkin = result.get("checkin") or {}
+    current_pair = _callback_pair(callback)
+    stored_pair = _message_pair(checkin.get("card_chat_id"), checkin.get("card_message_id"))
+    preserve_wake = (
+        result.get("status") == "done"
+        and checkin.get("slot_key") == "wake"
+        and (current_pair == stored_pair or _has_wake_checklist(callback.message))
+    )
+    await callback.answer("Карточка уже закрыта ✅")
+    if not preserve_hub and not preserve_wake:
+        await _clear_callback_markup(callback)
+    return True
+
+
+async def _cleanup_previous_card(callback: types.CallbackQuery, result: dict[str, Any]) -> None:
+    previous = result.get("previous_card")
+    if not isinstance(previous, (tuple, list)) or len(previous) != 2:
+        return
+    previous_pair = _message_pair(previous[0], previous[1])
+    if previous_pair is None or previous_pair == _callback_pair(callback):
+        return
+    bot = getattr(getattr(callback, "message", None), "bot", None)
+    if bot is not None:
+        await safe_delete_or_clear_markup(bot, *previous_pair)
+
+
+async def _rebind_closed_card_reference(
+    db,
+    callback: types.CallbackQuery,
+    result: dict[str, Any],
+    *,
+    keep_current: bool,
+) -> None:
+    previous = result.get("previous_card")
+    if not isinstance(previous, (tuple, list)) or len(previous) != 2:
+        return
+    old_pair = _message_pair(previous[0], previous[1])
+    current_pair = _callback_pair(callback)
+    if old_pair is None or old_pair == current_pair:
+        return
+    checkin = result.get("checkin") or {}
+    checkin_id = checkin.get("id")
+    checkin_user_id = checkin.get("user_id")
+    if checkin_id is None or checkin_user_id is None:
+        return
+    await repo.transition_pulse_checkin(
+        db,
+        int(checkin_id),
+        allowed_statuses=(str(checkin.get("status") or ""),),
+        user_id=int(checkin_user_id),
+        expected_fields={"card_chat_id": old_pair[0], "card_message_id": old_pair[1]},
+        card_chat_id=current_pair[0] if keep_current and current_pair else None,
+        card_message_id=current_pair[1] if keep_current and current_pair else None,
+    )
 
 
 class PulseScheduleState(StatesGroup):
@@ -178,6 +278,9 @@ async def cb_pulse_done(callback: types.CallbackQuery, db) -> None:
     if not res.get("ok"):
         await callback.answer(res.get("error", "Не найден чек-ин"), show_alert=True)
         return
+    if await _handle_already_resolved(callback, res):
+        return
+    await _cleanup_previous_card(callback, res)
 
     karma = res["karma"]
     score = int(karma.get("score_after") or 70)
@@ -194,6 +297,7 @@ async def cb_pulse_done(callback: types.CallbackQuery, db) -> None:
             "Добей быстрый утренний минимум в 1 тап:"
         )
         await safe_edit(callback.message, text, reply_markup=kb)
+        await _rebind_closed_card_reference(db, callback, res, keep_current=True)
         await callback.answer("Подъём отмечен!")
         return
 
@@ -207,6 +311,7 @@ async def cb_pulse_done(callback: types.CallbackQuery, db) -> None:
         inline_keyboard=[[InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")]]
     )
     await safe_edit(callback.message, text, reply_markup=kb)
+    await _rebind_closed_card_reference(db, callback, res, keep_current=False)
     await callback.answer("Отмечено!")
 
 
@@ -215,6 +320,12 @@ async def cb_pulse_bedtime(callback: types.CallbackQuery, db) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     cid = int(callback.data.split(":")[2]) if callback.data.startswith("pulse:bedtime_ok:") else None
     res = await pulse_service.confirm_bedtime(db, user, checkin_id=cid)
+    if not res.get("ok"):
+        await callback.answer(res.get("error", "Не удалось закрыть чек-ин"), show_alert=True)
+        return
+    if await _handle_already_resolved(callback, res, preserve_hub=callback.data == "pulse:manual_bedtime"):
+        return
+    await _cleanup_previous_card(callback, res)
     karma = res["karma"]
     score = int(karma.get("score_after") or 70)
     delta = int(karma.get("delta") or 0)
@@ -222,12 +333,13 @@ async def cb_pulse_bedtime(callback: types.CallbackQuery, db) -> None:
     text = (
         "🌙 <b>Приняла: телефон убран, отбой подтверждён.</b>\n"
         f"Карма: <b>{delta_txt}</b> → <b>{score}/100</b>.\n\n"
-        "До самого утра пингами тревожить не буду. Но если увижу твоё сообщение ночью — поймаю 👀"
+        "До самого утра пингами тревожить не буду."
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")]]
     )
     await safe_edit(callback.message, text, reply_markup=kb)
+    await _rebind_closed_card_reference(db, callback, res, keep_current=False)
     await callback.answer("Спокойной ночи!")
 
 
@@ -249,6 +361,12 @@ async def cb_pulse_manual_wake(callback: types.CallbackQuery, db) -> None:
             now.isoformat(),
         )
     res = await pulse_service.complete_checkin(db, user, int(checkin["id"]), now_utc=now)
+    if not res.get("ok"):
+        await callback.answer(res.get("error", "Не удалось закрыть чек-ин"), show_alert=True)
+        return
+    if await _handle_already_resolved(callback, res, preserve_hub=True):
+        return
+    await _cleanup_previous_card(callback, res)
     karma = res["karma"]
     score = int(karma.get("score_after") or 70)
     delta = int(karma.get("delta") or 0)
@@ -261,6 +379,7 @@ async def cb_pulse_manual_wake(callback: types.CallbackQuery, db) -> None:
         "Отметь воду и зубы:"
     )
     await safe_edit(callback.message, text, reply_markup=kb)
+    await _rebind_closed_card_reference(db, callback, res, keep_current=True)
     await callback.answer("Подъём отмечен!")
 
 
@@ -270,10 +389,21 @@ async def cb_pulse_snooze(callback: types.CallbackQuery, db) -> None:
     cid = int(parts[2])
     mins = int(parts[3]) if len(parts) > 3 else 15
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    res = await pulse_service.snooze_checkin(db, user, cid, mins)
+    current_pair = _callback_pair(callback)
+    res = await pulse_service.snooze_checkin(
+        db,
+        user,
+        cid,
+        mins,
+        card_chat_id=current_pair[0] if current_pair else None,
+        card_message_id=current_pair[1] if current_pair else None,
+    )
     if not res.get("ok"):
         await callback.answer(res.get("error", "Не найден чек-ин"), show_alert=True)
         return
+    if await _handle_already_resolved(callback, res):
+        return
+    await _cleanup_previous_card(callback, res)
     karma = res["karma"]
     delta = int(karma.get("delta") or 0)
     penalty_note = (
@@ -297,12 +427,16 @@ async def cb_pulse_skip(callback: types.CallbackQuery, db) -> None:
     if not res.get("ok"):
         await callback.answer(res.get("error", "Не найден чек-ин"), show_alert=True)
         return
+    if await _handle_already_resolved(callback, res):
+        return
+    await _cleanup_previous_card(callback, res)
     karma = res["karma"]
     text = (
         f"⏭ <b>Пропуск засчитан честно.</b>\n"
         f"Карма: <b>{karma['delta']}</b> → <b>{karma['score_after']}/100</b> (меньше штрафа, чем за полный игнор)."
     )
     await safe_edit(callback.message, text, reply_markup=None)
+    await _rebind_closed_card_reference(db, callback, res, keep_current=False)
     await callback.answer("Пропущено.")
 
 
@@ -602,7 +736,10 @@ async def cb_pulse_history(callback: types.CallbackQuery, db) -> None:
 @router.callback_query(lambda c: c.data == "pulse:test_ping")
 async def cb_pulse_test_ping(callback: types.CallbackQuery, db) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-    await pulse_service.send_test_pulse_ping(db, callback.message.bot, user)
+    result = await pulse_service.send_test_pulse_ping(db, callback.message.bot, user)
+    if isinstance(result, dict) and result.get("sent") is False:
+        await callback.answer("Не удалось отправить пробный пинг.", show_alert=True)
+        return
     await callback.answer("Пробный пинг отправлен!")
 
 

@@ -97,6 +97,49 @@ def _load_meta(checkin: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
+def _card_ref(checkin: Optional[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+    row = checkin or {}
+    return row.get("card_chat_id"), row.get("card_message_id")
+
+
+def _transition_snapshot(checkin: Dict[str, Any]) -> Dict[str, Any]:
+    """Fields that make a scheduled-send CAS fail after any newer state/card update."""
+    names = ("status", "ping_count", "snooze_count", "next_ping_at_utc", "card_chat_id", "card_message_id")
+    return {name: checkin.get(name) for name in names if name in checkin}
+
+
+async def _already_resolved_result(
+    db, user: Dict[str, Any], checkin: Dict[str, Any], *, is_wake: bool = False
+) -> Dict[str, Any]:
+    state = await repo.get_or_create_karma_state(db, int(user["id"]))
+    raw_score = state.get("score")
+    score = int(70 if raw_score is None else raw_score)
+    status = str(checkin.get("status") or "")
+    return {
+        "ok": True,
+        "already_resolved": True,
+        "already_done": status == "done",
+        "status": status,
+        "checkin": checkin,
+        "previous_card": _card_ref(checkin),
+        "is_wake": is_wake or str(checkin.get("slot_key") or "") == "wake",
+        "karma": {
+            "score_after": score,
+            "delta": 0,
+            "mode": karma_service.get_karma_mode(score, user),
+        },
+    }
+
+
+async def _clear_saved_card(bot, card_ref: Tuple[Optional[int], Optional[int]]) -> None:
+    chat_id, message_id = card_ref
+    if chat_id is None or message_id is None:
+        return
+    from utils.sender import safe_delete_or_clear_markup
+
+    await safe_delete_or_clear_markup(bot, chat_id, message_id)
+
+
 def get_effective_schedule(
     user: Dict[str, Any], local_date: str
 ) -> Tuple[str, str, bool]:
@@ -544,21 +587,22 @@ async def complete_checkin(
     if slot_key == "bedtime":
         return await confirm_bedtime(db, user, checkin_id=checkin_id, now_utc=now)
 
-    if checkin.get("status") == "done":
-        state = await repo.get_or_create_karma_state(db, int(user["id"]))
-        return {"ok": True, "already_done": True, "checkin": checkin, "karma": {"score_after": state["score"], "delta": 0}}
-
     domain = str(checkin.get("domain") or "tasks")
     meta = _load_meta(checkin)
     delta = SLOT_DEFAULT_REWARDS.get(slot_key, 3)
     title = meta.get("title") or SLOT_TITLES.get(slot_key, slot_key)
 
-    updated = await repo.update_pulse_checkin(
+    changed, updated = await repo.transition_pulse_checkin(
         db,
         checkin_id,
+        user_id=int(user["id"]),
+        allowed_statuses=("pending", "snoozed"),
         status="done",
         resolved_at_utc=now.isoformat(),
     )
+    if not changed:
+        return await _already_resolved_result(db, user, updated or checkin, is_wake=slot_key == "wake")
+    winning = updated or checkin
     if slot_key == "wake":
         await repo.clear_user_sleep_confirmed(db, int(user["id"]))
         tz = user.get("timezone") or "UTC"
@@ -576,9 +620,10 @@ async def complete_checkin(
     return {
         "ok": True,
         "already_done": False,
-        "checkin": updated or checkin,
+        "checkin": winning,
         "karma": karma_res,
         "is_wake": slot_key == "wake",
+        "previous_card": _card_ref(winning),
     }
 
 
@@ -599,6 +644,8 @@ async def confirm_bedtime(
         if checkin_id is not None
         else await repo.get_pulse_checkin(db, user_id, local_date, "bedtime")
     )
+    if checkin_id is not None and checkin is None:
+        return {"ok": False, "error": "Чек-ин не найден."}
     if checkin is None:
         checkin = await repo.upsert_pulse_checkin(
             db,
@@ -612,39 +659,39 @@ async def confirm_bedtime(
             meta_json=json.dumps({"manual": True}, ensure_ascii=False),
         )
 
-    already_done = checkin.get("status") == "done" and user.get("sleep_confirmed_date") == local_date
-    updated = await repo.update_pulse_checkin(
+    if int(checkin.get("user_id") or 0) != user_id:
+        return {"ok": False, "error": "Чек-ин не найден."}
+
+    changed, updated = await repo.transition_pulse_checkin(
         db,
         int(checkin["id"]),
+        user_id=user_id,
+        allowed_statuses=("pending", "snoozed"),
         status="done",
         resolved_at_utc=now.isoformat(),
     )
+    if not changed:
+        return await _already_resolved_result(db, user, updated or checkin, is_wake=False)
+    winning = updated or checkin
     await repo.update_user_sleep_confirmed(db, user_id, local_date, now.isoformat())
     await repo.update_sleep_ping(db, user_id, "evening", local_date)
 
-    if already_done:
-        state = await repo.get_or_create_karma_state(db, user_id)
-        karma_res = {
-            "score_after": int(state.get("score") or 70),
-            "delta": 0,
-            "mode": karma_service.get_karma_mode(int(state.get("score") or 70), user),
-        }
-    else:
-        karma_res = await karma_service.record_karma_event(
-            db,
-            user,
-            domain="sleep",
-            event_type="bedtime_confirmed",
-            delta=5,
-            reason="Вовремя убрал телефон и лёг спать",
-            now_utc=now,
-        )
+    karma_res = await karma_service.record_karma_event(
+        db,
+        user,
+        domain="sleep",
+        event_type="bedtime_confirmed",
+        delta=5,
+        reason="Вовремя убрал телефон и лёг спать",
+        now_utc=now,
+    )
 
     return {
         "ok": True,
-        "already_done": already_done,
-        "checkin": updated or checkin,
+        "already_done": False,
+        "checkin": winning,
         "karma": karma_res,
+        "previous_card": _card_ref(winning),
     }
 
 
@@ -711,12 +758,22 @@ async def snooze_checkin(
     checkin_id: int,
     minutes: int,
     now_utc: Optional[datetime.datetime] = None,
+    *,
+    card_chat_id: Optional[int] = None,
+    card_message_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Честный перенос чек-ина на N минут (1-й бесплатно, 2-й+ со штрафом -3)."""
     now = _naive_utc(now_utc)
     checkin = await repo.get_pulse_checkin_by_id(db, checkin_id)
     if not checkin or int(checkin["user_id"]) != int(user["id"]):
         return {"ok": False, "error": "Чек-ин не найден."}
+
+    card_ref = _card_ref(checkin)
+    callback_has_card = card_chat_id is not None and card_message_id is not None
+    if callback_has_card and checkin.get("status") == "snoozed":
+        return await _already_resolved_result(db, user, checkin)
+    if callback_has_card and card_ref[1] is not None and card_ref != (card_chat_id, card_message_id):
+        return await _already_resolved_result(db, user, checkin)
 
     mins = max(1, min(180, int(minutes)))
     new_snooze_count = int(checkin.get("snooze_count") or 0) + 1
@@ -727,14 +784,25 @@ async def snooze_checkin(
     meta = _load_meta(checkin)
     title = meta.get("title") or SLOT_TITLES.get(str(checkin.get("slot_key") or ""), "Чек-ин")
 
-    updated = await repo.update_pulse_checkin(
+    expected = _transition_snapshot(checkin)
+    fields = {}
+    if callback_has_card:
+        fields.update(card_chat_id=card_chat_id, card_message_id=card_message_id)
+    changed, updated = await repo.transition_pulse_checkin(
         db,
         checkin_id,
+        user_id=int(user["id"]),
+        allowed_statuses=("pending", "snoozed"),
+        expected_fields=expected,
         status="snoozed",
         snooze_count=new_snooze_count,
         next_ping_at_utc=next_ping.isoformat(),
         resolved_at_utc=None,
+        **fields,
     )
+    if not changed:
+        return await _already_resolved_result(db, user, updated or checkin)
+    winning = updated or checkin
 
     if new_snooze_count >= 2:
         karma_res = await karma_service.record_karma_event(
@@ -756,12 +824,14 @@ async def snooze_checkin(
 
     return {
         "ok": True,
-        "checkin": updated or checkin,
+        "checkin": winning,
         "minutes": mins,
         "next_local_hhmm": next_local_hhmm,
         "next_ping_at_utc": next_ping.isoformat(),
         "snooze_count": new_snooze_count,
         "karma": karma_res,
+        "previous_card": _card_ref(winning),
+        "is_wake": str(winning.get("slot_key") or "") == "wake",
     }
 
 
@@ -781,12 +851,17 @@ async def skip_checkin(
     meta = _load_meta(checkin)
     title = meta.get("title") or SLOT_TITLES.get(str(checkin.get("slot_key") or ""), "Чек-ин")
 
-    updated = await repo.update_pulse_checkin(
+    changed, updated = await repo.transition_pulse_checkin(
         db,
         checkin_id,
+        user_id=int(user["id"]),
+        allowed_statuses=("pending", "snoozed"),
         status="skipped",
         resolved_at_utc=now.isoformat(),
     )
+    if not changed:
+        return await _already_resolved_result(db, user, updated or checkin)
+    winning = updated or checkin
     karma_res = await karma_service.record_karma_event(
         db,
         user,
@@ -796,7 +871,13 @@ async def skip_checkin(
         reason=f"Пропущен чек-ин «{title}»",
         now_utc=now,
     )
-    return {"ok": True, "checkin": updated or checkin, "karma": karma_res}
+    return {
+        "ok": True,
+        "checkin": winning,
+        "karma": karma_res,
+        "previous_card": _card_ref(winning),
+        "is_wake": str(winning.get("slot_key") or "") == "wake",
+    }
 
 
 async def schedule_adhoc_snooze(
@@ -839,8 +920,9 @@ async def schedule_adhoc_snooze(
         return {
             "ok": res["ok"],
             "checkin_id": int(existing["id"]),
-            "next_local_hhmm": res["next_local_hhmm"],
+            "next_local_hhmm": res.get("next_local_hhmm") or format_time_local(next_ping, tz),
             "minutes": mins,
+            "already_resolved": res.get("already_resolved", False),
         }
 
     created = await repo.upsert_pulse_checkin(
@@ -967,17 +1049,7 @@ async def send_test_pulse_ping(
     existing = await repo.get_pulse_checkin(db, user_id, local_date, "adhoc_test")
     meta = json.dumps({"title": "Пробный чек-ин Пульса"}, ensure_ascii=False)
     if existing:
-        checkin = await repo.update_pulse_checkin(
-            db,
-            int(existing["id"]),
-            status="pending",
-            ping_count=0,
-            snooze_count=0,
-            scheduled_at_utc=now.isoformat(),
-            next_ping_at_utc=now.isoformat(),
-            resolved_at_utc=None,
-            meta_json=meta,
-        ) or existing
+        checkin = existing
     else:
         checkin = await repo.upsert_pulse_checkin(
             db,
@@ -986,22 +1058,42 @@ async def send_test_pulse_ping(
             "adhoc_test",
             "tasks",
             now.isoformat(),
-            now.isoformat(),
-            status="pending",
+            (now + datetime.timedelta(minutes=20)).isoformat(),
+            # Do not let a failed first test send become a scheduled test reminder.
+            status="skipped",
             meta_json=meta,
         )
 
     state = await repo.get_or_create_karma_state(db, user_id)
     text, kb = build_pulse_message(checkin, state, level=1, is_snooze_reminder=False, user=user)
-    await bot.send_message(chat_id=int(user["telegram_id"]), text=text, reply_markup=kb)
-    await repo.update_pulse_checkin(
+    old_card = _card_ref(checkin)
+    sent_msg = await _safe_bot_send(bot, user, local_date, text, reply_markup=kb)
+    if sent_msg is None:
+        return {**dict(checkin), "sent": False}
+    sent_chat_id = getattr(getattr(sent_msg, "chat", None), "id", None)
+    sent_message_id = getattr(sent_msg, "message_id", None)
+    changed, updated = await repo.transition_pulse_checkin(
         db,
         int(checkin["id"]),
+        user_id=user_id,
+        # adhoc_test is a separate test slot; it must never reopen a real pulse slot.
+        allowed_statuses=("pending", "snoozed", "done", "skipped", "ignored"),
+        expected_fields=_transition_snapshot(checkin),
+        status="pending",
         ping_count=1,
+        snooze_count=0,
         last_ping_at_utc=now.isoformat(),
         next_ping_at_utc=(now + datetime.timedelta(minutes=20)).isoformat(),
+        resolved_at_utc=None,
+        card_chat_id=sent_chat_id,
+        card_message_id=sent_message_id,
     )
-    return checkin
+    if not changed:
+        await _clear_saved_card(bot, (sent_chat_id, sent_message_id))
+        return {**dict(updated or checkin), "sent": False}
+    if old_card[0] is not None and old_card[1] is not None and old_card != (sent_chat_id, sent_message_id):
+        await _clear_saved_card(bot, old_card)
+    return {**dict(updated or checkin), "sent": True}
 
 
 async def _safe_bot_send(
@@ -1010,15 +1102,14 @@ async def _safe_bot_send(
     local_date: str,
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-) -> bool:
+) -> Optional[Any]:
     telegram_id = user.get("telegram_id")
     if not telegram_id:
-        return False
+        return None
     try:
-        await bot.send_message(chat_id=telegram_id, text=text, reply_markup=reply_markup)
-        return True
+        return await bot.send_message(chat_id=telegram_id, text=text, reply_markup=reply_markup)
     except Exception:
-        return False
+        return None
 
 
 async def process_pulse_tick(
@@ -1096,7 +1187,13 @@ async def process_pulse_tick(
 
         slot_key = str(checkin.get("slot_key") or "")
         if is_student_mode(user) and slot_key in {"lunch", "dinner"}:
-            await repo.update_pulse_checkin(db, int(checkin["id"]), status="skipped", resolved_at_utc=now.isoformat())
+            changed, transitioned = await repo.transition_pulse_checkin(
+                db, int(checkin["id"]), user_id=uid, allowed_statuses=("pending", "snoozed"),
+                expected_fields=_transition_snapshot(checkin), status="skipped",
+                resolved_at_utc=now.isoformat(), card_chat_id=None, card_message_id=None,
+            )
+            if changed:
+                await _clear_saved_card(bot, _card_ref(checkin))
             continue
         if _confirmed_sleep_active(user, now) and slot_key != "wake":
             continue
@@ -1107,33 +1204,50 @@ async def process_pulse_tick(
                 end_utc = busy_ev["end_utc"]
                 defer_utc = end_utc + datetime.timedelta(minutes=5)
                 if defer_utc > now:
-                    await repo.update_pulse_checkin(
-                        db, int(checkin["id"]), next_ping_at_utc=defer_utc.isoformat()
+                    await repo.transition_pulse_checkin(
+                        db, int(checkin["id"]), user_id=uid, allowed_statuses=("pending", "snoozed"),
+                        expected_fields=_transition_snapshot(checkin), next_ping_at_utc=defer_utc.isoformat()
                     )
                     continue
 
         status = str(checkin.get("status") or "pending")
         ping_count = int(checkin.get("ping_count") or 0)
         if is_student_mode(user) and status == "pending" and ping_count >= 1:
-            await repo.update_pulse_checkin(db, int(checkin["id"]), status="skipped", resolved_at_utc=now.isoformat())
+            changed, transitioned = await repo.transition_pulse_checkin(
+                db, int(checkin["id"]), user_id=uid, allowed_statuses=("pending",),
+                expected_fields=_transition_snapshot(checkin), status="skipped",
+                resolved_at_utc=now.isoformat(), card_chat_id=None, card_message_id=None,
+            )
+            if changed:
+                await _clear_saved_card(bot, _card_ref(checkin))
             continue
         sick_active = karma_service.is_sick_freeze_active(user, now)
         cid = int(checkin["id"])
 
         # В заморозке «Болею» эскалация мягкая: не дожимаем 2-м и 3-м уровнями и не штрафуем за игнор.
         if status == "pending" and ping_count >= 1 and sick_active:
-            await repo.update_pulse_checkin(
-                db, cid, status="skipped", resolved_at_utc=now.isoformat()
+            changed, transitioned = await repo.transition_pulse_checkin(
+                db, cid, user_id=uid, allowed_statuses=("pending",),
+                expected_fields=_transition_snapshot(checkin), status="skipped",
+                resolved_at_utc=now.isoformat(), card_chat_id=None, card_message_id=None,
             )
+            if changed:
+                await _clear_saved_card(bot, _card_ref(checkin))
             continue
 
         if status == "pending" and ping_count >= 3:
             domain = str(checkin.get("domain") or "tasks")
             meta = _load_meta(checkin)
             title = meta.get("title") or SLOT_TITLES.get(slot_key, slot_key)
-            await repo.update_pulse_checkin(
-                db, cid, status="ignored", resolved_at_utc=now.isoformat()
+            old_card = _card_ref(checkin)
+            changed, transitioned = await repo.transition_pulse_checkin(
+                db, cid, user_id=uid, allowed_statuses=("pending",),
+                expected_fields=_transition_snapshot(checkin), status="ignored",
+                resolved_at_utc=now.isoformat(), card_chat_id=None, card_message_id=None,
             )
+            if not changed:
+                continue
+            await _clear_saved_card(bot, old_card)
             karma_res = await karma_service.record_karma_event(
                 db,
                 user,
@@ -1164,21 +1278,34 @@ async def process_pulse_tick(
             context=slot_ctx,
             user=user,
         )
-        sent = await _safe_bot_send(bot, user, local_date, text, reply_markup=kb)
-        if not sent:
+        old_card = _card_ref(checkin)
+        sent_msg = await _safe_bot_send(bot, user, local_date, text, reply_markup=kb)
+        if sent_msg is None:
             continue
 
         new_ping_count = max(1, ping_count + 1)
         step_min = 15 if (slot_key in {"wake", "bedtime"} and new_ping_count == 1) else 20
         next_due = now + datetime.timedelta(minutes=step_min)
-        await repo.update_pulse_checkin(
+        sent_chat_id = getattr(getattr(sent_msg, "chat", None), "id", None)
+        sent_message_id = getattr(sent_msg, "message_id", None)
+        changed, transitioned = await repo.transition_pulse_checkin(
             db,
             cid,
+            user_id=uid,
+            allowed_statuses=("pending", "snoozed"),
+            expected_fields=_transition_snapshot(checkin),
             status="pending",
             ping_count=new_ping_count,
             last_ping_at_utc=now.isoformat(),
             next_ping_at_utc=next_due.isoformat(),
+            card_chat_id=sent_chat_id,
+            card_message_id=sent_message_id,
         )
+        if not changed:
+            await _clear_saved_card(bot, (sent_chat_id, sent_message_id))
+            continue
+        if old_card[1] is not None and old_card[1] != sent_message_id:
+            await _clear_saved_card(bot, old_card)
         sent_or_resolved += 1
 
     return sent_or_resolved
