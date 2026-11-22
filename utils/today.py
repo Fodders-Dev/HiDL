@@ -13,6 +13,7 @@ from utils.rows import row_to_dict
 from utils.texts import gentle_streak
 from utils.rows import rows_to_dicts
 from utils.affirmations import random_affirmation_text
+from utils.profile import is_student_mode
 
 
 def _ru_plural(n: int, one: str, few: str, many: str) -> str:
@@ -27,13 +28,17 @@ def _ru_plural(n: int, one: str, few: str, many: str) -> str:
 async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     """Build /today text and inline keyboard as dashboard."""
     user = dict(user)
+    student = is_student_mode(user)
     now_utc = datetime.datetime.utcnow()
     local_date = local_date_str(now_utc, user["timezone"])
     adhd = user.get("adhd_mode") == 1
 
-    await repo.ensure_user_tasks_for_date(db, user["id"], local_date)
-    tasks = await repo.get_tasks_for_day(db, user["id"], local_date)
-    routines = await repo.list_user_routines(db, user["id"])
+    if not student:
+        await repo.ensure_user_tasks_for_date(db, user["id"], local_date)
+        tasks = await repo.get_tasks_for_day(db, user["id"], local_date)
+        routines = await repo.list_user_routines(db, user["id"])
+    else:
+        tasks, routines = [], []
 
     status_emoji = {"pending": "⏳", "done": "✅", "skip": "⏭", "later": "🔔"}
     routine_status = {row_to_dict(t).get("routine_id"): row_to_dict(t).get("status") for t in tasks}
@@ -92,9 +97,12 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         custom_lines = custom_lines[:3]
         custom_kb = custom_kb[:3]
 
-    await repo.ensure_regular_tasks(db, user["id"], local_date)
-    reg_due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=local_date, due_in_days=1)
-    reg_done_today = await repo.list_regular_tasks_done_on_date(db, user["id"], local_date)
+    if not student:
+        await repo.ensure_regular_tasks(db, user["id"], local_date)
+        reg_due = await repo.list_regular_tasks(db, user["id"], due_only=True, local_date=local_date, due_in_days=1)
+        reg_done_today = await repo.list_regular_tasks_done_on_date(db, user["id"], local_date)
+    else:
+        reg_due, reg_done_today = [], []
     regular_lines = []
     today_date = datetime.date.fromisoformat(local_date)
     for r_raw in reg_due[:3]:
@@ -132,7 +140,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         quiet_note = "🔕 Тихий режим: шлёт только твои напоминания. Отключить в ⚙ Настройки.\n\n"
 
     bills_lines = []
-    bills = await repo.bills_due_soon(db, user["id"], local_date, days_ahead=3)
+    bills = [] if student else await repo.bills_due_soon(db, user["id"], local_date, days_ahead=3)
     if bills:
         bills_lines = []
         for b in bills[:3]:
@@ -149,20 +157,24 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     plan_done = [p for p in plan_items if p.get("done")]
 
     # продукты с подходящими сроками годности
-    wellness = await repo.get_wellness(db, user["id"])
-    window_days = int((wellness or {}).get("expiring_window_days", 3))
-    soon_pantry, expired_pantry = await repo.pantry_expiring(db, user["id"], local_date, window_days=window_days)
+    if student:
+        wellness = None
+        soon_pantry, expired_pantry = [], []
+    else:
+        wellness = await repo.get_wellness(db, user["id"])
+        window_days = int((wellness or {}).get("expiring_window_days", 3))
+        soon_pantry, expired_pantry = await repo.pantry_expiring(db, user["id"], local_date, window_days=window_days)
     soon_pantry_d = [row_to_dict(r) for r in soon_pantry]
     expired_pantry_d = [row_to_dict(r) for r in expired_pantry]
 
     # meds stats
-    meds_total, meds_taken = await repo.meds_stats_for_date(db, user["id"], local_date)
+    meds_total, meds_taken = (0, 0) if student else await repo.meds_stats_for_date(db, user["id"], local_date)
 
     # summary block
     points_week = await repo.points_week(db, user["id"], local_date)
     points_today = await repo.points_today(db, user["id"], local_date)
     streak = await repo.points_streak(db, user["id"], today=local_date)
-    stats_r = await repo.routine_stats(db, user["id"], days=1)
+    stats_r = [] if student else await repo.routine_stats(db, user["id"], days=1)
     stats_c = await repo.custom_stats(db, user["id"], days=1)
     done_today = sum(r["cnt"] for r in stats_r if r["status"] == "done") + sum(r["cnt"] for r in stats_c if r["status"] == "done")
     total_today = sum(r["cnt"] for r in stats_r) + sum(r["cnt"] for r in stats_c)
@@ -171,9 +183,9 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     routine_total_cnt = sum(r["cnt"] for r in stats_r)
     karma_state = await repo.get_or_create_karma_state(db, user["id"])
     karma_score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
-    karma_mode = karma_service.get_karma_mode(karma_score)
+    karma_mode = karma_service.get_karma_mode(karma_score, user)
     checkins_today = await repo.list_pulse_checkins_for_date(db, user["id"], local_date)
-    std_slots = {"wake", "lunch", "afternoon", "dinner", "winddown", "bedtime"}
+    std_slots = {"wake", "afternoon", "winddown", "bedtime"} if student else {"wake", "lunch", "afternoon", "dinner", "winddown", "bedtime"}
     std_checkins = [c for c in checkins_today if c.get("slot_key") in std_slots]
     pulse_done = sum(1 for c in std_checkins if c.get("status") == "done")
     pulse_total = max(6, len(std_checkins))
@@ -211,12 +223,12 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             )
     else:
         home_summary = "🧹 Дом: на эту неделю всё чисто, можешь выдохнуть."
-    if finance_line:
+    if finance_line and not student:
         summary_lines.append(finance_line)
-    if home_summary:
+    if home_summary and not student:
         summary_lines.append(home_summary)
     meal_plan_today = await repo.get_meal_plan_for_date(db, user["id"], local_date)
-    if meal_plan_today:
+    if meal_plan_today and not student:
         m_icons = {"breakfast": "🥣", "lunch": "🍲", "dinner": "🍽"}
         meal_parts = [
             ("✅" if m.get("status") == "cooked" else m_icons.get(str(m.get("meal_slot")), "🍽"))
@@ -231,7 +243,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             f"🎯 План на день: выполнено {len(plan_done)}/{len(plan_items)} дел "
             f"(важных {len(important_plan)}, доп. {len(extra_plan)})."
         )
-    if soon_pantry_d or expired_pantry_d:
+    if (soon_pantry_d or expired_pantry_d) and not student:
         names = [p.get("name") for p in soon_pantry_d[:2] + expired_pantry_d[:2] if p.get("name")]
         listed = ", ".join(names)
         total_pantry = len(soon_pantry_d) + len(expired_pantry_d)
@@ -242,7 +254,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             f"🧊 Продукты: у {len(soon_pantry_d)} вещей скоро срок, "
             f"у {len(expired_pantry_d)} уже истёк — {listed}{extra_note}."
         )
-    if meds_total:
+    if meds_total and not student:
         # показываем только краткий итог и 1–2 ближайших приёма;
         # детальный список можно открыть по кнопке «Таблетки».
         meds_line = (
@@ -283,35 +295,63 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             if thought:
                 affirm_line = f"💬 Мысль дня: «{thought}»"
                 summary_lines.append(affirm_line)
-    blocks = [f"{pause_note}{quiet_note}<b>План на {format_date_display(local_date)}</b>\n" + "\n".join(summary_lines)]
+    today_heading = "План дня" if student else f"План на {format_date_display(local_date)}"
+    blocks = [f"{pause_note}{quiet_note}<b>{today_heading}</b>\n" + "\n".join(summary_lines)]
     if routine_lines:
         blocks.append("<b>🌞 Рутины:</b>\n" + "\n".join(routine_lines))
-    if custom_lines:
+    if custom_lines and not student:
         blocks.append("<b>🔔 Свои напоминания:</b>\n" + "\n".join(custom_lines))
-    if regular_lines:
+    if regular_lines and not student:
         blocks.append("<b>🔁 Регулярка по дому:</b>\n" + "\n".join(regular_lines))
-    if bills_lines:
+    if bills_lines and not student:
         blocks.append("<b>📅 Счета в ближайшие дни:</b>\n" + "\n".join(bills_lines))
     if cal_events_today:
         cal_lines = []
         for ev in cal_events_today[:5]:
             when = "Весь день" if ev.get("is_all_day") else f"{ev.get('start_time')}–{ev.get('end_time')}"
             cal_lines.append(f"• {when} · {html.escape(str(ev.get('title') or ''))}")
-        blocks.append("<b>🗓 Календарь на сегодня:</b>\n" + "\n".join(cal_lines))
+        event_heading = "📚 Занятия и ДЗ:" if student else "🗓 Календарь на сегодня:"
+        blocks.append(f"<b>{event_heading}</b>\n" + "\n".join(cal_lines))
+    elif student:
+        blocks.append("<b>📚 Занятия и ДЗ:</b>\nНа сегодня занятий нет.")
+
+    desk_homework = [
+        item for item in plan_items
+        if str(item.get("external_key") or "").startswith("desk:hw:")
+    ] if student else []
+    if student and desk_homework:
+        homework_lines = []
+        for item in desk_homework[:5]:
+            icon = "✅" if item.get("done") else "⬜️"
+            title = html.escape(str(item.get("title") or ""))
+            url = str(item.get("external_url") or "")
+            link = f' · <a href="{html.escape(url, quote=True)}">🔗 Desk</a>' if url.startswith(("https://", "http://")) else ""
+            homework_lines.append(f"{icon} {title}{link}")
+        blocks.append("<b>📝 Домашние задания Desk:</b>\n" + "\n".join(homework_lines))
     if plan_items:
         # Если слишком много пунктов, прячем детали (особенно в ADHD-режиме)
+        visible_plan_items = [
+            item for item in plan_items
+            if not (student and str(item.get("external_key") or "").startswith("desk:hw:"))
+        ]
         show_details = True
-        if len(plan_items) > 5:
+        if (len(visible_plan_items) if student else len(plan_items)) > 5:
             show_details = False
         
         if show_details:
             plan_lines = ["<b>🎯 План на день — детали:</b>"]
-            for item in plan_items:
+            for item in visible_plan_items:
                 icon = "✅" if item.get("done") else "⬜️"
                 kind = " (важное)" if item.get("is_important") else ""
-                plan_lines.append(f"{icon} {item.get('title')}{kind}")
+                badge = " 🎓 <b>Desk</b>" if item.get("external_key", "").startswith("desk:") else ""
+                title = html.escape(str(item.get("title") or ""))
+                plan_lines.append(f"{icon} {title}{kind}{badge}")
             blocks.append("\n".join(plan_lines))
         # Если скрыли, верхняя строка саммари (строки 174-178) уже покажет статус
+
+    if student:
+        if custom_lines:
+            blocks.append("<b>🔔 Свои напоминания:</b>\n" + "\n".join(custom_lines))
 
     # Footer: очки, стрик и щадящий фокус
     footer_line = f"🎯 Очки: {points_today} сегодня / {points_week} за неделю"
@@ -325,30 +365,37 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     kb_buttons = []
     if first_pending_routine_row:
         kb_buttons.append(first_pending_routine_row)
-    kb_buttons.append(
+    if not student:
+        kb_buttons.append(
         [
             types.InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub"),
             types.InlineKeyboardButton(text="💡 Совет сейчас", callback_data="advice:more"),
         ]
-    )
+        )
     has_any_reminders = bool(custom)
     kb_buttons.append([types.InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")])
     if has_any_reminders:
         kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
     else:
         kb_buttons.append([types.InlineKeyboardButton(text="➕ Добавить напоминание", callback_data="rem:add")])
-    kb_buttons.append([types.InlineKeyboardButton(text="🧹 План по дому", callback_data="home:week")])
+    if student:
+        kb_buttons.append([types.InlineKeyboardButton(text="📚 Учёба / Desk", callback_data="desk:main")])
+        kb_buttons.append([types.InlineKeyboardButton(text="☕ Кафе фокуса", callback_data="more:focus")])
+        kb_buttons.append([types.InlineKeyboardButton(text="😴 Сон и пауза", callback_data="pause:menu")])
+    else:
+        kb_buttons.append([types.InlineKeyboardButton(text="🧹 План по дому", callback_data="home:week")])
     kb_buttons.append([types.InlineKeyboardButton(text="📅 План на день", callback_data="dplan:list")])
-    kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
+    if not student:
+        kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
     kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
     
     # Кнопка для просмотра скрытого плана - УДАЛЕНА, так как теперь есть кнопка "План на день" выше.
 
-    if meds_total:
+    if meds_total and not student:
         kb_buttons.append(
             [types.InlineKeyboardButton(text="Таблетки", callback_data="meds:today")]
         )
-    if soon_pantry_d or expired_pantry_d:
+    if (soon_pantry_d or expired_pantry_d) and not student:
         kb_buttons.append(
             [types.InlineKeyboardButton(text="Продукты", callback_data="pantry:expiring")]
         )

@@ -122,11 +122,11 @@ async def cafe_start(
 
 
 @router.message(FocusCafeState.task, lambda m: bool(m.text and not m.text.startswith("/")))
-async def cafe_task(message: types.Message, state: FSMContext) -> None:
+async def cafe_task(message: types.Message, state: FSMContext, user: dict | None = None) -> None:
     task = (message.text or "").strip()
     if task.lower() in {"отмена", "назад"}:
         await state.clear()
-        await message.answer("Отменила фокус-сессию.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила фокус-сессию.", reply_markup=main_menu_keyboard(user))
         return
     if not task:
         await message.answer("Нужна короткая формулировка задачи.")
@@ -164,11 +164,11 @@ async def cafe_pick_duration(callback: types.CallbackQuery, state: FSMContext, d
 
 
 @router.message(FocusCafeState.duration, lambda m: bool(m.text and not m.text.startswith("/")))
-async def cafe_custom_duration(message: types.Message, state: FSMContext, db) -> None:
+async def cafe_custom_duration(message: types.Message, state: FSMContext, db, user: dict | None = None) -> None:
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "назад"}:
         await state.clear()
-        await message.answer("Отменила фокус-сессию.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила фокус-сессию.", reply_markup=main_menu_keyboard(user))
         return
     try:
         minutes = int(raw)
@@ -317,7 +317,7 @@ async def cafe_restart(callback: types.CallbackQuery, state: FSMContext) -> None
 
 
 @router.callback_query(lambda c: c.data and c.data == "cafe:cancel")
-async def cafe_cancel(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def cafe_cancel(callback: types.CallbackQuery, state: FSMContext, user: dict | None = None) -> None:
     await state.clear()
-    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard(user))
     await callback.answer()

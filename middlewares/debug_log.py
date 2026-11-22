@@ -1,5 +1,6 @@
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, Update
+import re
 
 from utils.logger import log_debug
 
@@ -8,13 +9,17 @@ class DebugLogMiddleware(BaseMiddleware):
     """Логирование действий пользователя для отладки (включается DEBUG_LOG=1)."""
 
     async def __call__(self, handler, event, data):
+        def safe_text(value):
+            if not value:
+                return value
+            return re.sub(r"(?i)(/start(?:@[\w]+)?\s+desk_)[A-Za-z0-9_-]+", r"\1[REDACTED]", str(value))
         try:
             if isinstance(event, Update):
                 if event.message and isinstance(event.message, Message):
                     m = event.message
                     log_debug(
                         f"[update] message chat={m.chat.id} user={m.from_user.id} "
-                        f"text={repr(m.text)} caption={repr(m.caption)} "
+                        f"text={repr(safe_text(m.text))} caption={repr(safe_text(m.caption))} "
                         f"reply_to={m.reply_to_message.message_id if m.reply_to_message else None}"
                     )
                 elif event.callback_query and isinstance(event.callback_query, CallbackQuery):
@@ -30,7 +35,7 @@ class DebugLogMiddleware(BaseMiddleware):
                 m = event
                 log_debug(
                     f"[update] message chat={m.chat.id} user={m.from_user.id} "
-                    f"text={repr(m.text)} caption={repr(m.caption)} "
+                    f"text={repr(safe_text(m.text))} caption={repr(safe_text(m.caption))} "
                     f"reply_to={m.reply_to_message.message_id if m.reply_to_message else None}"
                 )
             elif isinstance(event, CallbackQuery):

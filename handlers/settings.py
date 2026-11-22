@@ -43,11 +43,12 @@ def _cancel_settings_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _handle_settings_cancel(message: types.Message, state: FSMContext) -> bool:
+async def _handle_settings_cancel(message: types.Message, state: FSMContext, db) -> bool:
     """Сбросить FSM настроек, если пользователь написал отмену/назад."""
     if (message.text or "").strip().lower() in {"отмена", "назад"}:
         await state.clear()
-        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
+        user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+        await message.answer("Отменено.", reply_markup=main_menu_keyboard(user))
         return True
     return False
 
@@ -72,19 +73,26 @@ def settings_keyboard(user: dict | None = None) -> InlineKeyboardMarkup:
     во вложенных меню.
     """
     focus_icon = "✅" if bool((user or {}).get("adhd_mode")) else "❌"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    student = (user or {}).get("profile_mode", "adult") == "student"
+    rows = [
+            [InlineKeyboardButton(text=f"🎓 Режим: {'Ученик' if student else 'Взрослый'}", callback_data=f"settings:profile_mode:{'adult' if student else 'student'}")],
             [InlineKeyboardButton(text="👤 Мой профиль", callback_data="settings:profile")],
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings:notifications")],
             [InlineKeyboardButton(text="😴 Режим сна", callback_data="settings:sleep_mode")],
             [InlineKeyboardButton(text="Время и режим дня", callback_data="settings:time_menu")],
             [InlineKeyboardButton(text="Рутины (шаги и время)", callback_data="settings:routines_menu")],
-            [InlineKeyboardButton(text="Срок «скоро истечёт»", callback_data="settings:expiry")],
             [InlineKeyboardButton(text=f"Щадящий фокус {focus_icon}", callback_data="settings:adhd")],
+    ]
+    if not student:
+        rows.extend([
+            [InlineKeyboardButton(text="Срок «скоро истечёт»", callback_data="settings:expiry")],
             [InlineKeyboardButton(text="Общий дом", callback_data="settings:household")],
+        ])
+    rows.extend([
+            [InlineKeyboardButton(text="📚 Fodder's Desk", callback_data="desk:main")],
             [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
-        ]
-    )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _render_notifications_menu(callback: types.CallbackQuery, db) -> None:
@@ -104,7 +112,9 @@ async def _render_notifications_menu(callback: types.CallbackQuery, db) -> None:
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")],
+            *([] if user.get("profile_mode", "adult") == "student" else [
+                [InlineKeyboardButton(text=f"🍽 Еда {meal_icon}", callback_data="settings:notify:meal")]
+            ]),
             [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
             [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
             [InlineKeyboardButton(text=f"🔕 Тихий режим {quiet_icon}", callback_data="settings:quiet")],
@@ -159,6 +169,14 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
         return
     action = parts[1]
     await state.clear()
+    if action == "profile_mode" and len(parts) == 3 and parts[2] in {"adult", "student"}:
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        await repo.update_user_profile_mode(db, user["id"], parts[2])
+        user = dict(await repo.get_user(db, user["id"]))
+        await safe_edit(callback.message, _settings_main_text(user), reply_markup=settings_keyboard(user))
+        await callback.message.answer("Профиль обновлён.", reply_markup=main_menu_keyboard(user))
+        await callback.answer("Готово")
+        return
     # Возврат в главное меню настроек
     if action == "main":
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
@@ -267,7 +285,9 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=f"Пол: {g_label}", callback_data="settings:gender")],
-                [InlineKeyboardButton(text=f"Питание: {d_label}", callback_data="settings:mealprof")],
+                *([] if user.get("profile_mode", "adult") == "student" else [
+                    [InlineKeyboardButton(text=f"Питание: {d_label}", callback_data="settings:mealprof")]
+                ]),
                 [InlineKeyboardButton(text="Цель/Приоритет", callback_data="settings:goals")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
             ]
@@ -344,7 +364,7 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
             "Создала общий дом. Передай партнёру этот код, чтобы он присоединился:\n"
             f"`{code}`",
             parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user),
         )
     elif action == "household_join":
         await state.set_state(SettingsState.household_join)
@@ -755,7 +775,7 @@ async def settings_affirm_mode(callback: types.CallbackQuery, db) -> None:
 
 @router.message(SettingsState.timezone, lambda m: m.text and not m.text.startswith("/"))
 async def settings_timezone(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
     tz = message.text.strip()
     computed_tz = None
@@ -796,13 +816,13 @@ async def settings_timezone(message: types.Message, state: FSMContext, db) -> No
     await repo.update_user_timezone(db, user["id"], tz)
     await state.clear()
     await message.answer(
-        f"Часовой пояс обновлён на {tz}.", reply_markup=main_menu_keyboard()
+        f"Часовой пояс обновлён на {tz}.", reply_markup=main_menu_keyboard(user)
     )
 
 
 @router.message(SettingsState.wake, lambda m: m.text and not m.text.startswith("/"))
 async def settings_wake(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
@@ -817,13 +837,13 @@ async def settings_wake(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
     await message.answer(
         f"Время подъёма обновлено: {hhmm}.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
 @router.message(SettingsState.sleep, lambda m: m.text and not m.text.startswith("/"))
 async def settings_sleep(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
@@ -838,13 +858,13 @@ async def settings_sleep(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
     await message.answer(
         f"Время отбоя обновлено: {hhmm}.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
 @router.message(SettingsState.goals, lambda m: m.text and not m.text.startswith("/"))
 async def settings_goals(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
     text = message.text.strip()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -852,13 +872,13 @@ async def settings_goals(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
     await message.answer(
         "Цель обновлена. Я буду учитывать это в подсказках.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
 @router.message(SettingsState.expiry, lambda m: m.text and not m.text.startswith("/"))
 async def settings_expiry(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
     raw = message.text.strip()
     try:
@@ -876,13 +896,13 @@ async def settings_expiry(message: types.Message, state: FSMContext, db) -> None
     await state.clear()
     await message.answer(
         f"Хорошо, буду считать, что продукт «скоро испортится», если до конца срока осталось ≤ {days} дн.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
 @router.message(SettingsState.routine_time, lambda m: m.text and not m.text.startswith("/"))
 async def settings_routine_time(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
     time_value = parse_hhmm(message.text.strip())
     if not time_value:
@@ -904,14 +924,15 @@ async def settings_routine_time(message: types.Message, state: FSMContext, db) -
     routine_label = ROUTINE_GENITIVE.get(routine_key, routine_key)
     await message.answer(
         f"Время напоминания для {routine_label} обновлено: {hhmm}.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
 @router.message(SettingsState.household_join, lambda m: m.text and not m.text.startswith("/"))
 async def settings_household_join(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     code = (message.text or "").strip()
     if not code:
         await message.answer(
@@ -925,22 +946,21 @@ async def settings_household_join(message: types.Message, state: FSMContext, db)
     if not household:
         await message.answer(
             "Я не нашла дом с таким кодом. Проверь, не перепутались ли буквы/цифры, или попроси партнёра показать код ещё раз.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user),
         )
         await state.clear()
         return
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     await repo_mod.set_user_household(db, user["id"], household["id"])
     await state.clear()
     await message.answer(
         "Подключила тебя к общему дому. Теперь кладовка продуктов и бытовая химия будут общими для вас.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
 @router.message(SettingsState.affirm_custom_time, lambda m: m.text and not m.text.startswith("/"))
 async def settings_affirm_custom_time(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_settings_cancel(message, state):
+    if await _handle_settings_cancel(message, state, db):
         return
     text = (message.text or "").replace(",", " ").replace(";", " ")
     parts = text.split()
@@ -971,5 +991,5 @@ async def settings_affirm_custom_time(message: types.Message, state: FSMContext,
     await state.clear()
     await message.answer(
         f"✅ Принято! Аффирмации будут приходить в эти часы: {', '.join(map(str, hours))}.",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(user)
     )

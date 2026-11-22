@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import datetime
 import os
 import shutil
@@ -85,6 +86,22 @@ async def connect(database_url: str) -> aiosqlite.Connection:
     return conn
 
 
+@asynccontextmanager
+async def independent_connection(conn: aiosqlite.Connection):
+    """Yield an isolated writer for a file database; reuse in-memory connections."""
+    rows = await conn.execute_fetchall("PRAGMA database_list;")
+    main = next((row for row in rows if row["name"] == "main"), None)
+    path = str(main["file"] or "") if main else ""
+    if not path or path == ":memory:":
+        yield conn
+        return
+    writer = await connect(path)
+    try:
+        yield writer
+    finally:
+        await writer.close()
+
+
 async def init_db(conn: aiosqlite.Connection) -> None:
     """Create tables and seed minimal data."""
     await conn.executescript(
@@ -121,6 +138,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             sleep_confirmed_date TEXT,
             sleep_confirmed_at TEXT,
             night_catch_last_at TEXT,
+            profile_mode TEXT NOT NULL DEFAULT 'adult',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -329,6 +347,8 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             is_important INTEGER DEFAULT 0,
             done INTEGER DEFAULT 0,
             synced_to_today INTEGER DEFAULT 0,
+            external_key TEXT DEFAULT '',
+            external_url TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (plan_id) REFERENCES day_plans(id) ON DELETE CASCADE,
@@ -400,6 +420,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             title TEXT NOT NULL,
             category TEXT DEFAULT 'misc',
             source TEXT DEFAULT 'manual',
+            external_key TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -664,6 +685,61 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             created_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS desk_link_tokens (
+            token TEXT PRIMARY KEY,
+            desk_user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            expires_at_utc TEXT NOT NULL,
+            consumed_at_utc TEXT,
+            consumed_by_user_id INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (consumed_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_desk_tokens_expiry ON desk_link_tokens(expires_at_utc);
+        CREATE TABLE IF NOT EXISTS desk_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
+            desk_user_id TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            linked_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS desk_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            desk_user_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS desk_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            batch_key TEXT DEFAULT '',
+            text TEXT NOT NULL,
+            url TEXT DEFAULT '',
+            button_label TEXT DEFAULT '',
+            deliver_after_utc TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_desk_outbox_due ON desk_outbox(status, deliver_after_utc, priority);
+        CREATE INDEX IF NOT EXISTS idx_desk_outbox_batch ON desk_outbox(batch_key, status);
         """
     )
     await ensure_columns(conn)
@@ -674,8 +750,22 @@ async def init_db(conn: aiosqlite.Connection) -> None:
 
 async def ensure_columns(conn: aiosqlite.Connection) -> None:
     """Ensure optional columns exist for backward compatibility."""
+    async def add_column_if_missing(table: str, name: str, definition: str) -> None:
+        """Recheck after ALTER errors so two WAL processes can start together safely."""
+        info = await conn.execute_fetchall(f"PRAGMA table_info({table});")
+        if name in {row["name"] for row in info}:
+            return
+        try:
+            await conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition};")
+        except Exception:
+            info = await conn.execute_fetchall(f"PRAGMA table_info({table});")
+            if name not in {row["name"] for row in info}:
+                raise
+
     users_info = await conn.execute_fetchall("PRAGMA table_info(users);")
     user_cols = {row["name"] for row in users_info}
+    if "profile_mode" not in user_cols:
+        await add_column_if_missing("users", "profile_mode", "TEXT NOT NULL DEFAULT 'adult'")
     if "pause_until" not in user_cols:
         await conn.execute("ALTER TABLE users ADD COLUMN pause_until TEXT;")
     if "quiet_mode" not in user_cols:
@@ -779,6 +869,18 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
     users_gender_cols = {row["name"] for row in users_gender_info}
     if "gender" not in users_gender_cols:
         await conn.execute("ALTER TABLE users ADD COLUMN gender TEXT DEFAULT 'neutral';")
+
+    for table, additions in {
+        "day_plan_items": (("external_key", "TEXT DEFAULT ''"), ("external_url", "TEXT DEFAULT ''")),
+        "schedule_events": (("external_key", "TEXT DEFAULT ''"),),
+    }.items():
+        info = await conn.execute_fetchall(f"PRAGMA table_info({table});")
+        cols = {row["name"] for row in info}
+        for col_name, definition in additions:
+            if col_name not in cols:
+                await add_column_if_missing(table, col_name, definition)
+    await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_day_plan_items_external ON day_plan_items(user_id, external_key) WHERE external_key != '';" )
+    await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_events_external ON schedule_events(user_id, external_key) WHERE external_key != '';" )
 
     weights_info = await conn.execute_fetchall("PRAGMA table_info(weights);")
     if not weights_info:

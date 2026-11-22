@@ -58,6 +58,12 @@ async def _ensure_user(message: types.Message, db, tg_user_id: int, tg_full_name
     return dict(created) if created else {"id": user_id, "name": name, "timezone": tz}
 
 
+async def _existing_menu_user(db, tg_user_id: int) -> dict | None:
+    """Read an existing profile for menu rendering without creating an account."""
+    row = await repo.get_user_by_telegram_id(db, tg_user_id)
+    return row_to_dict(row) if row else None
+
+
 def list_keyboard(reminders, with_add: bool = True) -> InlineKeyboardMarkup:
     buttons = []
     if with_add:
@@ -278,7 +284,7 @@ def _build_pending_from_payload(payload: dict, user: dict, base: dict | None = N
 async def _persist_parsed_reminder(message: types.Message, state: FSMContext, db, user: dict, pending: dict):
     reminder_time = pending.get("reminder_time")
     if not reminder_time or not parse_hhmm(reminder_time):
-        await message.answer("Нужно указать время. Например: <в 10>, <в 09:30> или <завтра в 14:00>.", reply_markup=main_menu_keyboard())
+        await message.answer("Нужно указать время. Например: <в 10>, <в 09:30> или <завтра в 14:00>.", reply_markup=main_menu_keyboard(user))
         return
     freq = pending.get("frequency_days") or 9999
     reminder_id = await repo.create_custom_reminder(
@@ -297,7 +303,7 @@ async def _persist_parsed_reminder(message: types.Message, state: FSMContext, db
             f"{pending.get('title','Напоминание')} в {reminder_time} "
             f"({_freq_label(freq)})"
         ),
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
@@ -319,7 +325,7 @@ async def _start_add_reminder(
     tg_user_id: int,
     tg_full_name: str,
 ) -> None:
-    user = await _ensure_user(db, tg_user_id, tg_full_name)
+    user = await _ensure_user(message, db, tg_user_id, tg_full_name)
     await state.update_data(user_id=user["id"], user_tz=user["timezone"])
     await state.set_state(CustomReminderState.title)
     pause_note = ""
@@ -349,11 +355,11 @@ async def add_reminder_start(message: types.Message, state: FSMContext, db) -> N
 
 
 @router.message(CustomReminderState.title, lambda m: m.text and not m.text.startswith("/"))
-async def add_reminder_title(message: types.Message, state: FSMContext) -> None:
+async def add_reminder_title(message: types.Message, state: FSMContext, user: dict | None = None) -> None:
     title = (message.text or "").strip()
     if title.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(user))
         return
     await state.update_data(title=title)
     await state.set_state(CustomReminderState.when)
@@ -375,10 +381,10 @@ async def add_reminder_title(message: types.Message, state: FSMContext) -> None:
 
 
 @router.message(CustomReminderState.when, lambda m: m.text and not m.text.startswith("/"))
-async def add_reminder_when_text(message: types.Message, state: FSMContext) -> None:
+async def add_reminder_when_text(message: types.Message, state: FSMContext, user: dict | None = None) -> None:
     if (message.text or "").strip().lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(user))
         return
     await message.answer(
         "Выбери вариант кнопками выше или нажми «❌ Отмена».",
@@ -418,14 +424,14 @@ async def reminder_when(callback: types.CallbackQuery, state: FSMContext, db) ->
         await state.clear()
         await callback.message.answer(
             ack(f"{data['title']} в {hhmm} (один раз).\n\nПосмотреть и удалить старые можно в разделе ⏰ Напоминания."),
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(row_to_dict(user)),
         )
         await callback.answer()
         return
     if choice == "weekly":
         await state.update_data(when_choice="weekly")
         await state.set_state(CustomReminderState.time)
-        await callback.message.answer("Введи время (HH:MM). Потом выберем день недели.", reply_markup=main_menu_keyboard())
+        await callback.message.answer("Введи время (HH:MM). Потом выберем день недели.", reply_markup=main_menu_keyboard(row_to_dict(user)))
         await callback.answer()
         return
     if choice in ("today", "tomorrow", "custom"):
@@ -440,7 +446,7 @@ async def add_reminder_time(message: types.Message, state: FSMContext, db) -> No
     text = (message.text or "").strip()
     if text.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     abs_time, plus_hours, weekday = parse_when(text)
     if abs_time:
@@ -572,7 +578,7 @@ async def add_reminder_frequency(message: types.Message, state: FSMContext, db) 
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     try:
         freq = int(raw)
@@ -595,10 +601,10 @@ async def add_reminder_frequency(message: types.Message, state: FSMContext, db) 
 
 
 @router.message(CustomReminderState.weekday, lambda m: m.text and not m.text.startswith("/"))
-async def add_reminder_weekday_text(message: types.Message, state: FSMContext) -> None:
+async def add_reminder_weekday_text(message: types.Message, state: FSMContext, user: dict | None = None) -> None:
     if (message.text or "").strip().lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(user))
         return
     await message.answer(
         "Выбери день недели кнопками выше или нажми «❌ Отмена».",
@@ -683,7 +689,7 @@ async def _save_reminder_with_frequency(
             desc += ", раз в неделю"
     else:
         desc += f", каждые {freq} д."
-    await message.answer(ack(f"{desc}{note}\n\nПосмотреть и удалить старые можно в разделе ⏰ Напоминания."), reply_markup=main_menu_keyboard())
+    await message.answer(ack(f"{desc}{note}\n\nПосмотреть и удалить старые можно в разделе ⏰ Напоминания."), reply_markup=main_menu_keyboard(user_dict))
 
 
 @router.message(Command("reminders"))
@@ -707,7 +713,7 @@ async def list_reminders(message: types.Message, state: FSMContext, db) -> None:
 
 @router.message(
     lambda m: m.text
-    and m.text.lower().strip() in {"напоминания", "напоминание", "⏰ напоминания", "напоминания!"}
+    and m.text.lower().strip() in {"напоминания", "напоминание", "⏰ напоминания", "🔔 напоминания", "напоминания!"}
 )
 async def list_reminders_button(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
@@ -835,7 +841,7 @@ async def reminder_edit_time(message: types.Message, state: FSMContext, db) -> N
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     data = await state.get_data()
     reminder_id = data.get("edit_id")
@@ -863,7 +869,7 @@ async def reminder_edit_time(message: types.Message, state: FSMContext, db) -> N
         hhmm = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
     await repo.update_custom_reminder_time(db, user["id"], reminder_id, hhmm)
     await state.clear()
-    await message.answer(ack(f"Время обновлено: {hhmm}"), reply_markup=main_menu_keyboard())
+    await message.answer(ack(f"Время обновлено: {hhmm}"), reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
 
 
 @router.message(CustomReminderState.edit_freq, lambda m: m.text and not m.text.startswith("/"))
@@ -871,7 +877,7 @@ async def reminder_edit_freq(message: types.Message, state: FSMContext, db) -> N
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     data = await state.get_data()
     reminder_id = data.get("edit_id")
@@ -893,7 +899,7 @@ async def reminder_edit_freq(message: types.Message, state: FSMContext, db) -> N
     user = await _ensure_user(message, db, message.from_user.id, message.from_user.full_name)
     await repo.update_custom_reminder_freq(db, user["id"], reminder_id, freq)
     await state.clear()
-    await message.answer(ack(f"Частота обновлена: каждые {freq} д."), reply_markup=main_menu_keyboard())
+    await message.answer(ack(f"Частота обновлена: каждые {freq} д."), reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("rem:wdset:"))
@@ -907,7 +913,7 @@ async def reminder_edit_weekday(callback: types.CallbackQuery, state: FSMContext
     user = await _ensure_user(callback.message, db, callback.from_user.id, callback.from_user.full_name)
     await repo.update_custom_reminder_freq(db, user["id"], reminder_id, frequency_days=7, target_weekday=weekday)
     await state.clear()
-    await callback.message.answer("День недели обновлен.", reply_markup=main_menu_keyboard())
+    await callback.message.answer("День недели обновлен.", reply_markup=main_menu_keyboard(user))
     await callback.answer("Сохранила")
 
 # Свободный ввод для напоминаний (натуральные команды)
@@ -998,14 +1004,14 @@ async def reminder_parsed_confirm_text(message: types.Message, state: FSMContext
     if low in {"да", "ок", "окей", "сохрани", "сохранить", "ага"}:
         if not pending or not user:
             await state.clear()
-            await message.answer("Черновик напоминания уже неактуален.", reply_markup=main_menu_keyboard())
+            await message.answer("Черновик напоминания уже неактуален.", reply_markup=main_menu_keyboard(user))
             return
         await _persist_parsed_reminder(message, state, db, user, pending)
         return
 
     if low in {"нет", "отмена", "не надо", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(user))
         return
 
     if pending and user and not pending.get("reminder_time"):
@@ -1046,7 +1052,7 @@ async def reminder_parsed_callbacks(callback: types.CallbackQuery, state: FSMCon
         return
     if action == "cancel":
         await state.clear()
-        await callback.message.answer("Отменила создание напоминания.", reply_markup=main_menu_keyboard())
+        await callback.message.answer("Отменила создание напоминания.", reply_markup=main_menu_keyboard(user))
         await callback.answer()
         return
     if action == "edit_title":
@@ -1110,7 +1116,7 @@ async def reminder_parsed_edit_title(message: types.Message, state: FSMContext, 
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     data = await state.get_data()
     pending = data.get("pending_parsed") or {}
@@ -1130,7 +1136,7 @@ async def reminder_parsed_edit_time(message: types.Message, state: FSMContext, d
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     data = await state.get_data()
     pending = data.get("pending_parsed") or {}
@@ -1158,7 +1164,7 @@ async def reminder_parsed_edit_freq(message: types.Message, state: FSMContext, d
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     data = await state.get_data()
     pending = data.get("pending_parsed") or {}
@@ -1186,7 +1192,7 @@ async def reminder_parsed_edit_weekday(message: types.Message, state: FSMContext
     raw = (message.text or "").strip()
     if raw.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     # запасной текстовый режим — если что, просто возвращаем в предпросмотр
     data = await state.get_data()

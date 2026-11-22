@@ -363,6 +363,11 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
 async def money_free_parse(message: types.Message, db, state: FSMContext) -> None:
     if await state.get_state():
         return
+    user_row = await repo.get_user_by_telegram_id(db, message.from_user.id)
+    if user_row and dict(user_row).get("profile_mode", "adult") == "student":
+        from handlers.inbox import handle_free_text_inbox
+        await handle_free_text_inbox(message, db)
+        return
     parsed = parse_command(message.text)
     if not parsed or parsed.type != "expense":
         return

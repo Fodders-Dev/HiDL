@@ -18,6 +18,7 @@ from utils.rows import rows_to_dicts
 from utils.sender import safe_edit
 from utils.time import local_date_str, parse_hhmm
 from utils.user import ensure_user
+from utils.profile import is_student_mode
 
 router = Router()
 
@@ -34,10 +35,10 @@ def _cancel_kb() -> InlineKeyboardMarkup:
     )
 
 
-async def _handle_cancel(message: types.Message, state: FSMContext) -> bool:
+async def _handle_cancel(message: types.Message, state: FSMContext, user: dict | None = None) -> bool:
     if (message.text or "").strip().lower() in {"отмена", "назад"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(user))
         return True
     return False
 
@@ -151,27 +152,28 @@ def _parse_weekdays(raw: str) -> str | None:
     return ",".join(str(x) for x in sorted(days))
 
 
-def _schedule_keyboard(local_date: str, connected: bool = False) -> InlineKeyboardMarkup:
+def _schedule_keyboard(local_date: str, connected: bool = False, user: dict | None = None) -> InlineKeyboardMarkup:
     gcal_row = [InlineKeyboardButton(text="🔗 Google Calendar", callback_data="sched:gcal")]
     if connected:
         gcal_row.append(InlineKeyboardButton(text="🔄 Синхр.", callback_data="sched:sync"))
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    student = is_student_mode(user)
+    rows = [
             [
                 InlineKeyboardButton(text="➕ Блок (работа/учёба/дорога)", callback_data="sched:add_block"),
                 InlineKeyboardButton(text="➕ Событие", callback_data="sched:add_event"),
             ],
             gcal_row,
-            [
-                InlineKeyboardButton(text="⚡ Вставить спорт 30м", callback_data=f"sched:suggest:{local_date}:sport"),
-                InlineKeyboardButton(text="🍳 Вставить готовку 45м", callback_data=f"sched:suggest:{local_date}:cook"),
-            ],
-            [
-                InlineKeyboardButton(text="🛒 Вставить покупки 60м", callback_data=f"sched:suggest:{local_date}:shop"),
-            ],
-            [InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")],
-        ]
-    )
+    ]
+    if not student:
+        rows.extend([
+            [InlineKeyboardButton(text="⚡ Вставить спорт 30м", callback_data=f"sched:suggest:{local_date}:sport"),
+             InlineKeyboardButton(text="🍳 Вставить готовку 45м", callback_data=f"sched:suggest:{local_date}:cook")],
+            [InlineKeyboardButton(text="🛒 Вставить покупки 60м", callback_data=f"sched:suggest:{local_date}:shop")],
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="⚡ Вставить спорт 30м", callback_data=f"sched:suggest:{local_date}:sport")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _render_schedule_text(db, user: dict, local_date: str) -> tuple[str, list[Interval], list[tuple[int, int]]]:
@@ -325,7 +327,7 @@ async def schedule_today(message: types.Message, state: FSMContext, db) -> None:
     local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     conns = await repo.list_user_calendar_connections(db, user["id"], enabled_only=True)
     text, _, _ = await _render_schedule_text(db, user, local_date)
-    await message.answer(text, reply_markup=_schedule_keyboard(local_date, connected=bool(conns)), parse_mode="HTML")
+    await message.answer(text, reply_markup=_schedule_keyboard(local_date, connected=bool(conns), user=user), parse_mode="HTML")
 
 
 @router.message(Command("gcal"))
@@ -345,7 +347,7 @@ async def gcal_cmd(message: types.Message, state: FSMContext, db) -> None:
         text, _, _ = await _render_schedule_text(db, user, local_date)
         await message.answer(
             f"✅ <b>Google Calendar подключён!</b> Загружено событий: {sync_res['synced_events']}.\n\n{text}",
-            reply_markup=_schedule_keyboard(local_date, connected=True),
+            reply_markup=_schedule_keyboard(local_date, connected=True, user=user),
             parse_mode="HTML",
         )
         return
@@ -366,14 +368,14 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await callback.message.answer("Отменила.", reply_markup=main_menu_keyboard(user))
         await callback.answer("Отменила.")
         return
 
     if action == "home":
         conns = await repo.list_user_calendar_connections(db, user["id"], enabled_only=True)
         text, _, _ = await _render_schedule_text(db, user, local_date)
-        await safe_edit(callback.message, text, reply_markup=_schedule_keyboard(local_date, connected=bool(conns)), parse_mode="HTML")
+        await safe_edit(callback.message, text, reply_markup=_schedule_keyboard(local_date, connected=bool(conns), user=user), parse_mode="HTML")
         await callback.answer()
         return
 
@@ -425,7 +427,7 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         conns = await repo.list_user_calendar_connections(db, user["id"], enabled_only=True)
         await callback.answer(f"Синхронизировано событий: {res['synced_events']}", show_alert=True)
         text, _, _ = await _render_schedule_text(db, user, local_date)
-        await safe_edit(callback.message, text, reply_markup=_schedule_keyboard(local_date, connected=bool(conns)), parse_mode="HTML")
+        await safe_edit(callback.message, text, reply_markup=_schedule_keyboard(local_date, connected=bool(conns), user=user), parse_mode="HTML")
         return
 
     if action == "add_block":
@@ -456,6 +458,9 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
     if action == "suggest":
         target_date = data[2] if len(data) > 2 else local_date
         kind = data[3] if len(data) > 3 else ""
+        if is_student_mode(user) and kind in {"cook", "shop"}:
+            await callback.answer("Этот бытовой вариант скрыт в профиле ученика.", show_alert=True)
+            return
         text, _, slots = await _render_schedule_text(db, user, target_date)
         duration = {"sport": 30, "cook": 45, "shop": 60}.get(kind, 30)
         title = {"sport": "Спорт", "cook": "Готовка", "shop": "Покупки"}.get(kind, "Событие")
@@ -475,7 +480,7 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             push_to_google=True,
         )
         conns = await repo.list_user_calendar_connections(db, user["id"], enabled_only=True)
-        await callback.message.answer(text, reply_markup=_schedule_keyboard(target_date, connected=bool(conns)), parse_mode="HTML")
+        await callback.message.answer(text, reply_markup=_schedule_keyboard(target_date, connected=bool(conns), user=user), parse_mode="HTML")
         await callback.answer("Добавила")
         return
 
@@ -523,14 +528,14 @@ async def cal_dismiss_nudge(callback: types.CallbackQuery) -> None:
 
 @router.message(ScheduleState.add_ics, lambda m: bool(m.text and not m.text.startswith("/")))
 async def schedule_add_ics(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_cancel(message, state):
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    if await _handle_cancel(message, state, user):
         return
     url = (message.text or "").strip()
     ok_url, err_msg = calendar_service.validate_ics_url(url)
     if not ok_url:
         await message.answer(f"❌ {html.escape(err_msg)}\nПопробуй ещё раз:", reply_markup=_cancel_kb())
         return
-    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
     await repo.upsert_calendar_connection(db, user["id"], "ics", label="Google Calendar (.ics)", ics_url=url)
     res = await calendar_service.sync_user_calendars(db, user)
     await state.clear()
@@ -538,16 +543,16 @@ async def schedule_add_ics(message: types.Message, state: FSMContext, db) -> Non
     text, _, _ = await _render_schedule_text(db, user, local_date)
     await message.answer(
         f"✅ <b>Google Calendar (.ics) подключён!</b> Событий загружено: {res['synced_events']}.\n\n{text}",
-        reply_markup=_schedule_keyboard(local_date, connected=True),
+        reply_markup=_schedule_keyboard(local_date, connected=True, user=user),
         parse_mode="HTML",
     )
 
 
 @router.message(ScheduleState.add_block, lambda m: bool(m.text and not m.text.startswith("/")))
 async def schedule_add_block(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_cancel(message, state):
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    if await _handle_cancel(message, state, user):
         return
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     raw = (message.text or "").strip()
     parts = [p.strip() for p in raw.split(";")]
     if len(parts) < 2:
@@ -566,14 +571,14 @@ async def schedule_add_block(message: types.Message, state: FSMContext, db) -> N
     weekdays = _parse_weekdays(parts[2] if len(parts) > 2 else "пн-пт") or "0,1,2,3,4"
     await repo.create_schedule_block(db, user["id"], title, _hhmm_str(st), _hhmm_str(en), weekdays)
     await state.clear()
-    await message.answer("✅ Сохранила блок.", reply_markup=main_menu_keyboard())
+    await message.answer("✅ Сохранила блок.", reply_markup=main_menu_keyboard(user))
 
 
 @router.message(ScheduleState.add_event, lambda m: bool(m.text and not m.text.startswith("/")))
 async def schedule_add_event(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_cancel(message, state):
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    if await _handle_cancel(message, state, user):
         return
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     raw = (message.text or "").strip()
     parts = [p.strip() for p in raw.split(";")]
@@ -602,7 +607,7 @@ async def schedule_add_event(message: types.Message, state: FSMContext, db) -> N
     )
     await state.clear()
     if res.get("google_synced"):
-        await message.answer("✅ Добавила событие (и синхронизировала с Google Calendar).", reply_markup=main_menu_keyboard())
+        await message.answer("✅ Добавила событие (и синхронизировала с Google Calendar).", reply_markup=main_menu_keyboard(user))
     else:
         note = f"\nℹ️ {res['google_error']}" if res.get("google_error") else ""
-        await message.answer(f"✅ Добавила событие.{note}", reply_markup=main_menu_keyboard())
+        await message.answer(f"✅ Добавила событие.{note}", reply_markup=main_menu_keyboard(user))

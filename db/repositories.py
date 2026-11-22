@@ -95,6 +95,17 @@ async def get_user(conn: aiosqlite.Connection, user_id: int) -> Optional[aiosqli
     return await cursor.fetchone()
 
 
+async def update_user_profile_mode(conn: aiosqlite.Connection, user_id: int, mode: str) -> None:
+    mode = str(mode or "").strip().lower()
+    if mode not in {"adult", "student"}:
+        raise ValueError("profile mode must be 'adult' or 'student'")
+    await conn.execute(
+        "UPDATE users SET profile_mode = ?, updated_at = ? WHERE id = ?",
+        (mode, utc_now_str(), int(user_id)),
+    )
+    await conn.commit()
+
+
 async def update_user_timezone(
     conn: aiosqlite.Connection, user_id: int, timezone: str
 ) -> None:
@@ -340,16 +351,17 @@ async def upsert_day_plan(
             "UPDATE day_plans SET updated_at = ? WHERE id = ?",
             (now, plan_id),
         )
-        await conn.execute("DELETE FROM day_plan_items WHERE plan_id = ?", (plan_id,))
     else:
-        cursor = await conn.execute(
-            """
-            INSERT INTO day_plans (user_id, plan_date, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            """,
+        await conn.execute(
+            "INSERT OR IGNORE INTO day_plans (user_id, plan_date, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (user_id, plan_date, now, now),
         )
-        plan_id = cursor.lastrowid
+        plan_row = await (await conn.execute(
+            "SELECT id FROM day_plans WHERE user_id=? AND plan_date=?", (user_id, plan_date)
+        )).fetchone()
+        plan_id = int(plan_row["id"])
+    # Replacing a manually authored plan must leave Desk-managed items intact.
+    await conn.execute("DELETE FROM day_plan_items WHERE plan_id = ? AND COALESCE(external_key, '') = ''", (plan_id,))
     for item in items:
         await conn.execute(
             """
@@ -443,14 +455,14 @@ async def add_day_plan_item(
             (now, plan_id),
         )
     else:
-        cursor = await conn.execute(
-            """
-            INSERT INTO day_plans (user_id, plan_date, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            """,
+        await conn.execute(
+            "INSERT OR IGNORE INTO day_plans (user_id, plan_date, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (user_id, plan_date, now, now),
         )
-        plan_id = cursor.lastrowid
+        plan_row = await (await conn.execute(
+            "SELECT id FROM day_plans WHERE user_id=? AND plan_date=?", (user_id, plan_date)
+        )).fetchone()
+        plan_id = int(plan_row["id"])
     cursor = await conn.execute(
         """
         INSERT INTO day_plan_items

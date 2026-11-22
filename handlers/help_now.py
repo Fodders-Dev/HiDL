@@ -8,19 +8,24 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from handlers import focus_cafe, kitchen
 from utils.sender import safe_edit
 from utils.user import ensure_user
+from utils.profile import is_student_mode
 
 router = Router()
 
 
-def _help_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="😵 Мало сил", callback_data="help:low")],
-            [InlineKeyboardButton(text="⏳ Прокрастинация", callback_data="help:procrast")],
+def _help_menu_keyboard(student: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="😵 Мало сил", callback_data="help:low")],
+        [InlineKeyboardButton(text="⏳ Прокрастинация", callback_data="help:procrast")],
+    ]
+    if not student:
+        rows.extend([
             [InlineKeyboardButton(text="🧹 Бардак", callback_data="help:mess")],
             [InlineKeyboardButton(text="🍽 Не знаю, что есть", callback_data="help:food")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
-        ]
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")])
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
     )
 
 
@@ -52,25 +57,26 @@ def _help_procrast_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _render_help_menu(message: types.Message) -> None:
+async def _render_help_menu(message: types.Message, user: dict) -> None:
     text = "Что сейчас сложнее всего? Выбери один вариант — дам короткий следующий шаг."
-    await safe_edit(message, text, reply_markup=_help_menu_keyboard())
+    await safe_edit(message, text, reply_markup=_help_menu_keyboard(is_student_mode(user)))
 
 
 @router.message(Command("help_now"))
 @router.message(lambda m: m.text and "помощ" in m.text.lower() and "сейчас" in m.text.lower())
-async def help_now_entry(message: types.Message, state: FSMContext) -> None:
+async def help_now_entry(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
     await message.answer(
         "Что сейчас сложнее всего? Выбери один вариант — дам короткий следующий шаг.",
-        reply_markup=_help_menu_keyboard(),
+        reply_markup=_help_menu_keyboard(is_student_mode(await ensure_user(db, message.from_user.id, message.from_user.full_name))),
     )
 
 
 @router.callback_query(lambda c: c.data == "help:menu")
-async def help_now_menu(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def help_now_menu(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     await state.clear()
-    await _render_help_menu(callback.message)
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    await _render_help_menu(callback.message, user)
     await callback.answer()
 
 

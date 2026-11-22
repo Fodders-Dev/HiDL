@@ -12,6 +12,7 @@ from services import calendar_service, pulse_service
 from utils.time import format_date_display, local_date_str, should_trigger, tzinfo_from_string
 from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
+from utils.profile import is_student_mode
 
 
 def _hhmm_to_min(hhmm: str) -> Optional[int]:
@@ -64,6 +65,7 @@ class ReminderScheduler:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
 
     def start(self) -> None:
+        self.scheduler.add_job(self._tick_desk_outbox, "interval", seconds=20, id="desk_outbox_tick")
         self.scheduler.add_job(self._tick, "interval", seconds=60, id="routine_tick")
         self.scheduler.add_job(self._tick_wellness, "interval", seconds=60, id="wellness_tick")
         self.scheduler.add_job(self._tick_bills, "cron", hour=9, minute=0, id="bills_ping")
@@ -99,6 +101,164 @@ class ReminderScheduler:
 
     async def _tick_calendar_alerts(self) -> None:
         await calendar_service.process_calendar_alerts_tick(self.conn, self.bot)
+
+    async def _tick_desk_outbox(self, now_utc: datetime.datetime | None = None) -> int:
+        """Drain a bounded set of due Desk batches on an isolated DB connection."""
+        now_value = now_utc or datetime.datetime.utcnow()
+        now = now_value.astimezone(datetime.timezone.utc).replace(tzinfo=None) if now_value.tzinfo else now_value
+        from db.database import independent_connection
+        async with independent_connection(self.conn) as writer:
+            delivered = 0
+            for _ in range(50):
+                delivered += await self._deliver_desk_outbox_group(writer, now)
+                # A zero result can mean a suppressed/deferred group was
+                # processed. Continue only while another eligible row exists.
+                cur = await writer.execute(
+                    "SELECT 1 FROM desk_outbox WHERE (status='pending' AND deliver_after_utc<=?) "
+                    "OR (status='sending' AND last_error LIKE 'lease:%' AND substr(last_error,7)<=?) LIMIT 1",
+                    (now.strftime("%Y-%m-%dT%H:%M:%SZ"), (now - datetime.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")),
+                )
+                if not await cur.fetchone():
+                    break
+            return delivered
+
+    async def _deliver_desk_outbox_group(self, writer, now: datetime.datetime) -> int:
+        """Atomically claim and process exactly one priority-ordered group."""
+        stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        lease_before = (now - datetime.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # A short lease prevents two scheduler processes from delivering the
+        # same rows while allowing a crashed process's claim to be recovered.
+        await writer.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await writer.execute(
+                "SELECT id,batch_key,deliver_after_utc FROM desk_outbox WHERE (status='pending' AND deliver_after_utc<=?) "
+                "OR (status='sending' AND last_error LIKE 'lease:%' AND substr(last_error,7)<=?) "
+                "ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,deliver_after_utc,id LIMIT 1",
+                (stamp, lease_before),
+            )
+            candidate = await cursor.fetchone()
+            ids = []
+            if candidate:
+                if candidate["batch_key"]:
+                    grouped = await writer.execute(
+                        "SELECT id FROM desk_outbox WHERE batch_key=? AND deliver_after_utc=? AND "
+                        "((status='pending' AND deliver_after_utc<=?) OR (status='sending' AND last_error LIKE 'lease:%' AND substr(last_error,7)<=?))",
+                        (candidate["batch_key"], candidate["deliver_after_utc"], stamp, lease_before),
+                    )
+                    ids = [int(row["id"]) for row in await grouped.fetchall()]
+                else:
+                    ids = [int(candidate["id"])]
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                await writer.execute(
+                    f"UPDATE desk_outbox SET status='sending',last_error=? WHERE id IN ({marks}) AND status IN ('pending','sending')",
+                    (f"lease:{stamp}", *ids),
+                )
+            await writer.commit()
+        except Exception:
+            await writer.rollback()
+            raise
+        if not ids:
+            return 0
+
+        marks = ",".join("?" for _ in ids)
+        cur = await writer.execute(
+            f"SELECT o.*,l.user_id AS linked_user_id,u.telegram_id,u.timezone,u.pause_until,u.quiet_mode,u.sleep_mode_enabled,"
+            f"u.sleep_target_sleep,u.sleep_target_wake,u.sleep_time,u.wake_up_time,u.sleep_confirmed_at "
+            f"FROM desk_outbox o JOIN users u ON u.id=o.user_id LEFT JOIN desk_links l ON l.user_id=o.user_id AND l.enabled=1 WHERE o.id IN ({marks}) AND o.status='sending' AND o.last_error=? "
+            "ORDER BY o.user_id,o.batch_key,o.deliver_after_utc,o.id", (*ids, f"lease:{stamp}"),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        unlinked_ids = [int(row["id"]) for row in rows if row.get("linked_user_id") is None]
+        if unlinked_ids:
+            unlinked_marks = ",".join("?" for _ in unlinked_ids)
+            await writer.execute(
+                f"UPDATE desk_outbox SET status='suppressed_unlinked',last_error='' WHERE id IN ({unlinked_marks}) AND status='sending' AND last_error=?",
+                (*unlinked_ids, f"lease:{stamp}"),
+            )
+            await writer.commit()
+        rows = [row for row in rows if row.get("linked_user_id") is not None]
+        # Group only teacher submissions that share both batch key and deadline.
+        groups: dict[tuple, list[dict]] = {}
+        for row in rows:
+            key = (row["user_id"], row["batch_key"], row["deliver_after_utc"]) if row["batch_key"] else (row["id"],)
+            groups.setdefault(key, []).append(row)
+
+        sent_count = 0
+        for batch in groups.values():
+            first = batch[0]
+            urgent = first["priority"] == "urgent"
+            user = dict(first)
+            user["id"] = int(first["user_id"])
+            actual_user = await repo.get_user(writer, int(first["user_id"]))
+            if actual_user:
+                user.update(dict(actual_user))
+            local_date = local_date_str(now, user.get("timezone") or "UTC")
+            ids_here = [int(row["id"]) for row in batch]
+            id_marks = ",".join("?" for _ in ids_here)
+            if not urgent and user.get("pause_until") and local_date <= str(user["pause_until"]):
+                await writer.execute(
+                    f"UPDATE desk_outbox SET status='suppressed_pause',last_error='' WHERE id IN ({id_marks}) AND status='sending' AND last_error=?",
+                    (*ids_here, f"lease:{stamp}"),
+                )
+                await writer.commit()
+                continue
+            confirmed_sleep = pulse_service._confirmed_sleep_active(user, now)
+            if not urgent and (_sleep_window_active(user, now) or confirmed_sleep):
+                tz = tzinfo_from_string(user.get("timezone") or "UTC")
+                local_now = now.replace(tzinfo=datetime.timezone.utc).astimezone(tz)
+                wake = user.get("wake_up_time") or "08:00"
+                try:
+                    hour, minute = map(int, wake.split(":"))
+                    wake_local = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    # If the configured wake time has passed but a shifted
+                    # sleep target still keeps the user asleep, use that
+                    # same-day target before rolling to tomorrow.
+                    if wake_local <= local_now:
+                        target_wake = user.get("sleep_target_wake") or ""
+                        try:
+                            target_hour, target_minute = map(int, target_wake.split(":"))
+                            shifted_wake = local_now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+                        except (TypeError, ValueError):
+                            shifted_wake = wake_local
+                        wake_local = shifted_wake if shifted_wake > local_now else wake_local + datetime.timedelta(days=1)
+                    defer_local = wake_local + datetime.timedelta(minutes=5)
+                    defer = defer_local.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    await writer.execute(
+                        f"UPDATE desk_outbox SET status='pending',deliver_after_utc=?,last_error='' WHERE id IN ({id_marks}) AND status='sending' AND last_error=?",
+                        (defer, *ids_here, f"lease:{stamp}"),
+                    )
+                    await writer.commit()
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            text = "\n".join(str(row["text"]) for row in batch)
+            # Telegram caps text at 4096 characters; leave room for a clear
+            # truncation marker when several teacher submissions were grouped.
+            if len(text) > 4000:
+                text = text[:3980].rstrip() + "…\n(Остальные сдачи доступны в Desk.)"
+            button = first.get("button_label") or "Открыть"
+            markup = None
+            if first.get("url"):
+                markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button, url=first["url"])]] )
+            ok = await self._safe_send_message(
+                user, local_date, text, reply_markup=markup, parse_mode=None,
+                disable_notification=bool(not urgent and user.get("quiet_mode")),
+            )
+            if ok:
+                await writer.execute(
+                    f"UPDATE desk_outbox SET status='sent',sent_at=?,attempts=attempts+1,last_error='' WHERE id IN ({id_marks}) AND status='sending' AND last_error=?",
+                    (stamp, *ids_here, f"lease:{stamp}"),
+                )
+                sent_count += len(batch)
+            else:
+                await writer.execute(
+                    f"UPDATE desk_outbox SET attempts=attempts+1,status=CASE WHEN attempts+1>=5 THEN 'failed' ELSE 'pending' END,"
+                    f"deliver_after_utc=?,last_error='telegram_send_failed' WHERE id IN ({id_marks}) AND status='sending' AND last_error=?",
+                    ((now + datetime.timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ"), *ids_here, f"lease:{stamp}"),
+                )
+            await writer.commit()
+        return sent_count
 
     async def _safe_send_message(
         self,
@@ -193,6 +353,8 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user_row in users:
             user = dict(user_row)
+            if is_student_mode(user):
+                continue
             local_date = local_date_str(now_utc, user["timezone"])
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
@@ -534,6 +696,7 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            student_mode = is_student_mode(user)
             local_date = local_date_str(now_utc, user["timezone"])
             if user["pause_until"] and local_date <= (user["pause_until"] or ""):
                 continue
@@ -592,7 +755,7 @@ class ReminderScheduler:
                             )
                             wellness = await repo.get_wellness(self.conn, user["id"])
             # Meal reminders
-            if wellness.get("meal_enabled"):
+            if wellness.get("meal_enabled") and not student_mode:
                 for t in meal_times:
                     key = f"{local_date}-{t}"
                     if wellness.get("meal_last_key") == key:
@@ -641,6 +804,8 @@ class ReminderScheduler:
         now_utc = datetime.datetime.utcnow()
         for user in users:
             user = dict(user)
+            if is_student_mode(user):
+                continue
             local_date = local_date_str(now_utc, user["timezone"])
             if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
                 continue
@@ -661,6 +826,8 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            if is_student_mode(user):
+                continue
             local_date = local_date_str(now_utc, user["timezone"])
             if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
                 continue
@@ -712,6 +879,8 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            if is_student_mode(user):
+                continue
             local_date = local_date_str(now_utc, user["timezone"])
             if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
                 continue
@@ -757,6 +926,8 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            if is_student_mode(user):
+                continue
             local_date = local_date_str(now_utc, user["timezone"])
             if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
                 continue
@@ -794,6 +965,8 @@ class ReminderScheduler:
         users = await repo.list_users(self.conn)
         for user in users:
             user = dict(user)
+            if is_student_mode(user):
+                continue
             today = local_date_str(now_utc, user["timezone"])
             if user.get("pause_until") and today <= (user.get("pause_until") or ""):
                 continue

@@ -12,6 +12,7 @@ from utils.menu_match import is_single_clause_reminder, looks_like_expense
 from utils.time import local_date_str
 from utils.user import ensure_user
 from utils.nlp import match_simple_intent
+from utils.profile import is_student_mode
 
 router = Router()
 
@@ -43,6 +44,8 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         return
     text_original = message.text or ""
     text = text_original.lower()
+    profile = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    student = is_student_mode(profile)
     # Простые односоставные напоминания уже обработаны в handlers/custom_reminders.py.
     if is_single_clause_reminder(text_original):
         return
@@ -60,7 +63,7 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
             await repo.upsert_user_task(db, user["id"], target_task["routine_id"], today, status=status_map[intent])
             if intent == "done":
                 await repo.add_points(db, user["id"], 5, local_date=today)
-            await message.answer(f"Отметила рутину как {intent}.", reply_markup=main_menu_keyboard())
+            await message.answer(f"Отметила рутину как {intent}.", reply_markup=main_menu_keyboard(profile))
             return
         # если нет рутины — пытаемся с напоминаниями
         custom = await repo.list_custom_reminders(db, user["id"])
@@ -75,7 +78,7 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
             )
             if intent == "done":
                 await repo.add_points(db, user["id"], 3, local_date=today)
-            await message.answer(f"Отметила: {c['title']} — {intent}.", reply_markup=main_menu_keyboard())
+            await message.answer(f"Отметила: {c['title']} — {intent}.", reply_markup=main_menu_keyboard(profile))
             return
         # если вообще нечего отмечать — падаем дальше по логике
 
@@ -86,7 +89,7 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         # Если FSM не активен, просто сообщим пользователю
         await message.answer(
             "Это похоже на время. Если ты хотела изменить время подъёма/отбоя, зайди в Настройки (⚙️).",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(profile),
         )
         return
 
@@ -97,7 +100,7 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         and len([p for p in re.split(r"[.!?;]+", text_original) if p.strip()]) <= 1
         and not any(k in text for k in ("напом", "устал", "придумал", "иде", "надо", "нужно", "?"))
     )
-    pantry_match = is_single_sentence and any(re.search(p, text) for p in pantry_patterns)
+    pantry_match = not student and is_single_sentence and any(re.search(p, text) for p in pantry_patterns)
     if pantry_match:
         # Извлекаем продукты из текста
         cleaned = text
@@ -122,12 +125,12 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
             await message.answer(
                 f"Добавила в кладовку: {items_str}.{extra}\n"
                 f"Посмотреть всё можно в 🍽 Еда → 📦 Кладовка.",
-                reply_markup=main_menu_keyboard(),
+                reply_markup=main_menu_keyboard(profile),
             )
             return
 
     # траты
-    if looks_like_expense(text_original):
+    if not student and looks_like_expense(text_original):
         amount = _extract_amount(text)
         if amount is None:
             await handle_free_text_inbox(message, db)
@@ -152,7 +155,7 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         
         user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
         await repo.add_expense(db, user["id"], amount, category)
-        await message.answer(f"Записала трату: {amount:.0f} ₽ ({category}).", reply_markup=main_menu_keyboard())
+        await message.answer(f"Записала трату: {amount:.0f} ₽ ({category}).", reply_markup=main_menu_keyboard(profile))
         return
 
     # Все остальные свободные сообщения разбираем через единый голосовой/текстовый inbox

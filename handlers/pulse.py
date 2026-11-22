@@ -182,7 +182,7 @@ async def cb_pulse_done(callback: types.CallbackQuery, db) -> None:
     karma = res["karma"]
     score = int(karma.get("score_after") or 70)
     delta = int(karma.get("delta") or 0)
-    mode = karma.get("mode") or karma_service.get_karma_mode(score)
+    mode = karma.get("mode") or karma_service.get_karma_mode(score, user)
     sign = f"+{delta}" if delta > 0 else str(delta)
 
     if res.get("is_wake"):

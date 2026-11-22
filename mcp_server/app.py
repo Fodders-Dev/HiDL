@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import hashlib
+import hmac
 import html
 import json
 import secrets
+import time
 from typing import Any, Optional
 
 from aiohttp import web
 import aiosqlite
 
-from config import MCPSettings, get_mcp_settings
+from config import MCPSettings, get_mcp_settings, DeskIntegrationSettings, get_desk_settings
+from db.database import connect
+from services import desk_service
 from services import calendar_service
 from mcp_server.oauth import (
     handle_authorization_server_metadata,
@@ -33,6 +39,109 @@ from mcp_server.tools import (
 
 _SUPPORTED_PROTOCOL_VERSIONS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 _DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+
+
+async def _desk_auth(request: web.Request) -> tuple[bool, bytes, web.Response | None]:
+    cfg: DeskIntegrationSettings = request.app["desk_settings"]
+    if not cfg.webhook_secret:
+        return False, b"", web.json_response({"ok": False, "error": "integration_not_configured"}, status=503)
+    raw = await request.read()
+    stamp = request.headers.get("X-Desk-Timestamp", "")
+    signature = request.headers.get("X-Desk-Signature", "")
+    if not stamp or len(stamp) > 12 or not stamp.isascii() or not stamp.isdigit():
+        return False, raw, web.json_response({"ok": False, "error": "invalid_signature"}, status=401)
+    stamp_num = int(stamp)
+    if abs(int(time.time()) - stamp_num) > 300:
+        return False, raw, web.json_response({"ok": False, "error": "invalid_signature"}, status=401)
+    expected = "sha256=" + hmac.new(cfg.webhook_secret.encode("utf-8"), stamp.encode("ascii") + b"." + raw, hashlib.sha256).hexdigest()
+    if not signature.isascii() or not hmac.compare_digest(expected, signature):
+        return False, raw, web.json_response({"ok": False, "error": "invalid_signature"}, status=401)
+    return True, raw, None
+
+
+async def _desk_connection(request: web.Request):
+    path = request.app.get("desk_database_path")
+    if path is None:
+        rows = await request.app["db_conn"].execute_fetchall("PRAGMA database_list")
+        path = (rows[0]["file"] if rows else "") or ":memory:"
+        request.app["desk_database_path"] = path
+    if path == ":memory:":
+        return request.app["db_conn"], False
+    return await connect(path), True
+
+
+async def handle_desk_link_tokens(request: web.Request) -> web.Response:
+    ok, raw, failure = await _desk_auth(request)
+    if not ok:
+        return failure
+    if not request.app["desk_settings"].bot_username:
+        return web.json_response({"ok": False, "error": "integration_not_configured"}, status=503)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        if not isinstance(body, dict):
+            raise ValueError("invalid_body")
+        conn, owned = await _desk_connection(request)
+        try:
+            result = await desk_service.create_link_token(
+                conn, desk_user_id=body.get("deskUserId"), role=body.get("role"),
+                display_name=body.get("displayName"), timezone=body.get("timezone"),
+                settings=request.app["desk_settings"],
+            )
+        finally:
+            if owned:
+                await conn.close()
+        return web.json_response({"ok": True, **result})
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc) or "invalid_body"}, status=400)
+
+
+async def handle_desk_link_get(request: web.Request) -> web.Response:
+    ok, _, failure = await _desk_auth(request)
+    if not ok:
+        return failure
+    conn, owned = await _desk_connection(request)
+    try:
+        link = await desk_service.get_link_for_desk_user(conn, request.match_info["deskUserId"])
+    finally:
+        if owned:
+            await conn.close()
+    if not link:
+        return web.json_response({"linked": False})
+    return web.json_response({"linked": True, "role": link["role"], "linkedAt": link["linked_at"]})
+
+
+async def handle_desk_link_delete(request: web.Request) -> web.Response:
+    ok, _, failure = await _desk_auth(request)
+    if not ok:
+        return failure
+    conn, owned = await _desk_connection(request)
+    try:
+        unlinked = await desk_service.unlink_desk_user(conn, request.match_info["deskUserId"])
+    finally:
+        if owned:
+            await conn.close()
+    return web.json_response({"ok": True, "unlinked": unlinked})
+
+
+async def handle_desk_webhook(request: web.Request) -> web.Response:
+    ok, raw, failure = await _desk_auth(request)
+    if not ok:
+        return failure
+    event_header = request.headers.get("X-Desk-Event-Id", "")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        desk_service.validate_envelope(payload, event_header)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc) or "invalid_envelope"}, status=400)
+    conn, owned = await _desk_connection(request)
+    try:
+        result = await desk_service.ingest_event(conn, payload, settings=request.app["desk_settings"])
+    finally:
+        if owned:
+            await conn.close()
+    if result.get("not_linked"):
+        return web.json_response({"ok": False, "error": "user_not_linked"}, status=404)
+    return web.json_response({"ok": True, "duplicate": bool(result.get("duplicate"))})
 
 
 def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
@@ -125,7 +234,10 @@ async def _dispatch_jsonrpc(
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler) -> web.StreamResponse:
-    if request.method == "OPTIONS":
+    if request.method == "OPTIONS" and request.path.startswith("/integrations/desk/"):
+        valid, _, failure = await _desk_auth(request)
+        resp: web.StreamResponse = web.Response(status=204) if valid else failure
+    elif request.method == "OPTIONS":
         resp: web.StreamResponse = web.Response(status=204)
     else:
         resp = await handler(request)
@@ -134,7 +246,7 @@ async def cors_middleware(request: web.Request, handler) -> web.StreamResponse:
     resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = (
-        "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version"
+        "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, X-Desk-Timestamp, X-Desk-Signature, X-Desk-Event-Id"
     )
     resp.headers["Access-Control-Expose-Headers"] = "Mcp-Session-Id, WWW-Authenticate"
     return resp
@@ -301,6 +413,8 @@ def create_mcp_app(
     cfg = settings or get_mcp_settings()
     app = web.Application(middlewares=[cors_middleware])
     app["db_conn"] = db_conn
+    app["desk_database_path"] = None
+    app["desk_settings"] = get_desk_settings()
     app["mcp_settings"] = cfg
     app["mcp_csrf_key"] = secrets.token_bytes(32)
     app["mcp_shutting_down"] = False
@@ -314,6 +428,11 @@ def create_mcp_app(
     app.router.add_get("/privacy", handle_privacy)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/gcal/callback", handle_gcal_callback)
+
+    app.router.add_post("/integrations/desk/link-tokens", handle_desk_link_tokens)
+    app.router.add_get("/integrations/desk/links/{deskUserId}", handle_desk_link_get)
+    app.router.add_delete("/integrations/desk/links/{deskUserId}", handle_desk_link_delete)
+    app.router.add_post("/integrations/desk/webhook", handle_desk_webhook)
 
     # RFC 9728 Protected Resource Metadata & RFC 8414 Authorization Server Metadata
     app.router.add_get("/.well-known/oauth-protected-resource", handle_protected_resource_metadata)

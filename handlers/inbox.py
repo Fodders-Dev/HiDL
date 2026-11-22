@@ -47,6 +47,12 @@ def _load_payload(action: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
+async def _existing_menu_user(db, telegram_id: int) -> dict[str, Any] | None:
+    """Read a profile for reply-menu rendering without creating a user."""
+    row = await repo.get_user_by_telegram_id(db, telegram_id)
+    return dict(row) if row else None
+
+
 async def handle_free_text_inbox(message: types.Message, db) -> None:
     """Единая точка входа для произвольного текста из natural_handler."""
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -61,7 +67,7 @@ async def handle_free_text_inbox(message: types.Message, db) -> None:
     reply_text = f"{night_notice}\n\n{outcome.reply_text}" if night_notice else outcome.reply_text
     await message.answer(
         reply_text,
-        reply_markup=outcome.reply_markup or main_menu_keyboard(),
+        reply_markup=outcome.reply_markup or main_menu_keyboard(user),
     )
 
 
@@ -90,7 +96,7 @@ async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> N
     reply_text = f"{night_notice}\n\n{outcome.reply_text}" if night_notice else outcome.reply_text
     await message.answer(
         reply_text,
-        reply_markup=outcome.reply_markup or main_menu_keyboard(),
+        reply_markup=outcome.reply_markup or main_menu_keyboard(user),
     )
 
 
@@ -130,7 +136,7 @@ def _build_edit_list_view(
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _build_item_detail_view(action: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
+def _build_item_detail_view(action: dict[str, Any], user: dict[str, Any] | None = None) -> tuple[str, InlineKeyboardMarkup]:
     kind = action.get("item_kind") or "diary"
     icon, label = inbox_service.KIND_LABELS.get(kind, ("📝", "Запись"))
     payload = _load_payload(action)
@@ -155,7 +161,7 @@ def _build_item_detail_view(action: dict[str, Any]) -> tuple[str, InlineKeyboard
     reclass_btns = [
         InlineKeyboardButton(text=lbl, callback_data=f"inbox:reclass:{aid}:{target_k}")
         for target_k, lbl in reclass_targets
-        if target_k != kind
+        if target_k != kind and not (target_k == "shopping" and user and user.get("profile_mode") == "student")
     ]
     rows: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(reclass_btns), 2):
@@ -217,7 +223,7 @@ async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         if not act or act.get("status") == "undone":
             await callback.answer("Пункт не найден.", show_alert=True)
             return
-        text, kb = _build_item_detail_view(act)
+        text, kb = _build_item_detail_view(act, user)
         await safe_edit(callback.message, text, reply_markup=kb)
         await callback.answer()
         return
@@ -229,7 +235,7 @@ async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         if not updated:
             await callback.answer("Не удалось изменить тип.", show_alert=True)
             return
-        text, kb = _build_item_detail_view(updated)
+        text, kb = _build_item_detail_view(updated, user)
         await safe_edit(callback.message, text, reply_markup=kb)
         await callback.answer("Перенесла")
         return
@@ -437,18 +443,18 @@ async def inbox_rename_input(message: types.Message, state: FSMContext, db) -> N
             text, kb = _build_edit_list_view(int(inbox_id), actions)
             await message.answer(text, reply_markup=kb)
         else:
-            await message.answer("Отменила правку.", reply_markup=main_menu_keyboard())
+            await message.answer("Отменила правку.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     await state.clear()
     if not aid:
-        await message.answer("Не нашла пункт для правки.", reply_markup=main_menu_keyboard())
+        await message.answer("Не нашла пункт для правки.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     updated = await inbox_service.rename_inbox_action(db, user, int(aid), new_title)
     if not updated:
-        await message.answer("Пункт уже удалён или не найден.", reply_markup=main_menu_keyboard())
+        await message.answer("Пункт уже удалён или не найден.", reply_markup=main_menu_keyboard(user))
         return
-    text, kb = _build_item_detail_view(updated)
+    text, kb = _build_item_detail_view(updated, user)
     await message.answer(text, reply_markup=kb)
 
 
@@ -460,17 +466,17 @@ async def inbox_clarify_when_input(message: types.Message, state: FSMContext, db
     raw_input = (message.text or "").strip()
     if raw_input.lower() in {"отмена", "отменить"}:
         await state.clear()
-        await message.answer("Отменила уточнение.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила уточнение.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     if not aid:
         await state.clear()
-        await message.answer("Черновик не найден.", reply_markup=main_menu_keyboard())
+        await message.answer("Черновик не найден.", reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)))
         return
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     act = await repo.get_inbox_action(db, user["id"], int(aid))
     if not act:
         await state.clear()
-        await message.answer("Уточнение не найдено.", reply_markup=main_menu_keyboard())
+        await message.answer("Уточнение не найдено.", reply_markup=main_menu_keyboard(user))
         return
 
     payload = _load_payload(act)
@@ -498,18 +504,18 @@ async def inbox_clarify_when_input(message: types.Message, state: FSMContext, db
         resolved_time=sched.resolved_time,
     )
     if not resolved:
-        await message.answer("Не удалось сохранить напоминание.", reply_markup=main_menu_keyboard())
+        await message.answer("Не удалось сохранить напоминание.", reply_markup=main_menu_keyboard(user))
         return
     inbox_id = int(resolved["inbox_message_id"])
     row = await repo.get_inbox_message(db, user["id"], inbox_id)
     actions = await repo.list_inbox_actions(db, user["id"], inbox_id, include_undone=False)
     if row:
         text, kb = inbox_service.render_inbox_summary(row, actions, llm_error=row.get("llm_error") or None)
-        await message.answer(text, reply_markup=kb or main_menu_keyboard())
+        await message.answer(text, reply_markup=kb or main_menu_keyboard(user))
     else:
         await message.answer(
             f"🔔 Поставила напоминание на {format_date_display(sched.resolved_date)} {sched.resolved_time}.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user),
         )
 
 

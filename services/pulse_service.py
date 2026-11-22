@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from db import repositories as repo
 from services import calendar_service, karma_service
 from utils.time import format_time_local, local_date_str, parse_hhmm, tzinfo_from_string
+from utils.profile import is_student_mode
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -160,14 +161,11 @@ def compute_daily_slots(
     winddown_rel = max(dinner_rel + 15, sleep_rel - 60)
     bedtime_rel = max(winddown_rel + 15, sleep_rel - 15)
 
-    specs = [
-        ("wake", "sleep", wake_min),
-        ("lunch", "food", lunch_rel),
-        ("afternoon", "tasks", afternoon_rel),
-        ("dinner", "food", dinner_rel),
-        ("winddown", "tasks", winddown_rel),
-        ("bedtime", "sleep", bedtime_rel),
-    ]
+    specs = [("wake", "sleep", wake_min), ("afternoon", "tasks", afternoon_rel),
+             ("winddown", "tasks", winddown_rel), ("bedtime", "sleep", bedtime_rel)]
+    if not is_student_mode(user):
+        specs.insert(1, ("lunch", "food", lunch_rel))
+        specs.insert(3, ("dinner", "food", dinner_rel))
     out: List[Dict[str, Any]] = []
     for slot_key, domain, offset_min in specs:
         sched_utc = _local_minutes_to_utc(local_date, offset_min, tz)
@@ -250,6 +248,7 @@ def build_pulse_message(
     level: int,
     is_snooze_reminder: bool = False,
     context: Optional[Dict[str, Any]] = None,
+    user: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     """Собрать текст и кнопки для чек-ина Пульса с учётом кармы и уровня эскалации."""
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -259,10 +258,12 @@ def build_pulse_message(
     domain = str(checkin.get("domain") or "tasks")
     meta = _load_meta(checkin)
     score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
-    mode = karma_service.get_karma_mode(score)
+    mode = karma_service.get_karma_mode(score, user)
+    if is_student_mode(user):
+        level = 1
     mode_code = mode["code"]
     ctx = context or {}
-    debt_note = karma_service.domain_debt_callout(karma_state, domain=domain)
+    debt_note = "" if is_student_mode(user) else karma_service.domain_debt_callout(karma_state, domain=domain)
     last_summary = str(karma_state.get("last_event_summary") or "")
 
     header_badge = f"{mode['emoji']} Карма {score}/100"
@@ -626,7 +627,7 @@ async def confirm_bedtime(
         karma_res = {
             "score_after": int(state.get("score") or 70),
             "delta": 0,
-            "mode": karma_service.get_karma_mode(int(state.get("score") or 70)),
+            "mode": karma_service.get_karma_mode(int(state.get("score") or 70), user),
         }
     else:
         karma_res = await karma_service.record_karma_event(
@@ -874,6 +875,8 @@ async def check_night_violation(
     now_utc: Optional[datetime.datetime] = None,
 ) -> Optional[str]:
     """Поймать пользователя за ночным онлайном после подтверждённого отбоя."""
+    if is_student_mode(user):
+        return None
     if not user.get("pulse_enabled", 1):
         return None
     confirmed_at = _parse_iso_utc(user.get("sleep_confirmed_at"))
@@ -989,7 +992,7 @@ async def send_test_pulse_ping(
         )
 
     state = await repo.get_or_create_karma_state(db, user_id)
-    text, kb = build_pulse_message(checkin, state, level=1, is_snooze_reminder=False)
+    text, kb = build_pulse_message(checkin, state, level=1, is_snooze_reminder=False, user=user)
     await bot.send_message(chat_id=int(user["telegram_id"]), text=text, reply_markup=kb)
     await repo.update_pulse_checkin(
         db,
@@ -1092,6 +1095,9 @@ async def process_pulse_tick(
             continue
 
         slot_key = str(checkin.get("slot_key") or "")
+        if is_student_mode(user) and slot_key in {"lunch", "dinner"}:
+            await repo.update_pulse_checkin(db, int(checkin["id"]), status="skipped", resolved_at_utc=now.isoformat())
+            continue
         if _confirmed_sleep_active(user, now) and slot_key != "wake":
             continue
 
@@ -1108,6 +1114,9 @@ async def process_pulse_tick(
 
         status = str(checkin.get("status") or "pending")
         ping_count = int(checkin.get("ping_count") or 0)
+        if is_student_mode(user) and status == "pending" and ping_count >= 1:
+            await repo.update_pulse_checkin(db, int(checkin["id"]), status="skipped", resolved_at_utc=now.isoformat())
+            continue
         sick_active = karma_service.is_sick_freeze_active(user, now)
         cid = int(checkin["id"])
 
@@ -1153,6 +1162,7 @@ async def process_pulse_tick(
             level=level,
             is_snooze_reminder=is_snooze,
             context=slot_ctx,
+            user=user,
         )
         sent = await _safe_bot_send(bot, user, local_date, text, reply_markup=kb)
         if not sent:

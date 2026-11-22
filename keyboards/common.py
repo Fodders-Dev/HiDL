@@ -4,15 +4,24 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+from utils.profile import is_student_mode
 
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
+def main_menu_keyboard(user: dict | None = None) -> ReplyKeyboardMarkup:
+    if is_student_mode(user):
+        rows = [
+            [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📚 Учёба / Desk")],
+            [KeyboardButton(text="🔔 Напоминания"), KeyboardButton(text="☕ Кафе фокуса")],
+            [KeyboardButton(text="😴 Сон и пауза"), KeyboardButton(text="⚙ Настройки")],
+        ]
+    else:
+        rows = [
             [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="🍽 Еда и покупки")],
             [KeyboardButton(text="🌙 Сон и карма"), KeyboardButton(text="🗓 Расписание")],
             [KeyboardButton(text="📓 Дневник"), KeyboardButton(text="⚙ Ещё")],
-        ],
+        ]
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
         resize_keyboard=True,
     )
 

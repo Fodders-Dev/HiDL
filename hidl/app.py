@@ -14,9 +14,11 @@ from handlers import (
     ask_mom,
     affirmations,
     custom_reminders,
+    desk,
     donate,
     knowledge,
     menu,
+    pause,
     schedule,
     finance,
     focus_cafe,
@@ -95,6 +97,8 @@ async def create_app(test_mode: bool = False) -> AppContext:
 
     # роутеры
     routers = (
+        desk.router,
+        pause.router,
         start.router,
         menu.router,
         pulse.router,

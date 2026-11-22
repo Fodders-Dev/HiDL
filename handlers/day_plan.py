@@ -1,4 +1,5 @@
 import datetime
+import html
 import logging
 from typing import List, Dict
 
@@ -12,6 +13,7 @@ from keyboards.common import main_menu_keyboard
 from utils.time import local_date_str
 from utils.user import ensure_user
 from utils.rows import rows_to_dicts
+from utils.profile import is_student_mode
 
 
 router = Router()
@@ -33,6 +35,18 @@ def _split_items(text: str) -> List[str]:
             if piece:
                 parts.append(piece)
     return parts
+
+
+def _plan_item_line(item: dict) -> str:
+    icon = "✅" if item.get("done") else "⬜️"
+    title = html.escape(str(item.get("title") or ""))
+    kind = " (важное)" if item.get("is_important") else ""
+    if str(item.get("external_key") or "").startswith("desk:"):
+        url = str(item.get("external_url") or "")
+        title = f"🎓 Desk · {title}"
+        if url.startswith(("https://", "http://")):
+            title = f'<a href="{html.escape(url, quote=True)}">{title}</a>'
+    return f"{icon} {title}{kind}"
 
 
 async def _save_plan(db, user_id: int, plan_date: str, important: List[str], extra: List[str]) -> None:
@@ -63,24 +77,22 @@ async def plan_tomorrow(message: types.Message, state: FSMContext, db) -> None:
         "Напиши 1–3 самых важных дела, которые точно хочешь успеть. "
         "Это не жёсткий список, а ориентир. Утром мы сможем что‑то убрать или добавить.\n"
         "Можно через запятую или с новой строки. Если ничего не приходит в голову — напиши «нет».",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
 
 
 @router.message(DayPlanState.important)
-async def plan_tomorrow_important(message: types.Message, state: FSMContext) -> None:
+async def plan_tomorrow_important(message: types.Message, state: FSMContext, db) -> None:
     text = (message.text or "").strip().lower()
     important: List[str] = []
     if text not in ("нет", "ничего", "no"):
         important = _split_items(message.text or "")
     await state.update_data(important=important)
     await state.set_state(DayPlanState.extra)
-    await message.answer(
-        "Теперь давай чуть по жизни.\n"
-        "Есть ли что-то по дому, здоровью или для себя? "
-        "Напиши 1–3 дела или «нет», если ничего добавлять не хочешь.",
-        reply_markup=main_menu_keyboard(),
-    )
+    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    prompt = ("Есть ли ещё учебное или личное дело? Напиши 1–3 пункта или «нет»." if is_student_mode(user)
+              else "Теперь давай чуть по жизни.\nЕсть ли что-то по дому, здоровью или для себя? Напиши 1–3 дела или «нет», если ничего добавлять не хочешь.")
+    await message.answer(prompt, reply_markup=main_menu_keyboard(user))
 
 
 @router.message(DayPlanState.extra)
@@ -110,7 +122,10 @@ async def plan_tomorrow_extra(message: types.Message, state: FSMContext, db) -> 
         for title in extra:
             lines.append(f"• {title}")
     lines.append("\nОстальное — бонус. Утром я напомню про этот план (+1 💎 за планирование).")
-    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
+    if is_student_mode(user):
+        lines = [line.replace("Дополнительно по жизни:", "Дополнительно:") for line in lines]
+        lines = [line.replace(" (+1 💎 за планирование)", "") for line in lines]
+    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard(user))
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("dplan:"))
@@ -150,9 +165,7 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             lines.append("Пока пусто.")
         else:
             for item in items:
-                icon = "✅" if item.get("done") else "⬜️"
-                kind = " (важное)" if item.get("is_important") else ""
-                lines.append(f"{icon} {item.get('title')}{kind}")
+                lines.append(_plan_item_line(item))
         
         # Интерактивные кнопки для текущей страницы
         kb_rows = []
@@ -245,7 +258,7 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         # Let's keep sending new message for input to avoid FSM confusion with old messages.
         await callback.message.answer(
             "Напиши одно дело, которое хочешь добавить к сегодняшнему плану.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user),
         )
         await callback.answer()
         return
@@ -298,9 +311,7 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
                 lines.append("Пока пусто.")
             else:
                 for item in items:
-                    icon = "✅" if item.get("done") else "⬜️"
-                    kind = " (важное)" if item.get("is_important") else ""
-                    lines.append(f"{icon} {item.get('title')}{kind}")
+                    lines.append(_plan_item_line(item))
             
             kb_rows = []
             for item in page_items:
@@ -348,7 +359,7 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             from utils.today import render_today
             text, kb = await render_today(db, user)
             try:
-                await callback.message.edit_text(text, reply_markup=kb or main_menu_keyboard())
+                await callback.message.edit_text(text, reply_markup=kb or main_menu_keyboard(user))
             except Exception:
                 pass
         return
@@ -369,9 +380,7 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         if not items:
             lines.append("Пока пусто.")
         for item in items:
-            icon = "✅" if item.get("done") else "⬜️"
-            kind = " (важное)" if item.get("is_important") else ""
-            lines.append(f"{icon} {item.get('title')}{kind}")
+            lines.append(_plan_item_line(item))
         kb = types.InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -402,5 +411,5 @@ async def day_plan_morning_add(message: types.Message, state: FSMContext, db) ->
     await state.clear()
     await message.answer(
         f"Добавила в план на сегодня: {text}.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )

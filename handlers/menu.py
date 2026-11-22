@@ -35,9 +35,11 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext) -
 
 @router.message(Command("menu"))
 @router.message(lambda m: match_menu_label(m.text, {"меню", "главное меню"}))
-async def show_menu(message: types.Message, state: FSMContext) -> None:
+async def show_menu(message: types.Message, state: FSMContext, db) -> None:
     await state.clear()
-    await message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+    row = await repo.get_user_by_telegram_id(db, message.from_user.id)
+    user = dict(row) if row else None
+    await message.answer("Главное меню:", reply_markup=main_menu_keyboard(user))
 
 
 @router.message(Command("today"))
@@ -47,7 +49,7 @@ async def cmd_today(message: types.Message, db, state: FSMContext) -> None:
     user_row = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     user = dict(user_row)
     text, kb = await render_today(db, user)
-    await message.answer(text, reply_markup=kb or main_menu_keyboard())
+    await message.answer(text, reply_markup=kb or main_menu_keyboard(user))
 
 
 @router.message(Command("settings"))
@@ -278,7 +280,8 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
         # одно нажатие включает щадящий день, повторный — предложит /resume.
         await wellness.gentle_button(callback.message, db)
     elif action == "tone":
-        await callback.message.answer("Тон общения: выбери стиль в настройках ниже.", reply_markup=main_menu_keyboard())
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        await callback.message.answer("Тон общения: выбери стиль в настройках ниже.", reply_markup=main_menu_keyboard(user))
     elif action == "wellness":
         from handlers import wellness
 

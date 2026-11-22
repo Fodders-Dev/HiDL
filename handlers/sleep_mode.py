@@ -66,11 +66,11 @@ def _sleep_cancel_keyboard(origin: str) -> InlineKeyboardMarkup:
     )
 
 
-async def _handle_sleep_cancel(message: types.Message, state: FSMContext) -> bool:
+async def _handle_sleep_cancel(message: types.Message, state: FSMContext, user: dict | None = None) -> bool:
     """Сбросить FSM режима сна при текстовой отмене."""
     if (message.text or "").strip().lower() in {"отмена", "назад"}:
         await state.clear()
-        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard(user))
         return True
     return False
 
@@ -162,8 +162,8 @@ async def sleep_toggle_callback(callback: types.CallbackQuery, state: FSMContext
 
 
 @router.message(SleepModeState.target_sleep, lambda m: m.text and not m.text.startswith("/"))
-async def sleep_set_target_sleep(message: types.Message, state: FSMContext) -> None:
-    if await _handle_sleep_cancel(message, state):
+async def sleep_set_target_sleep(message: types.Message, state: FSMContext, user: dict | None = None) -> None:
+    if await _handle_sleep_cancel(message, state, user):
         return
     data = await state.get_data()
     origin = data.get("sleep_origin", "main")
@@ -184,8 +184,8 @@ async def sleep_set_target_sleep(message: types.Message, state: FSMContext) -> N
 
 
 @router.message(SleepModeState.target_wake, lambda m: m.text and not m.text.startswith("/"))
-async def sleep_set_target_wake(message: types.Message, state: FSMContext, db) -> None:
-    if await _handle_sleep_cancel(message, state):
+async def sleep_set_target_wake(message: types.Message, state: FSMContext, db, user: dict | None = None) -> None:
+    if await _handle_sleep_cancel(message, state, user):
         return
     data = await state.get_data()
     origin = data.get("sleep_origin", "main")

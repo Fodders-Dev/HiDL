@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from db import repositories as repo
 from services import calendar_service, karma_service, pulse_service
 from utils.rows import rows_to_dicts
+from utils.profile import is_student_mode
 from utils.time import format_time_local, local_date_str, parse_hhmm
 
 DIET_LABELS = {
@@ -101,7 +102,7 @@ async def refresh_user_portrait_if_needed(
     )
     sleep_debt = int(karma_state.get("sleep_debt") or 0)
     sleep_streak = int(karma_state.get("sleep_streak") or 0)
-    if night_catches >= 1 or sleep_ignores >= 1 or sleep_debt >= 2:
+    if not is_student_mode(user) and (night_catches >= 1 or sleep_ignores >= 1 or sleep_debt >= 2):
         patterns.append("late_night_drift")
         bullets.append(
             f"• Сон: бывали срывы/поздний онлайн (ночных поимок: {night_catches}, долг сна: {sleep_debt})."
@@ -195,11 +196,13 @@ async def build_user_day_snapshot(
 
     karma_state = await repo.get_or_create_karma_state(db, user_id)
     score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
-    karma_mode = karma_service.get_karma_mode(score)
+    student = is_student_mode(user)
+    karma_mode = karma_service.get_karma_mode(score, user)
     sick_active = karma_service.is_sick_freeze_active(user, now)
 
     checkins = await repo.list_pulse_checkins_for_date(db, user_id, local_date)
-    slot_status = {str(c.get("slot_key")): str(c.get("status")) for c in checkins}
+    slot_status = {str(c.get("slot_key")): str(c.get("status")) for c in checkins
+                   if not student or c.get("slot_key") not in {"lunch", "dinner"}}
 
     plan_rows = rows_to_dicts(await repo.list_day_plan_items(db, user_id, local_date))
     pending_tasks = [p for p in plan_rows if not p.get("done")]
@@ -225,6 +228,8 @@ async def build_user_day_snapshot(
             patterns = []
     except Exception:
         patterns = []
+    if student:
+        patterns = [p for p in patterns if p != "late_night_drift"]
 
     return {
         "local_date": local_date,
@@ -246,10 +251,11 @@ async def build_user_day_snapshot(
         "reminders": reminders[:5],
         "events_today": events_today[:8],
         "events_tomorrow": events_tomorrow[:5],
-        "pantry_items": pantry_rows,
-        "shopping_unbought": shopping_rows,
-        "meal_plan_today": meal_plan_today,
+        "pantry_items": [] if student else pantry_rows,
+        "shopping_unbought": [] if student else shopping_rows,
+        "meal_plan_today": [] if student else meal_plan_today,
         "meal_profile": meal_profile,
+        "student_mode": student,
         "portrait_text": memory.get("portrait_text") or "",
         "patterns": patterns,
     }
@@ -258,6 +264,7 @@ async def build_user_day_snapshot(
 def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
     """Сформировать компактный контекст жизни пользователя и директиву тона для LLM."""
     mode = snapshot["karma_mode"]
+    student = bool(snapshot.get("student_mode"))
     mode_code = mode["code"]
     score = snapshot["karma_score"]
     state = snapshot["karma_state"]
@@ -268,6 +275,9 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         "strict": "Тон ответа: 😠 строгая мама — прямолинейно, с припоминанием просадок, без оскорблений.",
         "alarm": "Тон ответа: 🚨 жёсткий нажим и контроль (можно акценты КАПСОМ по делу срыва, без оскорблений).",
     }
+    if student:
+        tone_directives["strict"] = "Тон ответа: спокойный, бережный, без давления, стыда и нотаций."
+        tone_directives["alarm"] = tone_directives["strict"]
 
     debts = []
     for k, label in (("sleep", "сон"), ("food", "еда"), ("tasks", "дела"), ("hygiene", "гигиена")):
@@ -286,7 +296,7 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
     shop_str = ", ".join(shop_names) if shop_names else "пусто"
 
     slot_st = snapshot.get("slot_status") or {}
-    ate_note = (
+    ate_note = "" if student else (
         "обед/ужин закрыт"
         if slot_st.get("lunch") == "done" or slot_st.get("dinner") == "done"
         else "еда сегодня ещё не отмечена"
@@ -302,10 +312,13 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         "=== Снимок дня пользователя ===",
         f"Сейчас: {snapshot['local_date']} {snapshot['local_time']} ({snapshot['timezone']}), подъём {snapshot['wake_up_time']}, отбой {snapshot['sleep_time']} ({sleep_left_str}).",
         f"Карма: {score}/100 ({mode['emoji']} {mode['label']}), долги: {debts_str}. {tone_directives.get(mode_code, '')}",
-        f"Пульс: {ate_note}, ночной отбой={'подтверждён' if snapshot.get('sleep_confirmed') else 'нет'}, ЧП-заморозка={'да' if snapshot.get('sick_freeze_active') else 'нет'}.",
+        f"Пульс: {'спокойный ритм дня' if student else ate_note + ', ' + ('ночной отбой=подтверждён' if snapshot.get('sleep_confirmed') else 'ночной отбой=нет')}, ЧП-заморозка={'да' if snapshot.get('sick_freeze_active') else 'нет'}.",
         f"Задачи на сегодня (открыто {len(snapshot['pending_tasks'])}, закрыто {snapshot['done_tasks_count']}): {pending_str}.",
-        f"Питание: {DIET_LABELS.get(snapshot['meal_profile'], snapshot['meal_profile'])}. Холодильник: {pantry_str}. Покупки: {shop_str}.",
     ]
+    if student:
+        lines.append("Профиль: ученик. Тон спокойный и бережный; не дави, не стыди и не используй нотации или КАПС.")
+    else:
+        lines.append(f"Питание: {DIET_LABELS.get(snapshot['meal_profile'], snapshot['meal_profile'])}. Холодильник: {pantry_str}. Покупки: {shop_str}.")
     meal_plan_today = snapshot.get("meal_plan_today") or []
     if meal_plan_today:
         slot_names = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин"}
@@ -348,7 +361,7 @@ def format_portrait_card(
 ) -> str:
     """Сформировать HTML-карточку «🧠 Портрет привычек» для Telegram."""
     score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
-    mode = karma_service.get_karma_mode(score)
+    mode = karma_service.get_karma_mode(score, user)
     portrait = str(memory.get("portrait_text") or "").strip()
     refreshed = str(memory.get("last_refreshed_at") or "")[:16].replace("T", " ")
 

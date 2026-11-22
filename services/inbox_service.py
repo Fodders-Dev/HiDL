@@ -24,6 +24,7 @@ from services.inbox_parser import (
 from utils.pantry import format_quantity
 from utils.rows import rows_to_dicts
 from utils.time import format_date_display, local_date_str, parse_hhmm
+from utils.profile import is_student_mode
 
 KIND_LABELS = {
     "task": ("✅", "Задача"),
@@ -320,6 +321,8 @@ async def _persist_parsed_items(
 
     for item in parsed.items:
         kind = item.kind
+        if is_student_mode(user) and kind in {"shopping", "shopping_remove", "pantry_add", "pantry_remove", "pantry_use", "meal_done", "expense"}:
+            kind = "task" if kind == "shopping" else "diary"
         if kind == "task":
             item_id = await repo.add_day_plan_item(
                 db,
@@ -1165,6 +1168,12 @@ async def _build_query_response(
     recent_context: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, Optional[InlineKeyboardMarkup], dict[str, Any]]:
     qt = parsed.query_type
+    if is_student_mode(user) and qt in {"shopping", "pantry", "food"}:
+        return (
+            "В режиме «Ученик» бытовые списки скрыты. Если это идея или дело для себя, напиши её обычным сообщением — я сохраню в дневник или план.",
+            None,
+            {"query_type": "hidden_household"},
+        )
     if qt == "today":
         from utils.today import render_today
 
@@ -1919,6 +1928,8 @@ async def reclassify_inbox_action(
     *,
     now_utc: Optional[datetime.datetime] = None,
 ) -> Optional[dict[str, Any]]:
+    if is_student_mode(user) and new_kind == "shopping":
+        return None
     if new_kind not in {"task", "shopping", "diary", "idea", "done"}:
         return None
     action = await repo.get_inbox_action(db, user["id"], action_id)

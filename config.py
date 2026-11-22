@@ -176,6 +176,27 @@ class GoogleCalendarSettings:
         return bool(self.client_id and self.client_secret and self.redirect_uri)
 
 
+@dataclass(frozen=True)
+class DeskIntegrationSettings:
+    webhook_secret: str
+    bot_username: str
+    public_url: str
+    link_token_ttl_sec: int = 900
+    submit_batch_sec: int = 600
+    telegram_link_base_url: str = "https://t.me"
+
+
+def get_desk_settings() -> DeskIntegrationSettings:
+    return DeskIntegrationSettings(
+        webhook_secret=_env_str("DESK_WEBHOOK_SECRET"),
+        bot_username=_env_str("BOT_USERNAME").lstrip("@"),
+        public_url=_env_str("DESK_PUBLIC_URL").rstrip("/"),
+        link_token_ttl_sec=max(1, _env_int("DESK_LINK_TOKEN_TTL_SEC", 900)),
+        submit_batch_sec=max(0, _env_int("DESK_SUBMIT_BATCH_SEC", 600)),
+        telegram_link_base_url=_env_str("DESK_TELEGRAM_LINK_BASE_URL", "https://t.me").rstrip("/") or "https://t.me",
+    )
+
+
 def get_settings(require_bot_token: bool = True) -> Settings:
     """Return settings from environment variables."""
     bot_token = os.getenv("BOT_TOKEN", "")

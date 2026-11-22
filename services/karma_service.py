@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from db import repositories as repo
 from utils.time import format_time_local, local_date_str
+from utils.profile import is_student_mode
 
 SICK_FREEZE_MONTHLY_LIMIT = 2
 SICK_FREEZE_HOURS = 24
@@ -71,13 +72,18 @@ def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime.datetime]:
         return None
 
 
-def get_karma_mode(score: int) -> Dict[str, Any]:
+def get_karma_mode(score: int, user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Вернуть режим характера HiDL по текущему значению кармы 0–100."""
     clamped = max(0, min(100, int(score)))
     for mode in KARMA_MODES:
         if clamped >= mode["min_score"]:
-            return dict(mode)
-    return dict(KARMA_MODES[-1])
+            result = dict(mode)
+            break
+    else:
+        result = dict(KARMA_MODES[-1])
+    if is_student_mode(user) and result["code"] in {"strict", "alarm"}:
+        result.update(code="care", label="Спокойная забота", emoji="🙂", desc="Ровная поддержка без давления.")
+    return result
 
 
 def render_karma_bar(score: int) -> str:
@@ -222,12 +228,12 @@ async def record_karma_event(
     norm_domain = domain if domain in TRACKED_DOMAINS else "tasks"
     state = await repo.get_or_create_karma_state(db, user_id)
     old_score = int(state.get("score") if state.get("score") is not None else 70)
-    old_mode = get_karma_mode(old_score)
+    old_mode = get_karma_mode(old_score, user)
 
     frozen = delta < 0 and is_sick_freeze_active(user, now)
     actual_delta = 0 if frozen else int(delta)
     new_score = max(0, min(100, old_score + actual_delta))
-    new_mode = get_karma_mode(new_score)
+    new_mode = get_karma_mode(new_score, user)
 
     debt_col = f"{norm_domain}_debt"
     streak_col = f"{norm_domain}_streak"
@@ -298,7 +304,7 @@ def format_karma_screen(
     now = _naive_utc(now_utc)
     tz = user.get("timezone") or "UTC"
     score = int(state.get("score") if state.get("score") is not None else 70)
-    mode = get_karma_mode(score)
+    mode = get_karma_mode(score, user)
     bar = render_karma_bar(score)
 
     wd_wake = str(user.get("wake_up_time") or "08:00")

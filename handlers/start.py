@@ -3,11 +3,13 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import html
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils import texts
 from utils.time import is_valid_timezone, parse_hhmm, tzinfo_from_string
+from utils.profile import is_student_mode
 
 router = Router()
 
@@ -35,9 +37,14 @@ async def _handle_reg_cancel(message: types.Message, state: FSMContext) -> bool:
 async def cmd_start(message: types.Message, state: FSMContext, db) -> None:
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if user:
+        safe_name = html.escape(str(user["name"] or ""))
+        if is_student_mode(user):
+            greeting = f"С возвращением, {safe_name}! Продолжим с планом, занятиями или напоминаниями?"
+        else:
+            greeting = f"С возвращением, {safe_name}! Чем помочь сегодня?"
         await message.answer(
-            f"С возвращением, {user['name']}! Чем помочь сегодня?",
-            reply_markup=main_menu_keyboard(),
+            greeting,
+            reply_markup=main_menu_keyboard(dict(user)),
         )
         return
 
@@ -188,7 +195,17 @@ async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
 
 
 @router.message(Command("help"))
-async def cmd_help(message: types.Message) -> None:
+async def cmd_help(message: types.Message, db) -> None:
+    user_row = await repo.get_user_by_telegram_id(db, message.from_user.id)
+    user = dict(user_row) if user_row else None
+    if is_student_mode(user):
+        await message.answer(
+            "📅 Сегодня — план дня и напоминания.\n📚 Учёба / Desk — занятия и задания.\n"
+            "☕ Кафе фокуса — короткий старт работы.\n😴 Сон и пауза — бережный режим.\n"
+            "Любой текст или голос можно отправить сюда — я помогу разложить его по плану.",
+            reply_markup=main_menu_keyboard(user),
+        )
+        return
     await message.answer(
         "В обычной жизни достаточно кнопок меню внизу — команды учить не нужно.\n\n"
         "• 📅 Сегодня — план дня, рутины, прогресс\n"
@@ -196,9 +213,10 @@ async def cmd_help(message: types.Message) -> None:
         "• 🧹 Дом и 💰 Деньги — уборка по шагам, траты и счета\n"
         "• 🗓 Расписание и ☕ Кафе фокуса — слоты дня и таймер фокуса\n"
         "• 📓 Дневник (или просто текст/голос в чат) — разложу дела, мысли и напоминания\n\n"
+        "• 📚 /desk — занятия и задания из Fodder's Desk\n\n"
         "Полезные команды:\n"
         "/today — сегодня • /diary — дневник • /pantry — холодильник\n"
         "/reminders — напоминания • /sleep — сон • /settings — настройки\n"
         "/help_now — срочная поддержка, когда мало сил",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user),
     )
