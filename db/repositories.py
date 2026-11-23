@@ -1,6 +1,7 @@
 import datetime
 import json
 import re
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -4735,6 +4736,162 @@ async def list_schedule_events_range(
         (user_id, start_date, end_date),
     )
     return rows_to_dicts(await cur.fetchall())
+
+
+def _decode_recipe_json_list(raw: Any) -> List[Any]:
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _user_recipe_row_to_dict(row: Any) -> Dict[str, Any]:
+    d = row_to_dict(row)
+    return {
+        "id": str(d.get("recipe_key") or ""),
+        "db_id": int(d["id"]) if d.get("id") is not None else None,
+        "title": str(d.get("title") or ""),
+        "desc": str(d.get("desc") or ""),
+        "tags": [str(t) for t in _decode_recipe_json_list(d.get("tags_json")) if str(t).strip()],
+        "base_servings": max(1, int(d.get("base_servings") or 2)),
+        "time_minutes": max(1, int(d.get("time_minutes") or 20)),
+        "ingredients": [
+            i for i in _decode_recipe_json_list(d.get("ingredients_json"))
+            if isinstance(i, dict) and str(i.get("name") or "").strip()
+        ],
+        "steps": [str(s) for s in _decode_recipe_json_list(d.get("steps_json")) if str(s).strip()],
+        "source": str(d.get("source") or "ai_chef"),
+        "source_label": str(d.get("source_label") or ""),
+        "is_user_recipe": True,
+        "created_at": d.get("created_at"),
+        "updated_at": d.get("updated_at"),
+    }
+
+
+def generate_user_recipe_key() -> str:
+    """Сгенерировать короткий ключ рецепта, умещающийся в callback_data Telegram."""
+    return f"ur_{uuid.uuid4().hex[:10]}"
+
+
+async def upsert_user_recipe(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    recipe_key: Optional[str] = None,
+    title: str,
+    desc: str = "",
+    tags: Optional[List[str]] = None,
+    base_servings: int = 2,
+    time_minutes: int = 20,
+    ingredients: Optional[List[Dict[str, Any]]] = None,
+    steps: Optional[List[str]] = None,
+    source: str = "ai_chef",
+    source_label: str = "",
+) -> Dict[str, Any]:
+    """Сохранить или обновить личный рецепт пользователя в таблице user_recipes."""
+    now = utc_now_str()
+    clean_key = (recipe_key or "").strip() or generate_user_recipe_key()
+    clean_title = str(title or "Рецепт").strip()
+    clean_desc = str(desc or "").strip()
+    tags_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    ing_list = [i for i in (ingredients or []) if isinstance(i, dict) and str(i.get("name") or "").strip()]
+    steps_list = [str(s).strip() for s in (steps or []) if str(s).strip()]
+    serv = max(1, int(base_servings or 2))
+    t_min = max(1, int(time_minutes or 20))
+    await conn.execute(
+        """
+        INSERT INTO user_recipes (
+            user_id, recipe_key, title, desc, tags_json, base_servings, time_minutes,
+            ingredients_json, steps_json, source, source_label, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, recipe_key) DO UPDATE SET
+            title = excluded.title,
+            desc = excluded.desc,
+            tags_json = excluded.tags_json,
+            base_servings = excluded.base_servings,
+            time_minutes = excluded.time_minutes,
+            ingredients_json = excluded.ingredients_json,
+            steps_json = excluded.steps_json,
+            source = excluded.source,
+            source_label = excluded.source_label,
+            updated_at = excluded.updated_at
+        """,
+        (
+            user_id,
+            clean_key,
+            clean_title,
+            clean_desc,
+            json.dumps(tags_list, ensure_ascii=False),
+            serv,
+            t_min,
+            json.dumps(ing_list, ensure_ascii=False),
+            json.dumps(steps_list, ensure_ascii=False),
+            str(source or "ai_chef").strip(),
+            str(source_label or "").strip(),
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    return await get_user_recipe_by_key(conn, user_id, clean_key) or {}
+
+
+async def list_user_recipes(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    limit: int = 300,
+) -> List[Dict[str, Any]]:
+    """Вернуть личные рецепты пользователя (сначала свежие)."""
+    cur = await conn.execute(
+        """
+        SELECT * FROM user_recipes
+        WHERE user_id = ?
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?
+        """,
+        (user_id, max(1, int(limit or 300))),
+    )
+    return [_user_recipe_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def get_user_recipe_by_key(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    recipe_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Получить личный рецепт пользователя по ключу recipe_key."""
+    key = str(recipe_key or "").strip()
+    if not key:
+        return None
+    cur = await conn.execute(
+        "SELECT * FROM user_recipes WHERE user_id = ? AND recipe_key = ?",
+        (user_id, key),
+    )
+    row = await cur.fetchone()
+    return _user_recipe_row_to_dict(row) if row else None
+
+
+async def delete_user_recipe_by_key(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    recipe_key: str,
+) -> bool:
+    """Удалить личный рецепт пользователя."""
+    key = str(recipe_key or "").strip()
+    if not key:
+        return False
+    cur = await conn.execute(
+        "DELETE FROM user_recipes WHERE user_id = ? AND recipe_key = ?",
+        (user_id, key),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
 
 
 

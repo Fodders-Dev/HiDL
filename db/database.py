@@ -638,6 +638,28 @@ async def init_db(conn: aiosqlite.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_meal_plans_user_date
             ON meal_plans(user_id, plan_date);
 
+        CREATE TABLE IF NOT EXISTS user_recipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            recipe_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            desc TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            base_servings INTEGER NOT NULL DEFAULT 2,
+            time_minutes INTEGER NOT NULL DEFAULT 20,
+            ingredients_json TEXT NOT NULL DEFAULT '[]',
+            steps_json TEXT NOT NULL DEFAULT '[]',
+            source TEXT NOT NULL DEFAULT 'ai_chef',
+            source_label TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, recipe_key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_user_recipes_user_updated
+            ON user_recipes(user_id, updated_at);
+
         CREATE TABLE IF NOT EXISTS user_calendar_connections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -1321,6 +1343,28 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_meal_plans_user_date
             ON meal_plans(user_id, plan_date);
+
+        CREATE TABLE IF NOT EXISTS user_recipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            recipe_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            desc TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            base_servings INTEGER NOT NULL DEFAULT 2,
+            time_minutes INTEGER NOT NULL DEFAULT 20,
+            ingredients_json TEXT NOT NULL DEFAULT '[]',
+            steps_json TEXT NOT NULL DEFAULT '[]',
+            source TEXT NOT NULL DEFAULT 'ai_chef',
+            source_label TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, recipe_key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_user_recipes_user_updated
+            ON user_recipes(user_id, updated_at);
 
         CREATE TABLE IF NOT EXISTS user_calendar_connections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

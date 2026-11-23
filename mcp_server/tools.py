@@ -335,8 +335,9 @@ async def _tool_get_kitchen(
     max_minutes = int(args["max_minutes"]) if args.get("max_minutes") is not None else None
     category = str(args.get("category") or "").strip().lower()
 
+    all_recipes = await kitchen_ai.load_recipes_for_user(db, user["id"])
     recipes_out = []
-    for r in _load_recipes():
+    for r in all_recipes:
         if not _recipe_allowed(r, profile):
             continue
         t_min = int(r.get("time_minutes") or 0)
@@ -1048,7 +1049,7 @@ async def _tool_set_meal_plan(
             raise ToolError("meal_slot должен быть 'breakfast', 'lunch' или 'dinner'.")
         title = str(args.get("title") or "").strip()
         recipe_id = str(args.get("recipe_id") or "").strip()
-        rec = kitchen_ai.get_recipe(recipe_id) if recipe_id else None
+        rec = await kitchen_ai.get_recipe_for_user(db, int(user["id"]), recipe_id) if recipe_id else None
         if not title and rec:
             title = str(rec.get("title") or "")
         if not title:
@@ -1082,6 +1083,111 @@ async def _tool_set_meal_plan(
         return out
 
     raise ToolError("mode должен быть 'generate' или 'set_slot'.")
+
+
+async def _tool_import_cart(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    raw_items = args.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ToolError("Параметр items (непустой список продуктов) обязателен.")
+    cleaned_items: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+            continue
+        copy = dict(item)
+        if copy.get("expires_at"):
+            copy["expires_at"] = _validate_iso_date(copy["expires_at"])
+        cleaned_items.append(copy)
+    if not cleaned_items:
+        raise ToolError("Не найдено ни одного валидного продукта с полем name.")
+
+    now_utc = _now_utc_naive()
+    total_amount = args.get("total_amount")
+    expense_category = str(args.get("expense_category") or "продукты").strip() or "продукты"
+    sync_shopping = bool(args.get("sync_shopping", True))
+    store = str(args.get("store") or "").strip()
+
+    res = await kitchen_ai.import_cart_items(
+        db,
+        user,
+        cleaned_items,
+        total_amount=total_amount,
+        expense_category=expense_category,
+        sync_shopping=sync_shopping,
+        now_utc=now_utc,
+    )
+    sug = await kitchen_ai.suggest_meals_now(db, user, limit=3, now_utc=now_utc)
+    quick_suggestions = [
+        {
+            "id": str(s["recipe"].get("id") or ""),
+            "title": str(s["recipe"].get("title") or ""),
+            "time_minutes": int(s["recipe"].get("time_minutes") or 0),
+            "coverage": round(float(s.get("coverage") or 0.0), 2),
+            "missing_count": len(s.get("missing") or []),
+        }
+        for s in (sug.get("suggestions") or [])
+    ]
+    return {
+        "ok": True,
+        "store": store,
+        **res,
+        "quick_suggestions": quick_suggestions,
+    }
+
+
+async def _tool_add_recipe(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    title = str(args.get("title") or "").strip()
+    if not title:
+        raise ToolError("Параметр title обязателен.")
+    raw_ings = args.get("ingredients")
+    if not isinstance(raw_ings, list) or not raw_ings:
+        raise ToolError("Параметр ingredients (непустой список) обязателен.")
+    norm_ings = [
+        {
+            "name": str(i.get("name") or "").strip(),
+            "qty": float(i.get("qty") if i.get("qty") is not None else (i.get("amount") or 1.0)),
+            "unit": str(i.get("unit") or "шт").strip() or "шт",
+        }
+        for i in raw_ings
+        if isinstance(i, dict) and str(i.get("name") or "").strip()
+    ]
+    if not norm_ings:
+        raise ToolError("Каждый ингредиент должен содержать непустое поле name.")
+    raw_steps = args.get("steps")
+    if not isinstance(raw_steps, list) or not [str(s).strip() for s in raw_steps if str(s).strip()]:
+        raise ToolError("Параметр steps (непустой список шагов) обязателен.")
+    norm_steps = [str(s).strip() for s in raw_steps if str(s).strip()]
+
+    tags = [str(t).strip() for t in (args.get("tags") or []) if str(t).strip()]
+    saved = await repo.upsert_user_recipe(
+        db,
+        int(user["id"]),
+        recipe_key=str(args.get("recipe_id") or "").strip() or None,
+        title=title,
+        desc=str(args.get("desc") or "").strip(),
+        tags=tags,
+        base_servings=max(1, int(args.get("base_servings") or 2)),
+        time_minutes=max(1, int(args.get("time_minutes") or 20)),
+        ingredients=norm_ings,
+        steps=norm_steps,
+        source="mcp",
+        source_label=str(args.get("source_label") or "").strip(),
+    )
+    return {
+        "ok": True,
+        "recipe_id": saved.get("id"),
+        "title": saved.get("title"),
+        "recipe": saved,
+    }
 
 
 ToolHandler = Callable[[aiosqlite.Connection, dict[str, Any], MCPSettings, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -1422,6 +1528,73 @@ _TOOL_REGISTRY: list[dict[str, Any]] = [
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
         "handler": _tool_set_meal_plan,
+        "requires_write": True,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_import_cart",
+        "description": "Пакетно перенести корзину продуктов из магазина (например Перекрёсток) в холодильник HiDL, вычеркнуть из покупок и опционально записать сумму траты.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "Список продуктов корзины.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "amount": {"type": "number"},
+                            "unit": {"type": "string"},
+                            "category": {"type": "string"},
+                            "expires_at": {"type": "string", "description": "YYYY-MM-DD"},
+                        },
+                        "required": ["name"],
+                    },
+                },
+                "total_amount": {"type": "number", "description": "Итоговая сумма корзины (если > 0, запишется в траты)."},
+                "expense_category": {"type": "string", "description": "Категория траты (по умолчанию 'продукты')."},
+                "sync_shopping": {"type": "boolean", "description": "Вычеркнуть купленное из списка покупок (по умолчанию true)."},
+                "store": {"type": "string", "description": "Магазин (например 'Перекрёсток')."},
+            },
+            "required": ["items"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "handler": _tool_import_cart,
+        "requires_write": True,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_add_recipe",
+        "description": "Сохранить рецепт (от ассистента или из личной книги) в личную книгу рецептов пользователя HiDL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recipe_id": {"type": "string", "description": "Опциональный стабильный ключ рецепта."},
+                "title": {"type": "string"},
+                "desc": {"type": "string"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "base_servings": {"type": "integer", "minimum": 1, "maximum": 12},
+                "time_minutes": {"type": "integer", "minimum": 1, "maximum": 240},
+                "ingredients": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "qty": {"type": "number"},
+                            "unit": {"type": "string"},
+                        },
+                        "required": ["name"],
+                    },
+                },
+                "steps": {"type": "array", "items": {"type": "string"}},
+                "source_label": {"type": "string"},
+            },
+            "required": ["title", "ingredients", "steps"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "handler": _tool_add_recipe,
         "requires_write": True,
         "requires_diary": False,
     },

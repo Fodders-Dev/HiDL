@@ -164,12 +164,20 @@ def _build_request_body(
     temperature: float,
     max_tokens: int,
     response_format: Optional[dict[str, Any]] = None,
+    image_data_urls: Optional[list[str]] = None,
 ) -> dict[str, Any]:
+    urls = [str(u).strip() for u in (image_data_urls or []) if str(u or "").strip()]
+    user_content: Any = (
+        [{"type": "text", "text": user_prompt}]
+        + [{"type": "image_url", "image_url": {"url": url}} for url in urls]
+        if urls
+        else user_prompt
+    )
     body: dict[str, Any] = {
         "model": route.model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ],
         "temperature": max(0.0, min(1.5, float(temperature))),
         "max_tokens": max(64, int(max_tokens)),
@@ -202,6 +210,7 @@ async def _attempt_completion(
     max_tokens: int,
     timeout_sec: float,
     response_format: Optional[dict[str, Any]] = None,
+    image_data_urls: Optional[list[str]] = None,
     attempts: int = ATTEMPTS,
 ) -> LLMResult:
     url = f"{route.base_url.rstrip('/')}/chat/completions"
@@ -216,6 +225,7 @@ async def _attempt_completion(
         temperature=temperature,
         max_tokens=max_tokens,
         response_format=response_format,
+        image_data_urls=image_data_urls,
     )
     timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_sec)))
     request_options: dict[str, Any] = {"proxy": route.proxy_url} if route.proxy_url else {}
@@ -383,6 +393,7 @@ class LLMClient:
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
+        image_data_urls: Optional[list[str]] = None,
     ) -> LLMResult:
         enabled, routes, timeout_sec, default_max_tokens = self._resolve_routes()
         if not enabled or not routes:
@@ -400,6 +411,7 @@ class LLMClient:
                 max_tokens=effective_tokens,
                 timeout_sec=timeout_sec,
                 response_format=response_format,
+                image_data_urls=image_data_urls,
             )
             if res.ok:
                 if idx > 0:
@@ -418,6 +430,7 @@ class LLMClient:
         *,
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
+        image_data_urls: Optional[list[str]] = None,
     ) -> LLMResult:
         res = await self.complete_text(
             system_prompt=system_prompt,
@@ -425,6 +438,7 @@ class LLMClient:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
+            image_data_urls=image_data_urls,
         )
         if not res.ok:
             return res

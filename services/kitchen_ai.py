@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import math
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from db import repositories as repo
+from llm_client import LLMClient, client as default_llm_client
 from services import karma_service, pulse_service
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_time_local, local_date_str
@@ -157,7 +159,7 @@ def load_recipes() -> List[Dict[str, Any]]:
 
 
 def get_recipe(recipe_id: str) -> Optional[Dict[str, Any]]:
-    """Найти рецепт по ID."""
+    """Найти рецепт по ID в базовом каталоге."""
     rid = str(recipe_id or "").strip()
     if not rid:
         return None
@@ -165,6 +167,23 @@ def get_recipe(recipe_id: str) -> Optional[Dict[str, Any]]:
         if str(item.get("id") or "") == rid:
             return item
     return None
+
+
+async def load_recipes_for_user(db, user_id: int) -> List[Dict[str, Any]]:
+    """Загрузить личные рецепты пользователя и базовый каталог."""
+    personal = await repo.list_user_recipes(db, int(user_id))
+    return list(personal) + load_recipes()
+
+
+async def get_recipe_for_user(db, user_id: int, recipe_id: str) -> Optional[Dict[str, Any]]:
+    """Найти рецепт по ID сначала среди личных рецептов пользователя, затем в базовом каталоге."""
+    rid = str(recipe_id or "").strip()
+    if not rid:
+        return None
+    personal = await repo.get_user_recipe_by_key(db, int(user_id), rid)
+    if personal is not None:
+        return personal
+    return get_recipe(rid)
 
 
 def recipe_allowed_for_profile(recipe: Dict[str, Any], profile: str) -> bool:
@@ -447,8 +466,9 @@ async def suggest_meals_now(
     excl_id_set = {str(x) for x in (exclude_ids or []) if x}
     excl_terms = list(excluded_terms or [])
 
+    all_user_recipes = await load_recipes_for_user(db, user_id)
     allowed = [
-        r for r in load_recipes()
+        r for r in all_user_recipes
         if recipe_allowed_for_profile(r, profile)
         and str(r.get("id") or "") not in excl_id_set
         and not _recipe_matches_excluded_terms(r, excl_terms)
@@ -590,12 +610,12 @@ async def commit_cooked_recipe(
     now_utc: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
     """Списать продукты за приготовленное блюдо, обновить меню и начислить карму/закрыть Пульс."""
-    recipe = get_recipe(recipe_id)
+    user_id = int(user["id"])
+    recipe = await get_recipe_for_user(db, user_id, recipe_id)
     if not recipe:
         return {"ok": False, "error": "Рецепт не найден."}
 
     now = now_utc or datetime.datetime.utcnow()
-    user_id = int(user["id"])
     tz = user.get("timezone") or "UTC"
     local_date = local_date_str(now, tz)
     local_hhmm = format_time_local(now, tz)
@@ -789,7 +809,7 @@ async def generate_meal_plan(
 
     profile = await get_user_meal_profile(db, user_id)
     pantry = rows_to_dicts(await repo.list_pantry_items(db, user_id))
-    candidates = [r for r in load_recipes() if recipe_allowed_for_profile(r, profile)]
+    candidates = [r for r in await load_recipes_for_user(db, user_id) if recipe_allowed_for_profile(r, profile)]
 
     recent_since = (base_date - datetime.timedelta(days=4)).isoformat()
     recent_ids = set(await repo.get_recent_meal_recipe_ids(db, user_id, recent_since))
@@ -866,7 +886,7 @@ async def compute_meal_plan_missing_shopping(
             continue
         ings = row.get("ingredients") or []
         if not ings and row.get("recipe_id"):
-            rec = get_recipe(str(row["recipe_id"]))
+            rec = await get_recipe_for_user(db, user_id, str(row["recipe_id"]))
             ings = list(rec.get("ingredients") or []) if rec else []
         for ing in ings:
             if not isinstance(ing, dict) or not ing.get("name"):
@@ -944,6 +964,22 @@ def _guess_pantry_category(name: str) -> str:
     return "продукты"
 
 
+def _normalize_unit(raw_unit: str) -> str:
+    """Нормализовать единицу измерения продукта."""
+    u = (raw_unit or "").strip().lower().rstrip(".")
+    if u in {"кг", "kg", "килограмм", "килограмма"}:
+        return "kg"
+    if u in {"г", "гр", "g", "грамм", "грамма", "граммов"}:
+        return "g"
+    if u in {"мл", "ml"}:
+        return "ml"
+    if u.startswith("л") or u in {"l", "liter", "liters"}:
+        return "l"
+    if not u or u.startswith(("шт", "уп", "пач", "бан", "бутыл", "piece")):
+        return "шт"
+    return u[:12]
+
+
 def _parse_single_pantry_token(raw_token: str) -> Optional[Dict[str, Any]]:
     token = re.sub(r"\s+", " ", (raw_token or "").strip(" •-—\t"))
     if not token:
@@ -981,18 +1017,7 @@ def _parse_single_pantry_token(raw_token: str) -> Optional[Dict[str, Any]]:
         unit = "шт"
 
     if unit_raw:
-        if unit_raw in {"кг", "kg"}:
-            unit = "kg"
-        elif unit_raw in {"г", "гр"}:
-            unit = "g"
-        elif unit_raw in {"мл", "ml"}:
-            unit = "ml"
-        elif unit_raw.startswith("л"):
-            unit = "l"
-        elif unit_raw.startswith("уп") or unit_raw.startswith("пач") or unit_raw.startswith("бан"):
-            unit = "шт"
-        else:
-            unit = "шт"
+        unit = _normalize_unit(unit_raw)
 
     if not name:
         return None
@@ -1044,3 +1069,439 @@ async def bulk_add_pantry_items(
         added.append({**item, "id": pid})
 
     return {"added": added, "synced_shopping": synced_shopping}
+
+
+def _normalize_cart_item(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    name = re.sub(r"\s+", " ", str(raw.get("name") or "").strip())
+    if not name:
+        return None
+    name_clean = name[:1].upper() + name[1:]
+    raw_amt = raw.get("amount") if raw.get("amount") is not None else raw.get("quantity")
+    try:
+        amount = float(raw_amt) if raw_amt is not None else 1.0
+    except (TypeError, ValueError):
+        amount = 1.0
+    if amount <= 0:
+        amount = 1.0
+    unit = _normalize_unit(str(raw.get("unit") or "шт"))
+    category = str(raw.get("category") or "").strip() or _guess_pantry_category(name_clean)
+    expires_at = str(raw.get("expires_at") or "").strip() or None
+    return {
+        "name": name_clean,
+        "amount": round(amount, 2),
+        "unit": unit,
+        "category": category,
+        "expires_at": expires_at,
+    }
+
+
+def _extract_price_number(text: str) -> Optional[float]:
+    m = re.search(r"(\d[\d\s]{0,12}(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|р\.?)\b", text, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"(\d[\d\s]{0,12}(?:[.,]\d{1,2})?)", text)
+    if not m:
+        return None
+    num_str = re.sub(r"\s+", "", m.group(1)).replace(",", ".")
+    try:
+        val = float(num_str)
+        return round(val, 2) if val > 0 else None
+    except ValueError:
+        return None
+
+
+def _parse_cart_text_offline(raw_text: str) -> Dict[str, Any]:
+    raw = (raw_text or "").strip()
+    if not raw:
+        return {"items": [], "total_amount": None, "store": ""}
+
+    total_amount: Optional[float] = None
+    store = "Перекрёсток" if "перекр" in raw.casefold() else ""
+    lines = [re.sub(r"^\s*\d+[.)]\s*", "", ln.strip()) for ln in raw.splitlines() if ln.strip()]
+    if len(lines) == 1 and ("," in lines[0] or ";" in lines[0]):
+        lines = [part.strip() for part in re.split(r"[,;]+", lines[0]) if part.strip()]
+
+    items: List[Dict[str, Any]] = []
+    for ln in lines:
+        low = ln.casefold()
+        if re.match(r"^(?:итого|всего|к\s+оплате|сумма\s+заказа|оплата)\b", low):
+            extracted = _extract_price_number(ln)
+            if extracted is not None:
+                total_amount = extracted
+            continue
+        if re.match(r"^(?:доставка|скидка|промокод|списано|бонус|пакет|перекр[её]сток)\b", low):
+            continue
+
+        cleaned = re.sub(
+            r"(?:\s*[—–-]\s*)?\d[\d\s]*(?:[.,]\d{1,2})?\s*(?:₽|руб\.?|р\.?)\.?\s*$",
+            "",
+            ln,
+            flags=re.IGNORECASE,
+        ).strip()
+        mult = 1
+        m_mult = re.search(r"\s+(?:×|x|х|\*)\s*(\d+)\s*(?:шт\.?)?$", cleaned, flags=re.IGNORECASE)
+        if m_mult:
+            mult = max(1, min(50, int(m_mult.group(1))))
+            cleaned = cleaned[: m_mult.start()].strip()
+
+        parsed = _parse_single_pantry_token(cleaned)
+        if parsed:
+            if mult > 1:
+                parsed["amount"] = round(float(parsed["amount"]) * mult, 2)
+            norm = _normalize_cart_item(parsed)
+            if norm:
+                items.append(norm)
+
+    return {"items": items, "total_amount": total_amount, "store": store}
+
+
+_CART_PARSE_SYSTEM_PROMPT = (
+    "Ты извлекаешь список купленных продуктов из скриншота корзины/чека магазина или текстового списка. "
+    "Ответь строго JSON-объектом вида: "
+    "{\"store\": str, \"total_amount\": number|null, "
+    "\"items\": [{\"name\": str, \"amount\": number, \"unit\": \"g\"|\"kg\"|\"ml\"|\"l\"|\"шт\", \"category\": str}]}. "
+    "Игнорируй плату за доставку, пакеты, скидки и служебные подписи; объединяй множитель (например 300 г x 2 -> 600 g)."
+)
+
+
+async def parse_cart_input(
+    raw_text: str = "",
+    *,
+    image_bytes: Optional[bytes] = None,
+    image_mime: str = "image/jpeg",
+    llm_client_instance: Optional[LLMClient] = None,
+) -> Dict[str, Any]:
+    """Разобрать корзину/чек из текста или фото через LLM (с оффлайн-fallback для текста)."""
+    clean_text = (raw_text or "").strip()
+    client = llm_client_instance or default_llm_client
+
+    if image_bytes:
+        if not client.is_configured():
+            return {
+                "ok": False,
+                "items": [],
+                "total_amount": None,
+                "store": "",
+                "used_llm": False,
+                "error": "llm_not_configured",
+            }
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{image_mime};base64,{b64}"
+        prompt = "Разбери продукты и итоговую сумму с этого скриншота корзины/чека."
+        if clean_text:
+            prompt += f"\nПодпись пользователя: {clean_text}"
+        res = await client.complete_json(
+            _CART_PARSE_SYSTEM_PROMPT,
+            prompt,
+            temperature=0.1,
+            max_tokens=1600,
+            image_data_urls=[data_url],
+        )
+        if not res.ok or not isinstance(res.data, dict):
+            return {
+                "ok": False,
+                "items": [],
+                "total_amount": None,
+                "store": "",
+                "used_llm": True,
+                "error": res.error or "vision_parse_failed",
+            }
+        items = [x for x in (_normalize_cart_item(r) for r in (res.data.get("items") or [])) if x]
+        total_raw = res.data.get("total_amount")
+        try:
+            total_amt = round(float(total_raw), 2) if total_raw is not None and float(total_raw) > 0 else None
+        except (TypeError, ValueError):
+            total_amt = None
+        return {
+            "ok": bool(items),
+            "items": items,
+            "total_amount": total_amt,
+            "store": str(res.data.get("store") or "").strip(),
+            "used_llm": True,
+            "error": None if items else "no_items_found",
+        }
+
+    if not clean_text:
+        return {"ok": False, "items": [], "total_amount": None, "store": "", "used_llm": False, "error": "empty_input"}
+
+    if client.is_configured():
+        res = await client.complete_json(
+            _CART_PARSE_SYSTEM_PROMPT,
+            f"Разбери корзину/чек/список продуктов:\n{clean_text}",
+            temperature=0.1,
+            max_tokens=1600,
+        )
+        if res.ok and isinstance(res.data, dict):
+            items = [x for x in (_normalize_cart_item(r) for r in (res.data.get("items") or [])) if x]
+            if items:
+                total_raw = res.data.get("total_amount")
+                try:
+                    total_amt = round(float(total_raw), 2) if total_raw is not None and float(total_raw) > 0 else None
+                except (TypeError, ValueError):
+                    total_amt = None
+                return {
+                    "ok": True,
+                    "items": items,
+                    "total_amount": total_amt,
+                    "store": str(res.data.get("store") or "").strip(),
+                    "used_llm": True,
+                    "error": None,
+                }
+
+    offline = _parse_cart_text_offline(clean_text)
+    return {
+        "ok": bool(offline["items"]),
+        "items": offline["items"],
+        "total_amount": offline["total_amount"],
+        "store": offline["store"],
+        "used_llm": False,
+        "error": None if offline["items"] else "no_items_found",
+    }
+
+
+async def import_cart_items(
+    db,
+    user: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    *,
+    total_amount: Optional[float] = None,
+    expense_category: str = "продукты",
+    sync_shopping: bool = True,
+    now_utc: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    """Пакетно добавить корзину продуктов в холодильник, вычеркнуть покупки и опционально записать трату."""
+    _ = now_utc
+    user_id = int(user["id"])
+    added: List[Dict[str, Any]] = []
+    synced_shopping: List[str] = []
+    shop_rows = (
+        rows_to_dicts(await repo.list_shopping_items(db, user_id, scope="household"))
+        if sync_shopping
+        else []
+    )
+    removed_shop_ids: Set[int] = set()
+
+    for raw in items or []:
+        norm = _normalize_cart_item(raw)
+        if not norm:
+            continue
+        pid = await repo.create_pantry_item(
+            db,
+            user_id,
+            norm["name"],
+            norm["amount"],
+            norm["unit"],
+            norm["expires_at"],
+            norm["category"],
+        )
+        added.append({**norm, "id": pid})
+        if sync_shopping:
+            synced = await repo.find_and_delete_shopping_item_by_name(
+                db, user_id, norm["name"], scope="household"
+            )
+            if synced and synced.get("item_name"):
+                synced_shopping.append(str(synced["item_name"]))
+                if synced.get("id") is not None:
+                    removed_shop_ids.add(int(synced["id"]))
+            else:
+                matched_shop = next(
+                    (
+                        s
+                        for s in shop_rows
+                        if int(s["id"]) not in removed_shop_ids
+                        and not s.get("is_bought")
+                        and ingredients_match(norm["name"], str(s.get("item_name") or ""))
+                    ),
+                    None,
+                )
+                if matched_shop:
+                    await repo.delete_shopping_item(db, user_id, int(matched_shop["id"]), scope="household")
+                    removed_shop_ids.add(int(matched_shop["id"]))
+                    synced_shopping.append(str(matched_shop["item_name"]))
+
+    expense_id: Optional[int] = None
+    recorded_total: Optional[float] = None
+    if total_amount is not None:
+        try:
+            amt = float(total_amount)
+        except (TypeError, ValueError):
+            amt = 0.0
+        if amt > 0:
+            recorded_total = round(amt, 2)
+            cat = str(expense_category or "продукты").strip() or "продукты"
+            expense_id = await repo.add_expense(db, user_id, recorded_total, cat)
+
+    return {
+        "ok": True,
+        "added_count": len(added),
+        "added": added,
+        "synced_shopping": synced_shopping,
+        "expense_id": expense_id,
+        "total_amount": recorded_total,
+    }
+
+
+_AI_CHEF_SYSTEM_PROMPT = (
+    "Ты — практичный домашний ИИ-шеф HiDL. Придумывай понятные, вкусные рецепты из того, что есть дома. "
+    "Ответь строго JSON-объектом вида: "
+    "{\"recipes\": [{\"title\": str, \"desc\": str, \"time_minutes\": int, \"base_servings\": int, "
+    "\"tags\": [str], \"ingredients\": [{\"name\": str, \"qty\": float, \"unit\": str}], \"steps\": [str]}]}. "
+    "Строго соблюдай диету пользователя (vegan = 0 животных продуктов: без мяса, рыбы, молочки, сыра, яиц, мёда; "
+    "vegetarian = без мяса и рыбы). В первую очередь используй скоропортящиеся продукты."
+)
+
+
+def _normalize_ai_recipe(raw: Any, *, profile: str, eff_slot: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    title = re.sub(r"\s+", " ", str(raw.get("title") or "").strip())
+    if not title:
+        return None
+    desc = str(raw.get("desc") or "").strip()
+    try:
+        t_min = max(5, min(180, int(raw.get("time_minutes") or 20)))
+    except (TypeError, ValueError):
+        t_min = 20
+    try:
+        servings = max(1, min(8, int(raw.get("base_servings") or 2)))
+    except (TypeError, ValueError):
+        servings = 2
+
+    raw_tags = [str(t).strip().lower() for t in (raw.get("tags") or []) if str(t).strip()]
+    tags = list(dict.fromkeys(raw_tags))
+    if profile == "vegan":
+        if "vegan" not in tags:
+            tags.append("vegan")
+        if "vegetarian" not in tags:
+            tags.append("vegetarian")
+    elif profile == "vegetarian":
+        if "vegetarian" not in tags:
+            tags.append("vegetarian")
+    elif "omnivore" not in tags:
+        tags.append("omnivore")
+    if not any(slot in tags for slot in ("breakfast", "lunch", "dinner", "snack")):
+        tags.append(eff_slot)
+    if t_min <= 15 and "fast" not in tags:
+        tags.append("fast")
+
+    ingredients: List[Dict[str, Any]] = []
+    for ing in raw.get("ingredients") or []:
+        if not isinstance(ing, dict):
+            continue
+        iname = str(ing.get("name") or "").strip()
+        if not iname:
+            continue
+        try:
+            iqty = float(ing.get("qty") or 1.0)
+        except (TypeError, ValueError):
+            iqty = 1.0
+        iunit = _normalize_unit(str(ing.get("unit") or "шт"))
+        ingredients.append({"name": iname, "qty": round(max(0.1, iqty), 2), "unit": iunit})
+
+    steps = [str(s).strip() for s in (raw.get("steps") or []) if str(s).strip()]
+    if not ingredients or not steps:
+        return None
+
+    return {
+        "title": title,
+        "desc": desc,
+        "time_minutes": t_min,
+        "base_servings": servings,
+        "tags": tags,
+        "ingredients": ingredients,
+        "steps": steps,
+        "source": "ai_chef",
+    }
+
+
+async def generate_ai_recipes_from_pantry(
+    db,
+    user: Dict[str, Any],
+    *,
+    meal_slot: Optional[str] = None,
+    max_minutes: int = 30,
+    count: int = 3,
+    llm_client_instance: Optional[LLMClient] = None,
+    now_utc: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    """Сгенерировать 2–3 новых рецепта через LLM по реальным остаткам холодильника."""
+    now = now_utc or datetime.datetime.utcnow()
+    user_id = int(user["id"])
+    tz = user.get("timezone") or "UTC"
+    local_hhmm = format_time_local(now, tz)
+    try:
+        local_hour = int(local_hhmm.split(":")[0])
+    except Exception:
+        local_hour = 13
+
+    eff_slot = meal_slot if meal_slot in {"breakfast", "lunch", "dinner"} else infer_meal_slot(local_hour)
+    slot_label = MEAL_SLOT_LABELS.get(eff_slot, "приём пищи")
+    profile = await get_user_meal_profile(db, user_id)
+    pantry = rows_to_dicts(await repo.list_pantry_items(db, user_id))
+    local_today = local_date_str(now, tz)
+    soon, _ = await repo.pantry_expiring(db, user_id, local_today, window_days=3)
+    soon_rows = rows_to_dicts(soon)
+    expiring_names = [str(r.get("name") or "") for r in soon_rows if r.get("name")]
+
+    client = llm_client_instance or default_llm_client
+    if not client.is_configured():
+        return {
+            "ok": False,
+            "error": "llm_not_configured",
+            "recipes": [],
+            "pantry_count": len(pantry),
+            "expiring_names": expiring_names,
+            "meal_profile": profile,
+            "meal_slot": eff_slot,
+            "meal_slot_label": slot_label,
+        }
+
+    eff_count = max(1, min(5, int(count or 3)))
+    pantry_desc = (
+        ", ".join(f"{p['name']} ({p.get('amount', 1)} {p.get('unit', 'шт')})" for p in pantry[:40])
+        if pantry
+        else "холодильник пуст — предложи простые базовые домашние блюда"
+    )
+    expiring_desc = ", ".join(expiring_names) if expiring_names else "нет срочных"
+    prompt = (
+        f"Придумай ровно {eff_count} разных рецепта на {slot_label} до {max_minutes} мин.\n"
+        f"Профиль питания: {profile}.\n"
+        f"Продукты в холодильнике: {pantry_desc}.\n"
+        f"Скоропортящиеся (используй в первую очередь): {expiring_desc}.\n"
+        "Опирайся на имеющиеся продукты; допустимо добавить не больше 1–2 базовых мелочей."
+    )
+    res = await client.complete_json(
+        _AI_CHEF_SYSTEM_PROMPT,
+        prompt,
+        temperature=0.4,
+        max_tokens=1800,
+    )
+    if not res.ok or not isinstance(res.data, dict):
+        return {
+            "ok": False,
+            "error": res.error or "ai_chef_failed",
+            "recipes": [],
+            "pantry_count": len(pantry),
+            "expiring_names": expiring_names,
+            "meal_profile": profile,
+            "meal_slot": eff_slot,
+            "meal_slot_label": slot_label,
+        }
+
+    recipes = [
+        rec
+        for rec in (_normalize_ai_recipe(r, profile=profile, eff_slot=eff_slot) for r in (res.data.get("recipes") or []))
+        if rec is not None
+    ][:eff_count]
+
+    return {
+        "ok": bool(recipes),
+        "error": None if recipes else "no_valid_recipes",
+        "recipes": recipes,
+        "pantry_count": len(pantry),
+        "expiring_names": expiring_names,
+        "meal_profile": profile,
+        "meal_slot": eff_slot,
+        "meal_slot_label": slot_label,
+    }
