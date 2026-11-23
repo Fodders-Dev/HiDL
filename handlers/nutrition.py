@@ -95,15 +95,17 @@ async def render_kbju_card(
 
     if meals:
         lines.append("\n🍽 <b>Записано сегодня:</b>")
+        del_btns = []
         for idx, meal in enumerate(meals[-6:], 1):
             lines.append(
                 f"{idx}. {_h(meal['title'])} — {int(round(float(meal.get('kcal') or 0)))} ккал "
                 f"(Б{float(meal.get('protein_g') or 0):g}/Ж{float(meal.get('fat_g') or 0):g}/У{float(meal.get('carbs_g') or 0):g})"
             )
-            short = str(meal.get("title") or "Еда")[:22]
-            rows.append(
-                [InlineKeyboardButton(text=f"🗑 Удалить: {short}", callback_data=f"kbju:del:{meal['id']}")]
+            del_btns.append(
+                InlineKeyboardButton(text=f"🗑 #{idx}", callback_data=f"kbju:del:{meal['id']}")
             )
+        for i in range(0, len(del_btns), 3):
+            rows.append(del_btns[i : i + 3])
 
     rows.append(
         [
@@ -132,13 +134,12 @@ async def kbju_today_cb(callback: types.CallbackQuery, state: FSMContext, db) ->
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data == "kbju:add")
-async def kbju_add_start(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def _prompt_meal_input(target_message: types.Message, state: FSMContext) -> None:
     await state.set_state(MealAddState.waiting_input)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="kbju:cancel")]]
     )
-    await callback.message.answer(
+    await target_message.answer(
         "🍽 <b>Запись еды в КБЖУ</b>\n\n"
         "Пришли <b>фото тарелки</b> или напиши <b>текстом</b>, что съел(а), например:\n"
         "• <code>Овсянка на овсяном молоке 250 г и банан</code>\n"
@@ -147,6 +148,26 @@ async def kbju_add_start(callback: types.CallbackQuery, state: FSMContext) -> No
         reply_markup=kb,
         parse_mode="HTML",
     )
+
+
+@router.message(Command("eat"))
+async def cmd_eat(message: types.Message, state: FSMContext, db) -> None:
+    await state.clear()
+    await ensure_user(db, message.from_user.id, message.from_user.full_name)
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    meal_text = parts[1].strip() if len(parts) > 1 else ""
+    if not meal_text:
+        await _prompt_meal_input(message, state)
+        return
+    await state.set_state(MealAddState.waiting_input)
+    parsed = await fitness_nutrition.parse_meal_input(raw_text=meal_text)
+    await _show_meal_preview(message, state, parsed)
+
+
+@router.callback_query(lambda c: c.data == "kbju:add")
+async def kbju_add_start(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await _prompt_meal_input(callback.message, state)
     await callback.answer()
 
 

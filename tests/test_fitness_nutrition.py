@@ -1,5 +1,6 @@
 import datetime
 import json
+import re
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
@@ -14,6 +15,7 @@ from handlers import kitchen, movement, nutrition
 from llm_client import LLMResult
 from mcp_server.app import create_mcp_app
 from services import fitness_nutrition, kitchen_ai
+from utils.today import render_today
 
 
 class _MemFSM:
@@ -406,6 +408,69 @@ class FitnessNutritionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("hidl_get_fitness_nutrition", names)
         finally:
             await ro_server.close()
+
+    async def test_6_ux_polish_and_today_kbju(self) -> None:
+        # 1. Diet-aware protein advice (no "добрый белок", tailored by meal_profile)
+        vegan_adv = await fitness_nutrition.get_daily_nutrition_advice(self.db, self.u1)
+        vegan_txt = " ".join(vegan_adv.get("eat_more") or []).lower()
+        self.assertNotIn("добрый белок", vegan_txt)
+        self.assertIn("растительный белок", vegan_txt)
+
+        await repo.upsert_wellness(self.db, self.u2_id, meal_profile="omnivore")
+        omni_adv = await fitness_nutrition.get_daily_nutrition_advice(self.db, self.u2)
+        omni_txt = " ".join(omni_adv.get("eat_more") or []).lower()
+        self.assertNotIn("добрый белок", omni_txt)
+        self.assertIn("курица", omni_txt)
+
+        # 2. Workouts have no double numbering (e.g. "3. 1)") and fit:done:lazy offers momentum button
+        fsm = _MemFSM()
+        cb_w = SimpleNamespace(
+            data="fit:workout:20:upper",
+            from_user=SimpleNamespace(id=930001, full_name="Дима"),
+            message=SimpleNamespace(answer=AsyncMock(), edit_text=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await movement.fit_workout_generate_cb(cb_w, fsm, self.db)
+        w_text = cb_w.message.edit_text.call_args.args[0]
+        self.assertIsNone(re.search(r"^\d+\.\s+\d+[.)]", w_text, re.MULTILINE))
+
+        cb_done = SimpleNamespace(
+            data="fit:done:lazy",
+            from_user=SimpleNamespace(id=930001, full_name="Дима"),
+            message=SimpleNamespace(answer=AsyncMock(), edit_text=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await movement.fit_workout_done_cb(cb_done, fsm, self.db)
+        done_kb = cb_done.message.edit_text.call_args.kwargs["reply_markup"]
+        done_cbs = [btn.callback_data for row in done_kb.inline_keyboard for btn in row]
+        self.assertIn("fit:workout:10:auto", done_cbs)
+
+        # 3. /eat inline text -> preview; bare /eat -> prompt
+        msg_eat = SimpleNamespace(
+            text="/eat Овсянка 80 г и банан",
+            from_user=SimpleNamespace(id=930001, full_name="Дима"),
+            answer=AsyncMock(),
+        )
+        await nutrition.cmd_eat(msg_eat, fsm, self.db)
+        self.assertEqual(await fsm.get_state(), nutrition.MealAddState.confirm)
+        self.assertIn("ккал", msg_eat.answer.call_args.args[0])
+
+        msg_eat_empty = SimpleNamespace(
+            text="/eat",
+            from_user=SimpleNamespace(id=930001, full_name="Дима"),
+            answer=AsyncMock(),
+        )
+        await nutrition.cmd_eat(msg_eat_empty, fsm, self.db)
+        self.assertEqual(await fsm.get_state(), nutrition.MealAddState.waiting_input)
+        await fsm.clear()
+
+        # 4. /today includes КБЖУ for adult profile, excludes it for student mode
+        adult_today, _ = await render_today(self.db, self.u1)
+        self.assertIn("🔥 КБЖУ:", adult_today)
+
+        student_user = {**self.u1, "profile_mode": "student"}
+        student_today, _ = await render_today(self.db, student_user)
+        self.assertNotIn("🔥 КБЖУ:", student_today)
 
 
 if __name__ == "__main__":

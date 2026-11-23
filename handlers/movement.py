@@ -4,6 +4,7 @@ import asyncio
 import datetime
 from html import escape as _h
 import io
+import re
 from typing import Any, Dict, Optional
 
 from aiogram import F, Router, types
@@ -156,9 +157,15 @@ def _render_gear_card(equipment: list[str]) -> tuple[str, InlineKeyboardMarkup]:
         f"Сейчас выбрано: {_h(fitness_nutrition.format_equipment_labels(equipment))}",
     ]
     rows = []
+    gear_btns = []
     for key, emoji, label in fitness_nutrition.EQUIPMENT_CATALOG:
         mark = "✅ " if key in eq_set else "⬜ "
-        rows.append([InlineKeyboardButton(text=f"{mark}{emoji} {label}", callback_data=f"fit:gear_toggle:{key}")])
+        short = fitness_nutrition.EQUIPMENT_SHORT_LABELS.get(key, label)
+        gear_btns.append(
+            InlineKeyboardButton(text=f"{mark}{emoji} {short}", callback_data=f"fit:gear_toggle:{key}")
+        )
+    for i in range(0, len(gear_btns), 2):
+        rows.append(gear_btns[i : i + 2])
     rows.append([InlineKeyboardButton(text="➕ Добавить свой тренажёр", callback_data="fit:gear_custom")])
     rows.append(
         [
@@ -521,7 +528,14 @@ async def fit_profile_height(message: types.Message, state: FSMContext) -> None:
         return
     await state.update_data(height_cm=h)
     await state.set_state(FitProfileState.age)
-    await message.answer("Шаг 2/5. Сколько тебе <b>полных лет</b>? (например <code>28</code>)", parse_mode="HTML")
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="fit:profile_cancel")]]
+    )
+    await message.answer(
+        "Шаг 2/5. Сколько тебе <b>полных лет</b>? (например <code>28</code>)",
+        reply_markup=cancel_kb,
+        parse_mode="HTML",
+    )
 
 
 @router.message(FitProfileState.age, lambda m: bool(m.text and not m.text.startswith("/")))
@@ -740,6 +754,14 @@ async def fit_gear_custom_save(message: types.Message, state: FSMContext, db) ->
 
 # --- Anti-Laziness Micro-Start & Personal Workouts ---
 
+def _format_workout_steps(steps: list[Any]) -> list[str]:
+    formatted: list[str] = []
+    for idx, step in enumerate(steps, 1):
+        clean_step = re.sub(r"^\s*\d+[.)]\s*", "", str(step)).strip()
+        formatted.append(f"{idx}. {_h(clean_step)}")
+    return formatted
+
+
 @router.callback_query(lambda c: c.data and (c.data == "fit:lazy" or c.data.startswith("fit:lazy:")))
 async def fit_lazy_cb(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     parts = (callback.data or "").split(":")
@@ -762,8 +784,7 @@ async def fit_lazy_cb(callback: types.CallbackQuery, state: FSMContext, db) -> N
         f"🧰 Инвентарь: {_h(workout['equipment_used'])} · ~{workout['kcal_burned']} ккал",
         "",
     ]
-    for idx, step in enumerate(workout["steps"], 1):
-        lines.append(f"{idx}. {_h(step)}")
+    lines.extend(_format_workout_steps(workout["steps"]))
     lines.append(f"\n🤝 <i>{_h(workout['deal_text'])}</i>")
 
     kb = InlineKeyboardMarkup(
@@ -842,8 +863,7 @@ async def fit_workout_generate_cb(callback: types.CallbackQuery, state: FSMConte
         f"🧰 {_h(workout['equipment_used'])} · ~{workout['kcal_burned']} ккал",
         "",
     ]
-    for idx, step in enumerate(workout["steps"], 1):
-        lines.append(f"{idx}. {_h(step)}")
+    lines.extend(_format_workout_steps(workout["steps"]))
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -889,14 +909,18 @@ async def fit_workout_done_cb(callback: types.CallbackQuery, state: FSMContext, 
         f"📊 За 7 дней: {week['count']} тр. ({week['total_minutes']} мин)",
         f"🍽 Норма на сегодня с учётом движения: <b>{targets['kcal']} ккал</b> · Белок {targets['protein_g']} г",
     ]
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today"),
-                InlineKeyboardButton(text="⬅️ Спорт", callback_data="fit:menu"),
-            ]
+    done_rows = []
+    if is_lazy:
+        done_rows.append(
+            [InlineKeyboardButton(text="🔥 Поймал волну — ещё 10 мин!", callback_data="fit:workout:10:auto")]
+        )
+    done_rows.append(
+        [
+            InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today"),
+            InlineKeyboardButton(text="⬅️ Спорт", callback_data="fit:menu"),
         ]
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=done_rows)
     await safe_edit(callback.message, "\n".join(lines), reply_markup=kb, parse_mode="HTML")
     await callback.answer("Засчитала тренировку! 💪")
 

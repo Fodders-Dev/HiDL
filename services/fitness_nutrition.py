@@ -26,6 +26,16 @@ _EQUIPMENT_MAP: Dict[str, Tuple[str, str]] = {
     key: (emoji, label) for key, emoji, label in EQUIPMENT_CATALOG
 }
 
+EQUIPMENT_SHORT_LABELS: Dict[str, str] = {
+    "smart_scales": "Умные весы",
+    "dumbbells": "Гантели",
+    "pullup_bar": "Турник",
+    "bands": "Резинки",
+    "mat": "Коврик",
+    "cardio": "Кардио",
+    "bodyweight": "Свой вес",
+}
+
 GOAL_LABELS: Dict[str, str] = {
     "loss": "🔥 Сбросить вес и подтянуться",
     "recomp": "💪 Подтянуться (рекомпозиция)",
@@ -463,6 +473,8 @@ async def get_daily_nutrition_advice(
 
     latest_weight = await repo.get_latest_weight(db, user_id)
     week_workouts = await repo.workout_stats_week(db, user_id, local_date)
+    wellness = await repo.get_wellness(db, user_id) or {}
+    meal_profile = str(wellness.get("meal_profile") or "").strip().lower()
     targets = calculate_daily_targets(
         user,
         latest_weight,
@@ -488,7 +500,12 @@ async def get_daily_nutrition_advice(
     go_easy_on: List[str] = []
 
     if remaining["protein_g"] >= 25:
-        eat_more.append("добрый белок (тофу, чечевица, нут, фасоль, эдамаме или протеин)")
+        if meal_profile == "vegan":
+            eat_more.append("растительный белок (тофу, чечевица, нут, фасоль, эдамаме или протеин)")
+        elif meal_profile == "vegetarian":
+            eat_more.append("белок (яйца, творог, греческий йогурт, сыр, тофу или чечевицу)")
+        else:
+            eat_more.append("белок (курица, рыба, яйца, творог, греческий йогурт или тофу)")
     if remaining["kcal"] >= 350 and remaining["carbs_g"] >= 35:
         eat_more.append("сложные углеводы и объём (гречка, киноа, овощи, зелень)")
     if remaining["kcal"] > 0 and not eat_more:
@@ -989,42 +1006,42 @@ def _build_offline_workout(
     if focus_area == "upper":
         steps.append(f"Сделай {rounds} круга (отдых 45–60 сек между упражнениями):")
         if has_bar:
-            steps.append("1) Подтягивания (или австралийские / с резинкой) — 4–8 раз.")
+            steps.append("Подтягивания (или австралийские / с резинкой) — 4–8 раз.")
         elif has_db:
-            steps.append("1) Тяга гантелей в наклоне к поясу — 12 раз.")
+            steps.append("Тяга гантелей в наклоне к поясу — 12 раз.")
         elif has_bands:
-            steps.append("1) Тяга резинки к груди/поясу — 15 раз.")
+            steps.append("Тяга резинки к груди/поясу — 15 раз.")
         else:
-            steps.append("1) Отжимания от стола или пола — 8–12 раз.")
+            steps.append("Отжимания от стола или пола — 8–12 раз.")
         if has_db:
-            steps.append("2) Жим гантелей вверх стоя/сидя — 10–12 раз.")
-            steps.append("3) Отжимания (от пола или колен) — 8–12 раз.")
+            steps.append("Жим гантелей вверх стоя/сидя — 10–12 раз.")
+            steps.append("Отжимания (от пола или колен) — 8–12 раз.")
         else:
-            steps.append("2) Отжимания от пола/опоры — 8–12 раз.")
+            steps.append("Отжимания от пола/опоры — 8–12 раз.")
         if has_mat or True:
-            steps.append("4) Планка на локтях — 30 сек.")
+            steps.append("Планка на локтях — 30 сек.")
     elif focus_area == "lower":
         steps.append(f"Сделай {rounds} круга без спешки:")
         steps.append(
-            "1) Приседания с гантелями у груди — 12 раз." if has_db else "1) Приседания — 15 раз."
+            "Приседания с гантелями у груди — 12 раз." if has_db else "Приседания — 15 раз."
         )
         steps.append(
-            "2) Румынская тяга с гантелями (ровная спина) — 12 раз."
+            "Румынская тяга с гантелями (ровная спина) — 12 раз."
             if has_db
-            else "2) Ягодичный мостик на полу — 15 раз."
+            else "Ягодичный мостик на полу — 15 раз."
         )
         steps.append(
-            "3) Боковые шаги или махи с резинкой — по 12 на ногу."
+            "Боковые шаги или махи с резинкой — по 12 на ногу."
             if has_bands
-            else "3) Обратные выпады (или зашагивания) — 10–12 суммарно."
+            else "Обратные выпады (или зашагивания) — 10–12 суммарно."
         )
-        steps.append("4) Велосипед или скручивания на коврике — 30 сек.")
+        steps.append("Велосипед или скручивания на коврике — 30 сек.")
     elif focus_area == "core":
         steps.append(f"Сделай {rounds} круга на кор и осанку:")
-        steps.append("1) Мёртвый жук на коврике (медленно) — 10–12 раз.")
-        steps.append("2) Ягодичный мостик с паузой 2 сек наверху — 12–15 раз.")
-        steps.append("3) Боковая планка — по 20–25 сек на сторону.")
-        steps.append("4) Лодочка на животе (спина) — 12 раз.")
+        steps.append("Мёртвый жук на коврике (медленно) — 10–12 раз.")
+        steps.append("Ягодичный мостик с паузой 2 сек наверху — 12–15 раз.")
+        steps.append("Боковая планка — по 20–25 сек на сторону.")
+        steps.append("Лодочка на животе (спина) — 12 раз.")
     elif focus_area == "cardio" and has_cardio:
         steps = [
             "3 минуты плавного разогрева на тренажёре.",
@@ -1034,18 +1051,18 @@ def _build_offline_workout(
     else:
         steps.append(f"Сделай {rounds} круга (отдых между кругами ~90 сек):")
         steps.append(
-            "1) Гоблет-присед с гантелью — 12 раз." if has_db else "1) Приседания — 12–15 раз."
+            "Гоблет-присед с гантелью — 12 раз." if has_db else "Приседания — 12–15 раз."
         )
-        steps.append("2) Отжимания (от стола или пола) — 8–12 раз.")
+        steps.append("Отжимания (от стола или пола) — 8–12 раз.")
         if has_bar:
-            steps.append("3) Подтягивания или вис со сведением лопаток — 5–8 раз.")
+            steps.append("Подтягивания или вис со сведением лопаток — 5–8 раз.")
         elif has_db:
-            steps.append("3) Тяга гантелей в наклоне — 12 раз.")
+            steps.append("Тяга гантелей в наклоне — 12 раз.")
         elif has_bands:
-            steps.append("3) Тяга резинки на спину — 15 раз.")
-        steps.append("4) Планка — 30–40 сек.")
+            steps.append("Тяга резинки на спину — 15 раз.")
+        steps.append("Планка — 30–40 сек.")
         if has_cardio and dur >= 20:
-            steps.append("5) В финале — 5–7 минут спокойного кардио на тренажёре.")
+            steps.append("В финале — 5–7 минут спокойного кардио на тренажёре.")
     steps.append("Заминка 2 мин: потяни плечи, спину и ноги, выпей воды.")
 
     kcal_burned = int(round(dur * (6.2 if (has_db or has_bar or has_cardio) else 5.2)))

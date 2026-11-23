@@ -546,9 +546,11 @@ async def quick_pick_recipes(callback: types.CallbackQuery, db):
     rows.append([
         InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
         InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
-        InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes"),
     ])
-    rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
+    rows.append([
+        InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes"),
+        InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main"),
+    ])
 
     await safe_edit(
         callback.message,
@@ -701,7 +703,11 @@ async def view_recipe(callback: types.CallbackQuery, db):
         inline_keyboard=[
             serv_row,
             action_row,
-            [InlineKeyboardButton(text="🍽 Записать 1 порц. в КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
+            [
+                InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kbju:log_recipe:{rid}:0.5"),
+                InlineKeyboardButton(text="🍽 1 порц.", callback_data=f"kbju:log_recipe:{rid}:1"),
+                InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kbju:log_recipe:{rid}:2"),
+            ],
             [InlineKeyboardButton(text="✅ Проверить продукты", callback_data=f"kitchen:cook_check:{rid}:{servings}:{category}:{page}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"kitchen:recipes_cat:{category}:{page}")],
         ]
@@ -784,7 +790,11 @@ async def cook_fast_commit(callback: types.CallbackQuery, db):
         lines.append(f"💓 Карма еды: +{delta} → <b>{score_after}/100</b>")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🍽 Записать 1 порц. в мой КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
+        [
+            InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kbju:log_recipe:{rid}:0.5"),
+            InlineKeyboardButton(text="🍽 1 порц.", callback_data=f"kbju:log_recipe:{rid}:1"),
+            InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kbju:log_recipe:{rid}:2"),
+        ],
         [
             InlineKeyboardButton(text="🍳 Что приготовить ещё?", callback_data="kitchen:quick_pick"),
             InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
@@ -896,7 +906,11 @@ async def cook_commit(callback: types.CallbackQuery, state: FSMContext, db):
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Да, добавить", callback_data="kitchen:shop_auto_add")],
-            [InlineKeyboardButton(text="🍽 Записать 1 порц. в КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
+            [
+                InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kbju:log_recipe:{rid}:0.5"),
+                InlineKeyboardButton(text="🍽 1 порц.", callback_data=f"kbju:log_recipe:{rid}:1"),
+                InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kbju:log_recipe:{rid}:2"),
+            ],
             [InlineKeyboardButton(text="Нет, спасибо", callback_data=f"kitchen:cook_view:{rid}:{servings}:{category}:{page}")],
         ])
         await callback.message.edit_text(text, reply_markup=kb)
@@ -908,7 +922,11 @@ async def cook_commit(callback: types.CallbackQuery, state: FSMContext, db):
             else ""
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🍽 Записать 1 порц. в мой КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
+            [
+            InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kbju:log_recipe:{rid}:0.5"),
+            InlineKeyboardButton(text="🍽 1 порц.", callback_data=f"kbju:log_recipe:{rid}:1"),
+            InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kbju:log_recipe:{rid}:2"),
+        ],
             [
                 InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
                 InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main"),

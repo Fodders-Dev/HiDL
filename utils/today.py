@@ -5,7 +5,7 @@ from typing import Tuple
 from aiogram import types
 
 from db import repositories as repo
-from services import calendar_service, karma_service
+from services import calendar_service, fitness_nutrition, karma_service
 from utils.finance import payday_summary
 from utils.time import local_date_str, format_date_display, format_time_local
 from utils.formatting import format_money
@@ -238,6 +238,20 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         ]
         if meal_parts:
             summary_lines.append("🍽 Меню дня: " + " · ".join(meal_parts[:3]))
+    if not student:
+        kbju_advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
+        eaten = kbju_advice["eaten"]
+        targets = kbju_advice["targets"]
+        if (
+            int(eaten.get("meals_count") or 0) > 0
+            or not bool(targets.get("is_estimated", True))
+            or bool(user.get("weight_goal"))
+        ):
+            summary_lines.append(
+                f"🔥 КБЖУ: {int(round(float(eaten.get('kcal') or 0)))} / "
+                f"{int(round(float(targets.get('kcal') or 0)))} ккал · "
+                f"Б {int(round(float(eaten.get('protein_g') or 0)))}/{int(round(float(targets.get('protein_g') or 0)))}г"
+            )
     if plan_items:
         summary_lines.append(
             f"🎯 План на день: выполнено {len(plan_done)}/{len(plan_items)} дел "
