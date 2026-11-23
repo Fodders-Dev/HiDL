@@ -993,12 +993,40 @@ async def list_med_logs_for_date(
     return await cursor.fetchall()
 
 
+def get_user_equipment(user: Any) -> List[str]:
+    """Извлечь список домашнего инвентаря пользователя из users.equipment_json."""
+    d = row_to_dict(user) if not isinstance(user, dict) else user
+    raw = d.get("equipment_json")
+    if isinstance(raw, list):
+        items = raw
+    else:
+        try:
+            parsed = json.loads(raw or "[]")
+            items = parsed if isinstance(parsed, list) else []
+        except Exception:
+            items = []
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = str(item or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 async def update_user_body(
     conn: aiosqlite.Connection,
     user_id: int,
     height_cm: float | None = None,
     weight_goal: str | None = None,
     weight_target: float | None = None,
+    *,
+    age_years: int | None = None,
+    sex: str | None = None,
+    activity_level: str | None = None,
+    equipment: List[str] | None = None,
+    custom_kcal_target: int | None = None,
 ) -> None:
     now = utc_now_str()
     fields = []
@@ -1012,6 +1040,22 @@ async def update_user_body(
     if weight_target is not None:
         fields.append("weight_target = ?")
         values.append(weight_target)
+    if age_years is not None:
+        fields.append("age_years = ?")
+        values.append(max(0, int(age_years)))
+    if sex is not None:
+        fields.append("sex = ?")
+        values.append(str(sex).strip().lower())
+    if activity_level is not None:
+        fields.append("activity_level = ?")
+        values.append(str(activity_level).strip().lower())
+    if equipment is not None:
+        clean_eq = [str(e).strip() for e in equipment if str(e).strip()]
+        fields.append("equipment_json = ?")
+        values.append(json.dumps(list(dict.fromkeys(clean_eq)), ensure_ascii=False))
+    if custom_kcal_target is not None:
+        fields.append("custom_kcal_target = ?")
+        values.append(max(0, int(custom_kcal_target)))
     if not fields:
         return
     fields.append("updated_at = ?")
@@ -1760,13 +1804,43 @@ async def custom_statuses_for_date(
 
 
 # Weights tracking
-async def add_weight(conn: aiosqlite.Connection, user_id: int, weight: float) -> None:
+async def add_weight(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    weight: float,
+    *,
+    body_fat_pct: float | None = None,
+    muscle_mass_kg: float | None = None,
+    water_pct: float | None = None,
+    visceral_fat: float | None = None,
+    bmi: float | None = None,
+    source: str = "manual",
+    note: str = "",
+) -> int:
     now = utc_now_str()
-    await conn.execute(
-        "INSERT INTO weights (user_id, weight, created_at) VALUES (?, ?, ?)",
-        (user_id, weight, now),
+    cur = await conn.execute(
+        """
+        INSERT INTO weights (
+            user_id, weight, body_fat_pct, muscle_mass_kg, water_pct,
+            visceral_fat, bmi, source, note, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            float(weight),
+            body_fat_pct,
+            muscle_mass_kg,
+            water_pct,
+            visceral_fat,
+            bmi,
+            str(source or "manual").strip() or "manual",
+            str(note or "").strip(),
+            now,
+        ),
     )
     await conn.commit()
+    return int(cur.lastrowid)
 
 
 async def set_body_profile(conn: aiosqlite.Connection, user_id: int, height: float, goal: str) -> None:
@@ -1783,22 +1857,65 @@ async def set_body_profile(conn: aiosqlite.Connection, user_id: int, height: flo
 
 async def list_weights(conn: aiosqlite.Connection, user_id: int, limit: int = 10) -> List[aiosqlite.Row]:
     cursor = await conn.execute(
-        "SELECT * FROM weights WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT ?",
+        "SELECT * FROM weights WHERE user_id = ? AND weight > 0 ORDER BY datetime(created_at) DESC, id DESC LIMIT ?",
         (user_id, limit),
     )
     return await cursor.fetchall()
 
 
+async def get_latest_weight(conn: aiosqlite.Connection, user_id: int) -> Optional[Dict[str, Any]]:
+    """Вернуть последнюю положительную запись весов пользователя (строго личную)."""
+    cursor = await conn.execute(
+        "SELECT * FROM weights WHERE user_id = ? AND weight > 0 ORDER BY datetime(created_at) DESC, id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    return row_to_dict(row) if row else None
+
+
 async def weight_trend(conn: aiosqlite.Connection, user_id: int, days: int = 30) -> float:
     since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
     cursor = await conn.execute(
-        "SELECT weight, created_at FROM weights WHERE user_id = ? AND datetime(created_at) >= datetime(?) ORDER BY datetime(created_at) ASC",
+        "SELECT weight, created_at FROM weights WHERE user_id = ? AND weight > 0 AND datetime(created_at) >= datetime(?) ORDER BY datetime(created_at) ASC, id ASC",
         (user_id, since.isoformat()),
     )
     rows = await cursor.fetchall()
     if len(rows) < 2:
         return 0.0
     return rows[-1]["weight"] - rows[0]["weight"]
+
+
+async def body_metrics_trend(
+    conn: aiosqlite.Connection, user_id: int, days: int = 30
+) -> Dict[str, Any]:
+    """Посчитать динамику веса, % жира, мышц и воды за N дней (строго личные замеры)."""
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    cur = await conn.execute(
+        """
+        SELECT * FROM weights
+        WHERE user_id = ? AND weight > 0 AND datetime(created_at) >= datetime(?)
+        ORDER BY datetime(created_at) ASC, id ASC
+        """,
+        (user_id, since.isoformat()),
+    )
+    period_rows = rows_to_dicts(await cur.fetchall())
+    latest = await get_latest_weight(conn, user_id)
+
+    def _delta(field: str) -> Optional[float]:
+        vals = [float(r[field]) for r in period_rows if r.get(field) is not None and float(r[field]) > 0]
+        if len(vals) < 2:
+            return None
+        return round(vals[-1] - vals[0], 2)
+
+    return {
+        "latest": latest,
+        "count": len(period_rows),
+        "days": days,
+        "weight_delta": _delta("weight"),
+        "fat_delta": _delta("body_fat_pct"),
+        "muscle_delta": _delta("muscle_mass_kg"),
+        "water_delta": _delta("water_pct"),
+    }
 
 
 async def upsert_regular_task(
@@ -5041,9 +5158,21 @@ def _decode_recipe_json_list(raw: Any) -> List[Any]:
         return []
 
 
+def _decode_recipe_nutrition(raw: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        return raw if raw else None
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) and parsed else None
+    except Exception:
+        return None
+
+
 def _user_recipe_row_to_dict(row: Any) -> Dict[str, Any]:
     d = row_to_dict(row)
-    return {
+    out = {
         "id": str(d.get("recipe_key") or ""),
         "db_id": int(d["id"]) if d.get("id") is not None else None,
         "title": str(d.get("title") or ""),
@@ -5062,6 +5191,10 @@ def _user_recipe_row_to_dict(row: Any) -> Dict[str, Any]:
         "created_at": d.get("created_at"),
         "updated_at": d.get("updated_at"),
     }
+    nutr = _decode_recipe_nutrition(d.get("nutrition_json"))
+    if nutr is not None:
+        out["nutrition"] = nutr
+    return out
 
 
 def generate_user_recipe_key() -> str:
@@ -5081,6 +5214,7 @@ async def upsert_user_recipe(
     time_minutes: int = 20,
     ingredients: Optional[List[Dict[str, Any]]] = None,
     steps: Optional[List[str]] = None,
+    nutrition: Optional[Dict[str, Any]] = None,
     source: str = "ai_chef",
     source_label: str = "",
 ) -> Dict[str, Any]:
@@ -5093,15 +5227,16 @@ async def upsert_user_recipe(
     tags_list = [str(t).strip() for t in (tags or []) if str(t).strip()]
     ing_list = [i for i in (ingredients or []) if isinstance(i, dict) and str(i.get("name") or "").strip()]
     steps_list = [str(s).strip() for s in (steps or []) if str(s).strip()]
+    nutr_json = json.dumps(nutrition, ensure_ascii=False) if isinstance(nutrition, dict) and nutrition else ""
     serv = max(1, int(base_servings or 2))
     t_min = max(1, int(time_minutes or 20))
     await conn.execute(
         """
         INSERT INTO user_recipes (
             user_id, household_id, recipe_key, title, desc, tags_json, base_servings, time_minutes,
-            ingredients_json, steps_json, source, source_label, created_at, updated_at
+            ingredients_json, steps_json, nutrition_json, source, source_label, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, recipe_key) DO UPDATE SET
             household_id = excluded.household_id,
             title = excluded.title,
@@ -5111,6 +5246,10 @@ async def upsert_user_recipe(
             time_minutes = excluded.time_minutes,
             ingredients_json = excluded.ingredients_json,
             steps_json = excluded.steps_json,
+            nutrition_json = CASE
+                WHEN excluded.nutrition_json <> '' THEN excluded.nutrition_json
+                ELSE user_recipes.nutrition_json
+            END,
             source = excluded.source,
             source_label = excluded.source_label,
             updated_at = excluded.updated_at
@@ -5126,6 +5265,7 @@ async def upsert_user_recipe(
             t_min,
             json.dumps(ing_list, ensure_ascii=False),
             json.dumps(steps_list, ensure_ascii=False),
+            nutr_json,
             str(source or "ai_chef").strip(),
             str(source_label or "").strip(),
             now,
@@ -5225,6 +5365,214 @@ async def delete_user_recipe_by_key(
     )
     await conn.commit()
     return (cur.rowcount or 0) > 0
+
+
+# --- Personal КБЖУ Meal Logs (strictly user-private) ---
+
+async def add_meal_log(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+    title: str,
+    *,
+    meal_slot: str = "snack",
+    recipe_id: str = "",
+    servings: float = 1.0,
+    kcal: float = 0.0,
+    protein_g: float = 0.0,
+    fat_g: float = 0.0,
+    carbs_g: float = 0.0,
+    source: str = "manual",
+) -> int:
+    """Добавить запись приёма пищи в личный дневник КБЖУ."""
+    now = utc_now_str()
+    slot = meal_slot if meal_slot in {"breakfast", "lunch", "dinner", "snack"} else "snack"
+    cur = await conn.execute(
+        """
+        INSERT INTO meal_logs (
+            user_id, local_date, meal_slot, title, recipe_id, servings,
+            kcal, protein_g, fat_g, carbs_g, source, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            str(local_date),
+            slot,
+            str(title or "Приём пищи").strip(),
+            str(recipe_id or "").strip(),
+            round(max(0.1, float(servings or 1.0)), 2),
+            round(max(0.0, float(kcal or 0.0)), 1),
+            round(max(0.0, float(protein_g or 0.0)), 1),
+            round(max(0.0, float(fat_g or 0.0)), 1),
+            round(max(0.0, float(carbs_g or 0.0)), 1),
+            str(source or "manual").strip() or "manual",
+            now,
+        ),
+    )
+    await conn.commit()
+    return int(cur.lastrowid)
+
+
+async def list_meal_logs(
+    conn: aiosqlite.Connection, user_id: int, local_date: str
+) -> List[Dict[str, Any]]:
+    """Вернуть личные приёмы пищи пользователя за указанную локальную дату."""
+    cur = await conn.execute(
+        """
+        SELECT * FROM meal_logs
+        WHERE user_id = ? AND local_date = ?
+        ORDER BY id ASC
+        """,
+        (int(user_id), str(local_date)),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def delete_meal_log(
+    conn: aiosqlite.Connection, user_id: int, log_id: int
+) -> bool:
+    """Удалить личную запись приёма пищи по id."""
+    cur = await conn.execute(
+        "DELETE FROM meal_logs WHERE user_id = ? AND id = ?",
+        (int(user_id), int(log_id)),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+async def daily_nutrition_totals(
+    conn: aiosqlite.Connection, user_id: int, local_date: str
+) -> Dict[str, Any]:
+    """Суммировать личные калории и БЖУ пользователя за дату."""
+    cur = await conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(kcal), 0) AS kcal,
+            COALESCE(SUM(protein_g), 0) AS protein_g,
+            COALESCE(SUM(fat_g), 0) AS fat_g,
+            COALESCE(SUM(carbs_g), 0) AS carbs_g,
+            COUNT(*) AS meals_count
+        FROM meal_logs
+        WHERE user_id = ? AND local_date = ?
+        """,
+        (int(user_id), str(local_date)),
+    )
+    row = await cur.fetchone()
+    d = row_to_dict(row) if row else {}
+    return {
+        "kcal": round(float(d.get("kcal") or 0.0)),
+        "protein_g": round(float(d.get("protein_g") or 0.0), 1),
+        "fat_g": round(float(d.get("fat_g") or 0.0), 1),
+        "carbs_g": round(float(d.get("carbs_g") or 0.0), 1),
+        "meals_count": int(d.get("meals_count") or 0),
+    }
+
+
+# --- Personal Workout Logs (strictly user-private) ---
+
+async def add_workout_log(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+    title: str,
+    *,
+    focus_area: str = "full_body",
+    duration_min: int = 5,
+    equipment_used: str = "",
+    intensity: str = "easy",
+    kcal_burned: int = 0,
+    is_lazy_start: bool = False,
+) -> int:
+    """Записать выполненную тренировку или микро-старт в личную историю."""
+    now = utc_now_str()
+    cur = await conn.execute(
+        """
+        INSERT INTO workout_logs (
+            user_id, local_date, title, focus_area, duration_min,
+            equipment_used, intensity, kcal_burned, is_lazy_start, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            str(local_date),
+            str(title or "Тренировка").strip(),
+            str(focus_area or "full_body").strip(),
+            max(1, int(duration_min or 5)),
+            str(equipment_used or "").strip(),
+            str(intensity or "easy").strip(),
+            max(0, int(kcal_burned or 0)),
+            1 if is_lazy_start else 0,
+            now,
+        ),
+    )
+    await conn.commit()
+    return int(cur.lastrowid)
+
+
+async def list_workout_logs(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    limit: int = 10,
+    since_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Вернуть последние личные тренировки пользователя."""
+    eff_limit = max(1, int(limit or 10))
+    if since_date:
+        cur = await conn.execute(
+            """
+            SELECT * FROM workout_logs
+            WHERE user_id = ? AND local_date >= ?
+            ORDER BY local_date DESC, id DESC
+            LIMIT ?
+            """,
+            (int(user_id), str(since_date), eff_limit),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            SELECT * FROM workout_logs
+            WHERE user_id = ?
+            ORDER BY local_date DESC, id DESC
+            LIMIT ?
+            """,
+            (int(user_id), eff_limit),
+        )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def workout_stats_week(
+    conn: aiosqlite.Connection, user_id: int, local_date: str
+) -> Dict[str, Any]:
+    """Сводка тренировок за последние 7 дней (включая сегодня) и за сегодня."""
+    try:
+        end_d = datetime.date.fromisoformat(str(local_date))
+    except Exception:
+        end_d = datetime.date.today()
+    since_str = (end_d - datetime.timedelta(days=6)).isoformat()
+    logs = await list_workout_logs(conn, user_id, limit=50, since_date=since_str)
+    today_str = end_d.isoformat()
+    recent_areas: List[str] = []
+    for row in logs:
+        area = str(row.get("focus_area") or "").strip()
+        if area and area not in recent_areas:
+            recent_areas.append(area)
+    return {
+        "since_date": since_str,
+        "count": len(logs),
+        "total_minutes": sum(int(r.get("duration_min") or 0) for r in logs),
+        "lazy_starts": sum(1 for r in logs if int(r.get("is_lazy_start") or 0) == 1),
+        "kcal_burned": sum(int(r.get("kcal_burned") or 0) for r in logs),
+        "today_kcal_burned": sum(
+            int(r.get("kcal_burned") or 0)
+            for r in logs
+            if str(r.get("local_date") or "") == today_str
+        ),
+        "recent_focus_areas": recent_areas,
+        "latest": logs[0] if logs else None,
+    }
 
 
 

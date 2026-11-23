@@ -51,6 +51,7 @@ def food_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
             [InlineKeyboardButton(text="✨ Придумать из холодильника", callback_data="kitchen:ai_chef")],
+            [InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today")],
             [InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan")],
             [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
             [InlineKeyboardButton(text="📥 Импорт корзины / чека", callback_data="kitchen:cart_import")],
@@ -93,13 +94,16 @@ def home_menu_keyboard() -> InlineKeyboardMarkup:
 def movement_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Разминка 5 мин", callback_data="move:warmup")],
-            [InlineKeyboardButton(text="Дом тренировка 10-15", callback_data="move:home10")],
-            [InlineKeyboardButton(text="Дом тренировка 20 мин", callback_data="move:home20")],
-            [InlineKeyboardButton(text="Короткая прогулка", callback_data="move:short")],
-            [InlineKeyboardButton(text="Прогулка подлиннее", callback_data="move:long")],
-            [InlineKeyboardButton(text="⚖ Вес/цели", callback_data="move:weight")],
-            [InlineKeyboardButton(text="Фокус 20/10", callback_data="move:focus")],
+            [InlineKeyboardButton(text="🫠 Лень начинать (микро-старт 3–5 мин)", callback_data="fit:lazy")],
+            [InlineKeyboardButton(text="🏋️ Тренировка под мой дом", callback_data="fit:workout_menu")],
+            [InlineKeyboardButton(text="⚖ Умные весы и параметры тела", callback_data="fit:body")],
+            [InlineKeyboardButton(text="🧰 Мой инвентарь дома", callback_data="fit:gear")],
+            [InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today")],
+            [InlineKeyboardButton(text="📊 Прогресс за неделю", callback_data="fit:stats")],
+            [
+                InlineKeyboardButton(text="🚶 Прогулка", callback_data="move:short"),
+                InlineKeyboardButton(text="⏱ Фокус 20/10", callback_data="move:focus"),
+            ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:menu")],
         ]
     )

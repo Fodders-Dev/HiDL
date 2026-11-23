@@ -12,7 +12,7 @@ import aiosqlite
 
 from config import MCPSettings
 from db import repositories as repo
-from services import calendar_service, context_builder, karma_service, kitchen_ai, pulse_service
+from services import calendar_service, context_builder, fitness_nutrition, karma_service, kitchen_ai, pulse_service
 from services.inbox_parser import compute_one_time_last_sent
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_time_local, local_date_str, parse_hhmm
@@ -348,8 +348,19 @@ async def _tool_get_kitchen(
             continue
         recipes_out.append(_scale_recipe(r, servings))
 
+    advice = await fitness_nutrition.get_daily_nutrition_advice(
+        db, user, now_utc=_now_utc_naive()
+    )
     return {
         "meal_profile": profile,
+        "daily_nutrition": {
+            "local_date": advice["local_date"],
+            "targets": advice["targets"],
+            "eaten": advice["eaten"],
+            "remaining": advice["remaining"],
+            "eat_more": advice["eat_more"],
+            "go_easy_on": advice["go_easy_on"],
+        },
         "pantry_items": [
             {
                 "id": p.get("id"),
@@ -1190,6 +1201,136 @@ async def _tool_add_recipe(
     }
 
 
+async def _tool_get_fitness_nutrition(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    _ = (settings, args)
+    now_utc = _now_utc_naive()
+    user_id = int(user["id"])
+    tz = str(user.get("timezone") or "UTC")
+    local_date = local_date_str(now_utc, tz)
+    advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
+    trend = await repo.body_metrics_trend(db, user_id, days=30)
+    workouts_week = await repo.workout_stats_week(db, user_id, local_date)
+    equipment = repo.get_user_equipment(user)
+    return {
+        "local_date": advice["local_date"],
+        "body_profile": {
+            "height_cm": user.get("height_cm"),
+            "age_years": user.get("age_years"),
+            "sex": user.get("sex") or user.get("gender") or "",
+            "activity_level": user.get("activity_level") or "light",
+            "weight_goal": user.get("weight_goal") or "loss",
+            "weight_target": user.get("weight_target"),
+        },
+        "equipment": equipment,
+        "latest_scale": trend.get("latest"),
+        "body_trend_30d": {
+            "count": trend.get("count"),
+            "weight_delta": trend.get("weight_delta"),
+            "fat_delta": trend.get("fat_delta"),
+            "muscle_delta": trend.get("muscle_delta"),
+            "water_delta": trend.get("water_delta"),
+            "feedback": fitness_nutrition.format_body_trend_feedback(
+                trend, str(user.get("weight_goal") or "loss")
+            ),
+        },
+        "daily_nutrition": {
+            "targets": advice["targets"],
+            "eaten": advice["eaten"],
+            "remaining": advice["remaining"],
+            "over": advice["over"],
+            "eat_more": advice["eat_more"],
+            "go_easy_on": advice["go_easy_on"],
+            "meals": advice["meals"],
+        },
+        "workouts_week": workouts_week,
+    }
+
+
+async def _tool_log_meal(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    _ = settings
+    now_utc = _now_utc_naive()
+    tz = str(user.get("timezone") or "UTC")
+    target_date = _validate_iso_date(args.get("date")) or local_date_str(now_utc, tz)
+    raw_text = str(args.get("text") or "").strip()
+    title = str(args.get("title") or "").strip()
+    slot_raw = str(args.get("meal_slot") or "").strip().lower()
+    servings = max(0.1, float(args.get("servings") or 1.0))
+
+    kcal_raw = args.get("kcal")
+    if kcal_raw is not None:
+        try:
+            kcal_val = float(kcal_raw)
+        except (TypeError, ValueError):
+            kcal_val = 0.0
+        if kcal_val <= 0:
+            raise ToolError("Параметр kcal должен быть положительным числом.")
+        if not title:
+            title = raw_text or "Приём пищи"
+        protein_g = float(args.get("protein_g") or 0.0)
+        fat_g = float(args.get("fat_g") or 0.0)
+        carbs_g = float(args.get("carbs_g") or 0.0)
+        meal_slot = slot_raw if slot_raw in {"breakfast", "lunch", "dinner", "snack"} else "snack"
+    else:
+        query_text = raw_text or title
+        if not query_text:
+            raise ToolError("Передай title или text описания еды (либо явные kcal/protein_g/fat_g/carbs_g).")
+        parsed = await fitness_nutrition.parse_meal_input(raw_text=query_text)
+        if not parsed.get("ok"):
+            raise ToolError("Не удалось оценить КБЖУ по описанию — передай явно kcal, protein_g, fat_g, carbs_g.")
+        title = title or str(parsed["title"])
+        kcal_val = float(parsed["kcal"])
+        protein_g = float(parsed["protein_g"])
+        fat_g = float(parsed["fat_g"])
+        carbs_g = float(parsed["carbs_g"])
+        meal_slot = slot_raw if slot_raw in {"breakfast", "lunch", "dinner", "snack"} else str(parsed.get("meal_slot") or "snack")
+
+    log_id = await repo.add_meal_log(
+        db,
+        int(user["id"]),
+        target_date,
+        title,
+        meal_slot=meal_slot,
+        servings=servings,
+        kcal=round(kcal_val * servings, 1),
+        protein_g=round(protein_g * servings, 1),
+        fat_g=round(fat_g * servings, 1),
+        carbs_g=round(carbs_g * servings, 1),
+        source="mcp",
+    )
+    advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
+    return {
+        "ok": True,
+        "log_id": log_id,
+        "local_date": target_date,
+        "logged": {
+            "title": title,
+            "meal_slot": meal_slot,
+            "servings": servings,
+            "kcal": round(kcal_val * servings, 1),
+            "protein_g": round(protein_g * servings, 1),
+            "fat_g": round(fat_g * servings, 1),
+            "carbs_g": round(carbs_g * servings, 1),
+        },
+        "daily_nutrition": {
+            "targets": advice["targets"],
+            "eaten": advice["eaten"],
+            "remaining": advice["remaining"],
+            "eat_more": advice["eat_more"],
+            "go_easy_on": advice["go_easy_on"],
+        },
+    }
+
+
 ToolHandler = Callable[[aiosqlite.Connection, dict[str, Any], MCPSettings, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 _TOOL_REGISTRY: list[dict[str, Any]] = [
@@ -1595,6 +1736,37 @@ _TOOL_REGISTRY: list[dict[str, Any]] = [
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
         "handler": _tool_add_recipe,
+        "requires_write": True,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_get_fitness_nutrition",
+        "description": "Получить профиль тела, замеры умных весов и тренд за 30 дней, домашний инвентарь, суточный КБЖУ (цель/съедено/осталось/советы) и статистику тренировок за неделю.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
+        "handler": _tool_get_fitness_nutrition,
+        "requires_write": False,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_log_meal",
+        "description": "Записать приём пищи в личный дневник КБЖУ HiDL (по явным цифрам КБЖУ или текстовому описанию) и вернуть обновлённый остаток на день.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Название блюда."},
+                "text": {"type": "string", "description": "Текстовое описание еды для оценки КБЖУ, если цифры не переданы."},
+                "meal_slot": {"type": "string", "enum": ["breakfast", "lunch", "dinner", "snack"]},
+                "date": {"type": "string", "description": "YYYY-MM-DD (по умолчанию сегодня)."},
+                "servings": {"type": "number", "minimum": 0.1, "maximum": 10},
+                "kcal": {"type": "number", "minimum": 1},
+                "protein_g": {"type": "number", "minimum": 0},
+                "fat_g": {"type": "number", "minimum": 0},
+                "carbs_g": {"type": "number", "minimum": 0},
+            },
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "handler": _tool_log_meal,
         "requires_write": True,
         "requires_diary": False,
     },

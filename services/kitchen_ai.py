@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
-from services import karma_service, pulse_service
+from services import fitness_nutrition, karma_service, pulse_service
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_time_local, local_date_str
 
@@ -463,6 +463,7 @@ async def suggest_meals_now(
     local_today = local_date_str(now, tz)
     recent_since = (datetime.date.fromisoformat(local_today) - datetime.timedelta(days=4)).isoformat()
     recent_ids = set(await repo.get_recent_meal_recipe_ids(db, user_id, recent_since))
+    advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now)
     excl_id_set = {str(x) for x in (exclude_ids or []) if x}
     excl_terms = list(excluded_terms or [])
 
@@ -514,12 +515,16 @@ async def suggest_meals_now(
         if rid in recent_ids:
             score -= 18.0
 
+        nutrition = fitness_nutrition.estimate_recipe_nutrition(recipe)
+        score += fitness_nutrition.score_recipe_for_macros(nutrition, advice)
+
         scored.append(
             {
                 "recipe": recipe,
                 "have": match["have"],
                 "missing": match["missing"],
                 "coverage": cov,
+                "nutrition": nutrition,
                 "score": round(score, 2),
             }
         )
@@ -538,6 +543,7 @@ async def suggest_meals_now(
         "energy": eff_energy,
         "meal_profile": profile,
         "pantry_count": len(pantry),
+        "daily_advice": advice,
         "suggestions": scored[:limit],
     }
 
@@ -704,6 +710,7 @@ async def commit_cooked_recipe(
     return {
         "ok": True,
         "recipe": recipe,
+        "nutrition_per_serving": fitness_nutrition.estimate_recipe_nutrition(recipe),
         "deducted": deducted,
         "missing": match["missing"],
         "marked_slot": marked_slot,
@@ -1345,12 +1352,13 @@ async def import_cart_items(
 
 
 _AI_CHEF_SYSTEM_PROMPT = (
-    "Ты — практичный домашний ИИ-шеф HiDL. Придумывай понятные, вкусные рецепты из того, что есть дома. "
-    "Ответь строго JSON-объектом вида: "
+    "Ты — практичный домашний ИИ-шеф HiDL. Придумывай понятные, вкусные рецепты из того, что есть дома, "
+    "и подстраивай их под КБЖУ-остаток пользователя на сегодня. Ответь строго JSON-объектом вида: "
     "{\"recipes\": [{\"title\": str, \"desc\": str, \"time_minutes\": int, \"base_servings\": int, "
-    "\"tags\": [str], \"ingredients\": [{\"name\": str, \"qty\": float, \"unit\": str}], \"steps\": [str]}]}. "
+    "\"tags\": [str], \"nutrition\": {\"kcal\": int, \"protein_g\": float, \"fat_g\": float, \"carbs_g\": float}, "
+    "\"ingredients\": [{\"name\": str, \"qty\": float, \"unit\": str}], \"steps\": [str]}]}. "
     "Строго соблюдай диету пользователя (vegan = 0 животных продуктов: без мяса, рыбы, молочки, сыра, яиц, мёда; "
-    "vegetarian = без мяса и рыбы). В первую очередь используй скоропортящиеся продукты."
+    "vegetarian = без мяса и рыбы). Поле nutrition указывай примерно за 1 порцию. В первую очередь используй скоропортящиеся продукты."
 )
 
 
@@ -1405,16 +1413,19 @@ def _normalize_ai_recipe(raw: Any, *, profile: str, eff_slot: str) -> Optional[D
     if not ingredients or not steps:
         return None
 
-    return {
+    recipe_obj: Dict[str, Any] = {
         "title": title,
         "desc": desc,
         "time_minutes": t_min,
         "base_servings": servings,
         "tags": tags,
+        "nutrition": raw.get("nutrition") if isinstance(raw.get("nutrition"), dict) else None,
         "ingredients": ingredients,
         "steps": steps,
         "source": "ai_chef",
     }
+    recipe_obj["nutrition"] = fitness_nutrition.estimate_recipe_nutrition(recipe_obj)
+    return recipe_obj
 
 
 async def generate_ai_recipes_from_pantry(
@@ -1427,7 +1438,7 @@ async def generate_ai_recipes_from_pantry(
     llm_client_instance: Optional[LLMClient] = None,
     now_utc: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
-    """Сгенерировать 2–3 новых рецепта через LLM по реальным остаткам холодильника."""
+    """Сгенерировать 2–3 новых рецепта через LLM по реальным остаткам холодильника и КБЖУ."""
     now = now_utc or datetime.datetime.utcnow()
     user_id = int(user["id"])
     tz = user.get("timezone") or "UTC"
@@ -1445,6 +1456,7 @@ async def generate_ai_recipes_from_pantry(
     soon, _ = await repo.pantry_expiring(db, user_id, local_today, window_days=3)
     soon_rows = rows_to_dicts(soon)
     expiring_names = [str(r.get("name") or "") for r in soon_rows if r.get("name")]
+    advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now)
 
     client = llm_client_instance or default_llm_client
     if not client.is_configured():
@@ -1457,6 +1469,7 @@ async def generate_ai_recipes_from_pantry(
             "meal_profile": profile,
             "meal_slot": eff_slot,
             "meal_slot_label": slot_label,
+            "daily_advice": advice,
         }
 
     eff_count = max(1, min(5, int(count or 3)))
@@ -1469,6 +1482,7 @@ async def generate_ai_recipes_from_pantry(
     prompt = (
         f"Придумай ровно {eff_count} разных рецепта на {slot_label} до {max_minutes} мин.\n"
         f"Профиль питания: {profile}.\n"
+        f"Ориентир по КБЖУ: {advice['chef_hint']}\n"
         f"Продукты в холодильнике: {pantry_desc}.\n"
         f"Скоропортящиеся (используй в первую очередь): {expiring_desc}.\n"
         "Опирайся на имеющиеся продукты; допустимо добавить не больше 1–2 базовых мелочей."
@@ -1489,6 +1503,7 @@ async def generate_ai_recipes_from_pantry(
             "meal_profile": profile,
             "meal_slot": eff_slot,
             "meal_slot_label": slot_label,
+            "daily_advice": advice,
         }
 
     recipes = [
@@ -1506,4 +1521,5 @@ async def generate_ai_recipes_from_pantry(
         "meal_profile": profile,
         "meal_slot": eff_slot,
         "meal_slot_label": slot_label,
+        "daily_advice": advice,
     }

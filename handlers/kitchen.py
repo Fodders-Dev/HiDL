@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import household_service, kitchen_ai
+from services import fitness_nutrition, household_service, kitchen_ai
 from utils.rows import rows_to_dicts
 from utils.time import format_date_display, local_date_str
 from utils.texts import error
@@ -224,6 +224,7 @@ def kitchen_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
         [InlineKeyboardButton(text="✨ Придумать из холодильника", callback_data="kitchen:ai_chef")],
+        [InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today")],
         [InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan")],
         [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
         [InlineKeyboardButton(text="📥 Импорт корзины / чека", callback_data="kitchen:cart_import")],
@@ -438,9 +439,15 @@ def _format_suggestion_line(idx: int, item: dict) -> str:
     recipe = item["recipe"]
     title = _h(recipe.get("title") or "Рецепт")
     t_min = int(recipe.get("time_minutes") or 15)
+    nutr = item.get("nutrition") or {}
+    nutr_str = (
+        f" · ~{int(nutr['kcal'])} ккал (Б{float(nutr['protein_g']):g}/Ж{float(nutr['fat_g']):g}/У{float(nutr['carbs_g']):g})"
+        if nutr.get("kcal")
+        else ""
+    )
     have = item.get("have") or []
     missing = item.get("missing") or []
-    lines = [f"{idx}. <b>{title}</b> · {t_min} мин"]
+    lines = [f"{idx}. <b>{title}</b> · {t_min} мин{nutr_str}"]
     if not missing:
         lines.append("   ✅ <i>Всё нужное есть дома</i>")
     else:
@@ -502,11 +509,19 @@ async def quick_pick_recipes(callback: types.CallbackQuery, db):
     slot_label = all_res["meal_slot_label"]
     pantry_count = int(all_res["pantry_count"] or 0)
     energy_label = kitchen_ai.ENERGY_MODES.get(energy, "🍳 20–30м")
+    advice = all_res.get("daily_advice") or {}
 
     lines = [
         f"🍳 <b>Что приготовить на {_h(slot_label)}</b> ({_h(energy_label)})",
-        f"Питание: <b>{_diet_label(profile)}</b> • В холодильнике: {pantry_count} поз.\n",
+        f"Питание: <b>{_diet_label(profile)}</b> • В холодильнике: {pantry_count} поз.",
     ]
+    if advice.get("summary_line"):
+        lines.append(f"🔥 {_h(advice['summary_line'])}")
+    if advice.get("eat_more"):
+        lines.append(f"💡 Лучше добрать: {_h(advice['eat_more'][0])}")
+    if advice.get("go_easy_on"):
+        lines.append(f"⚠️ Поаккуратнее с: {_h(advice['go_easy_on'][0])}")
+    lines.append("")
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
@@ -529,6 +544,7 @@ async def quick_pick_recipes(callback: types.CallbackQuery, db):
         InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
     ])
     rows.append([
+        InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
         InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
         InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes"),
     ])
@@ -621,10 +637,15 @@ async def view_recipe(callback: types.CallbackQuery, db):
     servings = max(1, servings)
     factor = servings / base
 
+    nutr = fitness_nutrition.estimate_recipe_nutrition(recipe)
     title = _h(recipe.get("title", "Рецепт"))
     desc = _h(recipe.get("desc", ""))
     text = f"<b>{title}</b>\n{desc}\n\n"
-    text += f"⏱ {int(recipe.get('time_minutes', 15))} мин • 🍽 {servings} порц.\n\n"
+    text += f"⏱ {int(recipe.get('time_minutes', 15))} мин • 🍽 {servings} порц.\n"
+    text += (
+        f"🔥 ~<b>{nutr['kcal']} ккал</b> на 1 порцию "
+        f"(Б {nutr['protein_g']:g}г / Ж {nutr['fat_g']:g}г / У {nutr['carbs_g']:g}г)\n\n"
+    )
     text += f"🧾 <b>Ингредиенты</b> (на {servings} порц.):\n"
     for ing in recipe.get("ingredients") or []:
         qty = _scale_qty(ing.get("qty", 0), factor, ing.get("unit", ""))
@@ -680,6 +701,7 @@ async def view_recipe(callback: types.CallbackQuery, db):
         inline_keyboard=[
             serv_row,
             action_row,
+            [InlineKeyboardButton(text="🍽 Записать 1 порц. в КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
             [InlineKeyboardButton(text="✅ Проверить продукты", callback_data=f"kitchen:cook_check:{rid}:{servings}:{category}:{page}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"kitchen:recipes_cat:{category}:{page}")],
         ]
@@ -722,6 +744,7 @@ async def cook_fast_commit(callback: types.CallbackQuery, db):
         return
 
     recipe = res["recipe"]
+    nutr = res.get("nutrition_per_serving") or {}
     actor_name = _h(user.get("name") or "Партнёр")
     await household_service.notify_household_partners(
         getattr(callback, "bot", None),
@@ -730,6 +753,11 @@ async def cook_fast_commit(callback: types.CallbackQuery, db):
         f"🍳 <b>{actor_name}</b> приготовил(а): <b>{_h(recipe.get('title'))}</b>.",
     )
     lines = [f"🍽 <b>Приготовлено: {_h(recipe.get('title'))}!</b>"]
+    if nutr.get("kcal"):
+        lines.append(
+            f"🔥 1 порция: ~<b>{nutr['kcal']} ккал</b> "
+            f"(Б {float(nutr['protein_g']):g}г / Ж {float(nutr['fat_g']):g}г / У {float(nutr['carbs_g']):g}г)"
+        )
     deducted = res.get("deducted") or []
     if deducted:
         ded_str = ", ".join(
@@ -756,6 +784,7 @@ async def cook_fast_commit(callback: types.CallbackQuery, db):
         lines.append(f"💓 Карма еды: +{delta} → <b>{score_after}/100</b>")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍽 Записать 1 порц. в мой КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
         [
             InlineKeyboardButton(text="🍳 Что приготовить ещё?", callback_data="kitchen:quick_pick"),
             InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
@@ -867,11 +896,29 @@ async def cook_commit(callback: types.CallbackQuery, state: FSMContext, db):
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Да, добавить", callback_data="kitchen:shop_auto_add")],
+            [InlineKeyboardButton(text="🍽 Записать 1 порц. в КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
             [InlineKeyboardButton(text="Нет, спасибо", callback_data=f"kitchen:cook_view:{rid}:{servings}:{category}:{page}")],
         ])
         await callback.message.edit_text(text, reply_markup=kb)
     else:
-        await callback.message.edit_text("Всё готово! Приятного аппетита 😋\nЧто дальше?", reply_markup=kitchen_main_keyboard())
+        nutr = res.get("nutrition_per_serving") or {}
+        nutr_note = (
+            f"\n🔥 1 порция: ~<b>{nutr['kcal']} ккал</b> (Б {float(nutr['protein_g']):g}г / Ж {float(nutr['fat_g']):g}г / У {float(nutr['carbs_g']):g}г)"
+            if nutr.get("kcal")
+            else ""
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🍽 Записать 1 порц. в мой КБЖУ", callback_data=f"kbju:log_recipe:{rid}:1")],
+            [
+                InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main"),
+            ],
+        ])
+        await callback.message.edit_text(
+            f"Всё готово! Приятного аппетита 😋{nutr_note}\nЧто дальше?",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
 
 
 # --- HANDLERS: 3-4 DAY MEAL PLAN ---
@@ -1387,11 +1434,14 @@ def _render_ai_recipes_list(
     slot_label: str,
     pantry_count: int,
     expiring_names: list[str],
+    advice_summary: str = "",
 ) -> Tuple[str, InlineKeyboardMarkup]:
     lines = [
         f"✨ <b>ИИ-шеф: идеи на {_h(slot_label)}</b>",
         f"Питание: <b>{_diet_label(profile)}</b> • В холодильнике: {pantry_count} поз.",
     ]
+    if advice_summary:
+        lines.append(f"🔥 {_h(advice_summary)}")
     if expiring_names:
         lines.append(f"⏰ В первую очередь пускаем в дело: {_h(', '.join(expiring_names[:5]))}")
     lines.append("")
@@ -1401,7 +1451,13 @@ def _render_ai_recipes_list(
         title = str(rec.get("title") or f"Блюдо {idx}")
         t_min = int(rec.get("time_minutes") or 20)
         desc = str(rec.get("desc") or "").strip()
-        lines.append(f"<b>{idx}. {_h(title)}</b> · {t_min} мин")
+        nutr = rec.get("nutrition") or {}
+        nutr_str = (
+            f" · ~{int(nutr['kcal'])} ккал (Б{float(nutr['protein_g']):g}/Ж{float(nutr['fat_g']):g}/У{float(nutr['carbs_g']):g})"
+            if nutr.get("kcal")
+            else ""
+        )
+        lines.append(f"<b>{idx}. {_h(title)}</b> · {t_min} мин{nutr_str}")
         if desc:
             lines.append(f"<i>{_h(desc)}</i>")
         rows.append([
@@ -1435,6 +1491,7 @@ async def ai_chef_suggest(callback: types.CallbackQuery, state: FSMContext, db):
         await safe_edit(callback.message, msg, reply_markup=kb)
         return
 
+    advice_summary = str((res.get("daily_advice") or {}).get("summary_line") or "")
     await state.update_data(
         ai_recipes=res["recipes"],
         ai_chef_meta={
@@ -1442,6 +1499,7 @@ async def ai_chef_suggest(callback: types.CallbackQuery, state: FSMContext, db):
             "slot_label": res["meal_slot_label"],
             "pantry_count": res["pantry_count"],
             "expiring_names": res["expiring_names"],
+            "advice_summary": advice_summary,
         },
     )
     text, kb = _render_ai_recipes_list(
@@ -1450,6 +1508,7 @@ async def ai_chef_suggest(callback: types.CallbackQuery, state: FSMContext, db):
         slot_label=res["meal_slot_label"],
         pantry_count=int(res["pantry_count"] or 0),
         expiring_names=list(res["expiring_names"] or []),
+        advice_summary=advice_summary,
     )
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
 
@@ -1470,10 +1529,16 @@ async def ai_chef_view_recipe(callback: types.CallbackQuery, state: FSMContext):
         return
 
     rec = recipes[idx]
+    nutr = rec.get("nutrition") or fitness_nutrition.estimate_recipe_nutrition(rec)
     lines = [f"✨ <b>{_h(rec.get('title'))}</b>"]
     if rec.get("desc"):
         lines.append(_h(rec["desc"]))
     lines.append(f"\n⏱ {int(rec.get('time_minutes') or 20)} мин • 🍽 {int(rec.get('base_servings') or 2)} порц.")
+    if nutr.get("kcal"):
+        lines.append(
+            f"🔥 ~<b>{nutr['kcal']} ккал</b> на 1 порцию "
+            f"(Б {float(nutr['protein_g']):g}г / Ж {float(nutr['fat_g']):g}г / У {float(nutr['carbs_g']):g}г)"
+        )
     lines.append("\n🧾 <b>Ингредиенты:</b>")
     for ing in rec.get("ingredients") or []:
         lines.append(_format_ing_line(ing.get("name", ""), float(ing.get("qty") or 1), str(ing.get("unit") or "")))
@@ -1514,6 +1579,7 @@ async def ai_chef_save_recipe(callback: types.CallbackQuery, state: FSMContext, 
         time_minutes=int(rec.get("time_minutes") or 20),
         ingredients=list(rec.get("ingredients") or []),
         steps=list(rec.get("steps") or []),
+        nutrition=rec.get("nutrition") if isinstance(rec.get("nutrition"), dict) else None,
         source="ai_chef",
         source_label="ИИ-шеф",
     )
@@ -1554,6 +1620,7 @@ async def ai_chef_back(callback: types.CallbackQuery, state: FSMContext, db):
         slot_label=str(meta.get("slot_label") or "блюдо"),
         pantry_count=int(meta.get("pantry_count") or 0),
         expiring_names=list(meta.get("expiring_names") or []),
+        advice_summary=str(meta.get("advice_summary") or ""),
     )
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
 

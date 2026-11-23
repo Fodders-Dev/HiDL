@@ -657,6 +657,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             time_minutes INTEGER NOT NULL DEFAULT 20,
             ingredients_json TEXT NOT NULL DEFAULT '[]',
             steps_json TEXT NOT NULL DEFAULT '[]',
+            nutrition_json TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT 'ai_chef',
             source_label TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -667,6 +668,44 @@ async def init_db(conn: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_user_recipes_user_updated
             ON user_recipes(user_id, updated_at);
+
+        CREATE TABLE IF NOT EXISTS meal_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            meal_slot TEXT NOT NULL DEFAULT 'snack',
+            title TEXT NOT NULL,
+            recipe_id TEXT NOT NULL DEFAULT '',
+            servings REAL NOT NULL DEFAULT 1.0,
+            kcal REAL NOT NULL DEFAULT 0,
+            protein_g REAL NOT NULL DEFAULT 0,
+            fat_g REAL NOT NULL DEFAULT 0,
+            carbs_g REAL NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'manual',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_meal_logs_user_date
+            ON meal_logs(user_id, local_date);
+
+        CREATE TABLE IF NOT EXISTS workout_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            title TEXT NOT NULL,
+            focus_area TEXT NOT NULL DEFAULT 'full_body',
+            duration_min INTEGER NOT NULL DEFAULT 5,
+            equipment_used TEXT NOT NULL DEFAULT '',
+            intensity TEXT NOT NULL DEFAULT 'easy',
+            kcal_burned INTEGER NOT NULL DEFAULT 0,
+            is_lazy_start INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workout_logs_user_date
+            ON workout_logs(user_id, local_date);
 
         CREATE TABLE IF NOT EXISTS user_calendar_connections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1365,6 +1404,7 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             time_minutes INTEGER NOT NULL DEFAULT 20,
             ingredients_json TEXT NOT NULL DEFAULT '[]',
             steps_json TEXT NOT NULL DEFAULT '[]',
+            nutrition_json TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT 'ai_chef',
             source_label TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -1375,6 +1415,44 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_user_recipes_user_updated
             ON user_recipes(user_id, updated_at);
+
+        CREATE TABLE IF NOT EXISTS meal_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            meal_slot TEXT NOT NULL DEFAULT 'snack',
+            title TEXT NOT NULL,
+            recipe_id TEXT NOT NULL DEFAULT '',
+            servings REAL NOT NULL DEFAULT 1.0,
+            kcal REAL NOT NULL DEFAULT 0,
+            protein_g REAL NOT NULL DEFAULT 0,
+            fat_g REAL NOT NULL DEFAULT 0,
+            carbs_g REAL NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'manual',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_meal_logs_user_date
+            ON meal_logs(user_id, local_date);
+
+        CREATE TABLE IF NOT EXISTS workout_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            title TEXT NOT NULL,
+            focus_area TEXT NOT NULL DEFAULT 'full_body',
+            duration_min INTEGER NOT NULL DEFAULT 5,
+            equipment_used TEXT NOT NULL DEFAULT '',
+            intensity TEXT NOT NULL DEFAULT 'easy',
+            kcal_burned INTEGER NOT NULL DEFAULT 0,
+            is_lazy_start INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workout_logs_user_date
+            ON workout_logs(user_id, local_date);
 
         CREATE TABLE IF NOT EXISTS user_calendar_connections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1859,6 +1937,76 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
             WHERE household_id IS NULL
             """
         )
+
+    # --- Fitness, Smart Scales & КБЖУ ---
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meal_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            meal_slot TEXT NOT NULL DEFAULT 'snack',
+            title TEXT NOT NULL,
+            recipe_id TEXT NOT NULL DEFAULT '',
+            servings REAL NOT NULL DEFAULT 1.0,
+            kcal REAL NOT NULL DEFAULT 0,
+            protein_g REAL NOT NULL DEFAULT 0,
+            fat_g REAL NOT NULL DEFAULT 0,
+            carbs_g REAL NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'manual',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_meal_logs_user_date
+            ON meal_logs(user_id, local_date);
+
+        CREATE TABLE IF NOT EXISTS workout_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            title TEXT NOT NULL,
+            focus_area TEXT NOT NULL DEFAULT 'full_body',
+            duration_min INTEGER NOT NULL DEFAULT 5,
+            equipment_used TEXT NOT NULL DEFAULT '',
+            intensity TEXT NOT NULL DEFAULT 'easy',
+            kcal_burned INTEGER NOT NULL DEFAULT 0,
+            is_lazy_start INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_workout_logs_user_date
+            ON workout_logs(user_id, local_date);
+        """
+    )
+
+    users_fit_info = await conn.execute_fetchall("PRAGMA table_info(users);")
+    users_fit_cols = {row["name"] for row in users_fit_info}
+    for col_name, col_def in (
+        ("age_years", "INTEGER DEFAULT 0"),
+        ("sex", "TEXT DEFAULT ''"),
+        ("activity_level", "TEXT DEFAULT 'light'"),
+        ("equipment_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("custom_kcal_target", "INTEGER DEFAULT 0"),
+    ):
+        if users_fit_info and col_name not in users_fit_cols:
+            await conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")
+
+    weights_mig_info = await conn.execute_fetchall("PRAGMA table_info(weights);")
+    weights_mig_cols = {row["name"] for row in weights_mig_info}
+    for col_name, col_def in (
+        ("body_fat_pct", "REAL"),
+        ("muscle_mass_kg", "REAL"),
+        ("water_pct", "REAL"),
+        ("visceral_fat", "REAL"),
+        ("bmi", "REAL"),
+        ("source", "TEXT NOT NULL DEFAULT 'manual'"),
+        ("note", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if weights_mig_info and col_name not in weights_mig_cols:
+            await conn.execute(f"ALTER TABLE weights ADD COLUMN {col_name} {col_def};")
+
+    if ur_info and "nutrition_json" not in ur_cols:
+        await conn.execute("ALTER TABLE user_recipes ADD COLUMN nutrition_json TEXT NOT NULL DEFAULT '';")
 
     existing_articles = await conn.execute_fetchall(
         "SELECT title FROM knowledge_articles;"

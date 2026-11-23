@@ -265,6 +265,12 @@ async def move_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
     elif action == "home":
         from handlers import movement
         await movement.move_home(callback)
+    elif action == "home10":
+        from handlers import movement
+        await movement.move_home10(callback)
+    elif action == "home20":
+        from handlers import movement
+        await movement.move_home20(callback)
     elif action == "weight":
         from handlers import movement
         await movement.move_weight(callback, state=state, db=db)
