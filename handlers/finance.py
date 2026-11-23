@@ -1,4 +1,5 @@
 import datetime
+import html
 from collections import defaultdict
 
 from aiogram import Router, types
@@ -9,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard, money_menu_keyboard
+from services import household_service
 from utils.menu_match import looks_like_expense, match_menu_label
 from utils.rows import row_to_dict
 from utils.sender import safe_edit
@@ -293,10 +295,45 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         await safe_edit(callback.message, _MONEY_MENU_TEXT, reply_markup=money_menu_keyboard())
     elif action == "spent":
         await state.set_state(SpendState.amount)
+        await state.update_data(expense_scope="personal")
         await callback.message.answer(
             "Сколько ушло? Напиши сумму, или сразу сумму и категорию (например «500 еда»).",
             reply_markup=_cancel_kb(),
         )
+    elif action == "spent_household":
+        await state.set_state(SpendState.amount)
+        await state.update_data(expense_scope="household")
+        await callback.message.answer(
+            "🏠 <b>Общая трата дома.</b> Напиши сумму и категорию (например «3500 продукты»):",
+            reply_markup=_cancel_kb(),
+            parse_mode="HTML",
+        )
+    elif action == "household":
+        user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        hid = await repo.get_or_create_household(db, int(user["id"]))
+        summary = await repo.household_monthly_expenses_summary(db, hid)
+        lines = [
+            f"🏠 <b>Общие траты дома ({summary['month']}):</b> {format_money(summary['total'])}",
+        ]
+        by_member = summary.get("by_member") or []
+        if by_member:
+            lines.append("\nПо участникам:")
+            for m in by_member:
+                lines.append(f"• {html.escape(str(m['name']))}: {format_money(m['total'])}")
+        by_cat = summary.get("by_category") or {}
+        if by_cat:
+            lines.append("\nПо категориям:")
+            for cat, val in sorted(by_cat.items(), key=lambda pair: -pair[1])[:8]:
+                lines.append(f"• {html.escape(str(cat))}: {format_money(val)}")
+        if not by_member and not by_cat:
+            lines.append("\nПока нет общих трат за этот месяц.")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [types.InlineKeyboardButton(text="➕ Записать общую трату", callback_data="money:spent_household")],
+                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")],
+            ]
+        )
+        await safe_edit(callback.message, "\n".join(lines), reply_markup=kb, parse_mode="HTML")
     elif action == "report":
         user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
         text = await _compose_spent_week(db, user)
@@ -411,10 +448,13 @@ async def spend_amount(message: types.Message, state: FSMContext, db) -> None:
         return
     if len(parts) > 1:
         category = parts[1]
+        data = await state.get_data()
+        exp_scope = "household" if data.get("expense_scope") == "household" else "personal"
         user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
-        await repo.add_expense(db, user["id"], amount, category)
+        await repo.add_expense(db, user["id"], amount, category, scope=exp_scope)
         await state.clear()
-        await message.answer(f"Записала: {amount:.0f} ({category})", reply_markup=main_menu_keyboard())
+        prefix = "🏠 " if exp_scope == "household" else ""
+        await message.answer(f"Записала: {prefix}{amount:.0f} ({category})", reply_markup=main_menu_keyboard())
     else:
         await state.update_data(amount=amount)
         await state.set_state(SpendState.category)
@@ -446,9 +486,11 @@ async def spend_category(message: types.Message, state: FSMContext, db) -> None:
         await state.clear()
         await message.answer(f"Лимит для {limit_cat_name} — {limit:.0f} ₽/мес.", reply_markup=main_menu_keyboard())
         return
-    await repo.add_expense(db, user["id"], float(amount), category)
+    exp_scope = "household" if data.get("expense_scope") == "household" else "personal"
+    await repo.add_expense(db, user["id"], float(amount), category, scope=exp_scope)
     await state.clear()
-    await message.answer(f"Записала: {amount:.0f} ({category})", reply_markup=main_menu_keyboard())
+    prefix = "🏠 " if exp_scope == "household" else ""
+    await message.answer(f"Записала: {prefix}{amount:.0f} ({category})", reply_markup=main_menu_keyboard())
 
 
 @router.message(SpendState.payday_day, lambda m: bool(m.text and not m.text.startswith("/")))
@@ -523,7 +565,11 @@ async def _render_bills(db, user_id: int) -> str:
                 year += 1
         due_date = datetime.date(year, month, day)
         due_text = due_date.strftime("%d.%m.%Y")
-        lines.append(f"{paid} {row.get('title')}: ~{row.get('amount',0):.0f} ₽, до {due_text}")
+        scope_tag = "🏠 " if row.get("scope") == "household" else ""
+        paid_by = ""
+        if row.get("last_paid_month") == current_month and row.get("paid_by_name"):
+            paid_by = f" (оплатил(а) {row['paid_by_name']})"
+        lines.append(f"{paid} {scope_tag}{row.get('title')}: ~{row.get('amount',0):.0f} ₽, до {due_text}{paid_by}")
     return "Счета:\n" + "\n".join(lines)
 
 
@@ -545,12 +591,18 @@ async def bills_menu(
     bills = await repo.list_bills(db, user["id"])
     for b in bills:
         row = row_to_dict(b)
+        is_house = row.get("scope") == "household"
+        scope_btn_text = "🏠 Общий" if is_house else "👤 Личный"
         kb_rows.append(
             [
                 types.InlineKeyboardButton(
                     text=f"Оплачено {row['title']}",
                     callback_data=f"bill:pay:{row['id']}",
-                )
+                ),
+                types.InlineKeyboardButton(
+                    text=scope_btn_text,
+                    callback_data=f"bill:scope:{row['id']}",
+                ),
             ]
         )
     kb_rows.append([types.InlineKeyboardButton(text="➕ Добавить счёт", callback_data="bill:add")])
@@ -618,13 +670,41 @@ async def bill_set_day(message: types.Message, state: FSMContext, db) -> None:
     await bills_menu(message, state, db)
 
 
+@router.callback_query(lambda c: c.data and c.data.startswith("bill:scope:"))
+async def bill_toggle_scope(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+    _, _, bill_id_s = callback.data.split(":")
+    user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    new_scope = await repo.toggle_bill_scope(db, user["id"], int(bill_id_s))
+    if not new_scope:
+        await callback.answer("Счёт не найден", show_alert=True)
+        return
+    await callback.answer("Теперь счёт общий для дома 🏠" if new_scope == "household" else "Теперь счёт личный 👤")
+    await bills_menu(
+        callback.message,
+        state,
+        db,
+        tg_user_id=callback.from_user.id,
+        tg_full_name=callback.from_user.full_name,
+        use_edit=True,
+    )
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("bill:pay:"))
 async def bill_pay(callback: types.CallbackQuery, db) -> None:
     _, _, bill_id = callback.data.split(":")
     bill_id = int(bill_id)
     user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    bill = await repo.get_bill_by_id(db, user["id"], bill_id)
     current_month = datetime.date.today().strftime("%Y-%m")
     await repo.mark_bill_paid(db, user["id"], bill_id, current_month)
+    if bill and bill.get("scope") == "household":
+        actor_name = html.escape(str(user.get("name") or "Партнёр"))
+        await household_service.notify_household_partners(
+            getattr(callback, "bot", None),
+            db,
+            user,
+            f"✅ <b>{actor_name}</b> оплатил(а) общий счёт «{html.escape(str(bill.get('title') or 'Счёт'))}».",
+        )
     text = await _render_bills(db, user["id"])
     await callback.message.edit_text(text, reply_markup=None)
     await callback.message.answer("Отметила счёт как оплаченный.", reply_markup=main_menu_keyboard())

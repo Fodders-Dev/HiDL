@@ -89,3 +89,26 @@ def format_date_display(date_str: str) -> str:
         return f"{d.day:02d}.{d.month:02d}.{d.year}"
     except Exception:
         return date_str
+
+
+def is_in_time_window(
+    now_utc: datetime.datetime,
+    tz_str: str,
+    start_hhmm: str,
+    end_hhmm: str,
+) -> bool:
+    """Return True if local time falls inside [start_hhmm, end_hhmm) (supports wrap past midnight)."""
+    start_t = parse_hhmm(start_hhmm or "")
+    end_t = parse_hhmm(end_hhmm or "")
+    if not start_t or not end_t:
+        return False
+    tzinfo = tzinfo_from_string(tz_str or "UTC")
+    local_dt = now_utc.replace(tzinfo=datetime.timezone.utc).astimezone(tzinfo)
+    local_min = local_dt.hour * 60 + local_dt.minute
+    start_min = start_t.hour * 60 + start_t.minute
+    end_min = end_t.hour * 60 + end_t.minute
+    if start_min == end_min:
+        return False
+    if start_min < end_min:
+        return start_min <= local_min < end_min
+    return local_min >= start_min or local_min < end_min

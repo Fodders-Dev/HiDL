@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import kitchen_ai
+from services import household_service, kitchen_ai
 from utils.rows import rows_to_dicts
 from utils.time import format_date_display, local_date_str
 from utils.texts import error
@@ -722,6 +722,13 @@ async def cook_fast_commit(callback: types.CallbackQuery, db):
         return
 
     recipe = res["recipe"]
+    actor_name = _h(user.get("name") or "Партнёр")
+    await household_service.notify_household_partners(
+        getattr(callback, "bot", None),
+        db,
+        user,
+        f"🍳 <b>{actor_name}</b> приготовил(а): <b>{_h(recipe.get('title'))}</b>.",
+    )
     lines = [f"🍽 <b>Приготовлено: {_h(recipe.get('title'))}!</b>"]
     deducted = res.get("deducted") or []
     if deducted:
@@ -837,6 +844,14 @@ async def cook_commit(callback: types.CallbackQuery, state: FSMContext, db):
         await callback.answer("Рецепт не найден", show_alert=True)
         return
 
+    recipe = res.get("recipe") or {}
+    actor_name = _h(user.get("name") or "Партнёр")
+    await household_service.notify_household_partners(
+        getattr(callback, "bot", None),
+        db,
+        user,
+        f"🍳 <b>{actor_name}</b> приготовил(а): <b>{_h(recipe.get('title') or 'Блюдо')}</b>.",
+    )
     delta = int(res.get("karma_delta") or 0)
     await callback.answer(
         f"Приятного аппетита! Продукты списаны (+{delta} кармы)." if delta else "Приятного аппетита! Продукты списаны.",
@@ -1318,18 +1333,32 @@ async def cart_import_confirm(callback: types.CallbackQuery, state: FSMContext, 
         return
 
     user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    hid = await repo.get_or_create_household(db, int(user["id"]))
+    members = await repo.list_household_members(db, hid)
+    exp_scope = "household" if len(members) > 1 else "personal"
     total_amt = preview.get("total_amount") if mode == "both" else None
     res = await kitchen_ai.import_cart_items(
         db,
         user,
         items,
         total_amount=total_amt,
+        expense_scope=exp_scope,
         sync_shopping=True,
     )
     await state.clear()
 
     added = res.get("added") or []
     synced = res.get("synced_shopping") or []
+    actor_name = _h(user.get("name") or "Партнёр")
+    if added:
+        preview_names = ", ".join(_h(it["name"]) for it in added[:6])
+        more = f" и ещё {len(added) - 6}" if len(added) > 6 else ""
+        await household_service.notify_household_partners(
+            getattr(callback, "bot", None),
+            db,
+            user,
+            f"🛒 <b>{actor_name}</b> пополнил(а) общий холодильник (+{len(added)} поз.): {preview_names}{more}",
+        )
     lines = [f"✅ <b>Перенесла в холодильник: {len(added)} поз.</b>"]
     for it in added[:12]:
         lines.append(f"• {_h(it['name'])} ({format_quantity(it['amount'], it['unit'])})")

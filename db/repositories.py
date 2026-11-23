@@ -1,6 +1,7 @@
 import datetime
 import json
 import re
+import secrets
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -267,13 +268,47 @@ async def update_user_gender(
 
 # --- Households / общий дом ---
 
+DEFAULT_HOUSEHOLD_SETTINGS: Dict[str, bool] = {
+    "share_recipes": True,
+    "share_meal_plan": True,
+    "share_bills": True,
+    "notify_partner": True,
+}
+
+
+def generate_household_invite_code() -> str:
+    """Сгенерировать случайный неугадываемый код приглашения в дом."""
+    return f"H-{secrets.token_hex(4).upper()}"
+
+
+def _decode_household_settings(raw: Any) -> Dict[str, bool]:
+    merged = dict(DEFAULT_HOUSEHOLD_SETTINGS)
+    if raw:
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                for key in merged:
+                    if key in parsed:
+                        merged[key] = bool(parsed[key])
+        except Exception:
+            pass
+    return merged
+
+
+async def get_household(conn: aiosqlite.Connection, household_id: int) -> Optional[Dict[str, Any]]:
+    """Получить данные дома и его декодированные настройки."""
+    cursor = await conn.execute("SELECT * FROM households WHERE id = ?", (int(household_id),))
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    d = row_to_dict(row)
+    d["settings"] = _decode_household_settings(d.get("settings_json"))
+    return d
+
 
 async def get_or_create_household(conn: aiosqlite.Connection, user_id: int) -> int:
     """
     Вернуть household_id пользователя, при необходимости создав личный дом.
-
-    По умолчанию у каждого пользователя есть свой «личный дом». Если позже
-    он создаст общий дом через настройки, household_id можно будет поменять.
     """
     cursor = await conn.execute(
         "SELECT household_id, name FROM users WHERE id = ?", (user_id,)
@@ -283,12 +318,12 @@ async def get_or_create_household(conn: aiosqlite.Connection, user_id: int) -> i
         return int(row["household_id"])
     name = row["name"] if row else ""
     now = utc_now_str()
-    invite_code = f"H{user_id}"
+    invite_code = generate_household_invite_code()
     cur = await conn.execute(
-        "INSERT INTO households (name, invite_code, created_at) VALUES (?, ?, ?)",
-        (name or "Дом", invite_code, now),
+        "INSERT INTO households (name, invite_code, settings_json, created_at) VALUES (?, ?, ?, ?)",
+        (name or "Дом", invite_code, json.dumps(DEFAULT_HOUSEHOLD_SETTINGS), now),
     )
-    household_id = cur.lastrowid
+    household_id = int(cur.lastrowid)
     await conn.execute(
         "UPDATE users SET household_id = ? WHERE id = ?",
         (household_id, user_id),
@@ -300,8 +335,11 @@ async def get_or_create_household(conn: aiosqlite.Connection, user_id: int) -> i
 async def get_household_by_code(
     conn: aiosqlite.Connection, invite_code: str
 ) -> Optional[aiosqlite.Row]:
+    clean = (invite_code or "").strip()
+    if not clean:
+        return None
     cursor = await conn.execute(
-        "SELECT * FROM households WHERE invite_code = ?", (invite_code.strip(),)
+        "SELECT * FROM households WHERE UPPER(invite_code) = UPPER(?)", (clean,)
     )
     return await cursor.fetchone()
 
@@ -314,7 +352,74 @@ async def set_user_household(
         "UPDATE users SET household_id = ?, updated_at = ? WHERE id = ?",
         (household_id, now, user_id),
     )
+    await conn.execute(
+        "UPDATE user_recipes SET household_id = ? WHERE user_id = ?",
+        (household_id, user_id),
+    )
     await conn.commit()
+
+
+async def regenerate_household_invite_code(conn: aiosqlite.Connection, household_id: int) -> str:
+    """Выпустить новый случайный код приглашения в дом."""
+    new_code = generate_household_invite_code()
+    await conn.execute(
+        "UPDATE households SET invite_code = ? WHERE id = ?",
+        (new_code, int(household_id)),
+    )
+    await conn.commit()
+    return new_code
+
+
+async def update_household_settings(
+    conn: aiosqlite.Connection, household_id: int, **updates: Any
+) -> Dict[str, bool]:
+    """Обновить булевые настройки общего дома."""
+    house = await get_household(conn, household_id)
+    settings = dict((house or {}).get("settings") or DEFAULT_HOUSEHOLD_SETTINGS)
+    for key in DEFAULT_HOUSEHOLD_SETTINGS:
+        if key in updates:
+            settings[key] = bool(updates[key])
+    await conn.execute(
+        "UPDATE households SET settings_json = ? WHERE id = ?",
+        (json.dumps(settings, ensure_ascii=False), int(household_id)),
+    )
+    await conn.commit()
+    return settings
+
+
+async def list_household_members(
+    conn: aiosqlite.Connection, household_id: int
+) -> List[Dict[str, Any]]:
+    """Вернуть список участников дома."""
+    cur = await conn.execute(
+        "SELECT * FROM users WHERE household_id = ? ORDER BY id ASC",
+        (int(household_id),),
+    )
+    return rows_to_dicts(await cur.fetchall())
+
+
+async def leave_household(conn: aiosqlite.Connection, user_id: int) -> int:
+    """Отсоединить пользователя в новый собственный дом со свежим кодом."""
+    now = utc_now_str()
+    cur_u = await conn.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+    u_row = await cur_u.fetchone()
+    name = (u_row["name"] if u_row else "") or "Дом"
+    new_code = generate_household_invite_code()
+    cur = await conn.execute(
+        "INSERT INTO households (name, invite_code, settings_json, created_at) VALUES (?, ?, ?, ?)",
+        (name, new_code, json.dumps(DEFAULT_HOUSEHOLD_SETTINGS), now),
+    )
+    new_hid = int(cur.lastrowid)
+    await conn.execute(
+        "UPDATE users SET household_id = ?, updated_at = ? WHERE id = ?",
+        (new_hid, now, user_id),
+    )
+    await conn.execute(
+        "UPDATE user_recipes SET household_id = ? WHERE user_id = ?",
+        (new_hid, user_id),
+    )
+    await conn.commit()
+    return new_hid
 
 
 # --- Day plans (evening / morning planning) ---
@@ -1881,14 +1986,65 @@ async def upsert_wellness(
 
 
 # Expenses
-async def add_expense(conn: aiosqlite.Connection, user_id: int, amount: float, category: str) -> int:
+async def add_expense(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    amount: float,
+    category: str,
+    *,
+    scope: str = "personal",
+) -> int:
     now = utc_now_str()
+    clean_scope = "household" if scope == "household" else "personal"
+    hid = await get_or_create_household(conn, user_id) if clean_scope == "household" else None
     cursor = await conn.execute(
-        "INSERT INTO expenses (user_id, amount, category, note, created_at) VALUES (?, ?, ?, ?, ?)",
-        (user_id, amount, category, "", now),
+        "INSERT INTO expenses (user_id, household_id, scope, amount, category, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, hid, clean_scope, amount, category, "", now),
     )
     await conn.commit()
     return cursor.lastrowid
+
+
+async def household_monthly_expenses_summary(
+    conn: aiosqlite.Connection,
+    household_id: int,
+    *,
+    year_month: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Сводка общих трат дома за месяц по участникам и категориям."""
+    ym = year_month or datetime.datetime.utcnow().strftime("%Y-%m")
+    rows = rows_to_dicts(
+        await conn.execute_fetchall(
+            """
+            SELECT e.user_id, COALESCE(u.name, 'Участник') AS member_name, e.amount, e.category
+            FROM expenses e
+            LEFT JOIN users u ON u.id = e.user_id
+            WHERE e.household_id = ? AND e.scope = 'household' AND strftime('%Y-%m', e.created_at) = ?
+            ORDER BY e.id DESC
+            """,
+            (int(household_id), ym),
+        )
+    )
+    total = 0.0
+    by_member_map: Dict[int, Dict[str, Any]] = {}
+    by_cat: Dict[str, float] = {}
+    for r in rows:
+        amt = float(r.get("amount") or 0.0)
+        uid = int(r["user_id"])
+        name = str(r.get("member_name") or "Участник")
+        cat = str(r.get("category") or "другое")
+        total += amt
+        if uid not in by_member_map:
+            by_member_map[uid] = {"user_id": uid, "name": name, "total": 0.0}
+        by_member_map[uid]["total"] = round(by_member_map[uid]["total"] + amt, 2)
+        by_cat[cat] = round(by_cat.get(cat, 0.0) + amt, 2)
+    by_member = sorted(by_member_map.values(), key=lambda x: -x["total"])
+    return {
+        "month": ym,
+        "total": round(total, 2),
+        "by_member": by_member,
+        "by_category": by_cat,
+    }
 
 
 async def delete_expense(conn: aiosqlite.Connection, user_id: int, expense_id: int) -> None:
@@ -2189,16 +2345,63 @@ async def get_article(
 
 # Bills
 async def list_bills(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
-    cursor = await conn.execute(
-        "SELECT * FROM bills WHERE user_id = ? ORDER BY day_of_month", (user_id,)
-    )
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_bills = bool((house or {}).get("settings", {}).get("share_bills", True))
+    if share_bills:
+        cursor = await conn.execute(
+            """
+            SELECT b.*, u.name AS paid_by_name
+            FROM bills b
+            LEFT JOIN users u ON u.id = b.paid_by_user_id
+            WHERE b.user_id = ? OR (b.scope = 'household' AND b.household_id = ?)
+            ORDER BY b.day_of_month, b.id
+            """,
+            (user_id, hid),
+        )
+    else:
+        cursor = await conn.execute(
+            """
+            SELECT b.*, u.name AS paid_by_name
+            FROM bills b
+            LEFT JOIN users u ON u.id = b.paid_by_user_id
+            WHERE b.user_id = ?
+            ORDER BY b.day_of_month, b.id
+            """,
+            (user_id,),
+        )
     return await cursor.fetchall()
 
 
+async def get_bill_by_id(
+    conn: aiosqlite.Connection, user_id: int, bill_id: int
+) -> Optional[Dict[str, Any]]:
+    hid = await get_or_create_household(conn, user_id)
+    cur = await conn.execute(
+        """
+        SELECT b.*, u.name AS paid_by_name
+        FROM bills b
+        LEFT JOIN users u ON u.id = b.paid_by_user_id
+        WHERE b.id = ? AND (b.user_id = ? OR (b.scope = 'household' AND b.household_id = ?))
+        """,
+        (int(bill_id), user_id, hid),
+    )
+    row = await cur.fetchone()
+    return row_to_dict(row) if row else None
+
+
 async def upsert_bill(
-    conn: aiosqlite.Connection, user_id: int, title: str, amount: float, day_of_month: int
+    conn: aiosqlite.Connection,
+    user_id: int,
+    title: str,
+    amount: float,
+    day_of_month: int,
+    *,
+    scope: str = "personal",
 ) -> int:
     now = utc_now_str()
+    clean_scope = "household" if scope == "household" else "personal"
+    hid = await get_or_create_household(conn, user_id) if clean_scope == "household" else None
     cursor = await conn.execute(
         "SELECT id FROM bills WHERE user_id = ? AND title = ?", (user_id, title)
     )
@@ -2206,19 +2409,23 @@ async def upsert_bill(
     if row:
         await conn.execute(
             """
-            UPDATE bills SET amount = ?, day_of_month = ?, updated_at = ?
+            UPDATE bills
+            SET amount = ?, day_of_month = ?, scope = ?, household_id = ?, updated_at = ?
             WHERE id = ?
             """,
-            (amount, day_of_month, now, row["id"]),
+            (amount, day_of_month, clean_scope, hid, now, row["id"]),
         )
         await conn.commit()
         return row["id"]
     cursor = await conn.execute(
         """
-        INSERT INTO bills (user_id, title, amount, day_of_month, last_paid_month, created_at, updated_at)
-        VALUES (?, ?, ?, ?, '', ?, ?)
+        INSERT INTO bills (
+            user_id, household_id, scope, title, amount, day_of_month,
+            last_paid_month, paid_by_user_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, '', NULL, ?, ?)
         """,
-        (user_id, title, amount, day_of_month, now, now),
+        (user_id, hid, clean_scope, title, amount, day_of_month, now, now),
     )
     await conn.commit()
     return cursor.lastrowid
@@ -2226,11 +2433,42 @@ async def upsert_bill(
 
 async def mark_bill_paid(conn: aiosqlite.Connection, user_id: int, bill_id: int, month: str) -> None:
     now = utc_now_str()
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_bills = bool((house or {}).get("settings", {}).get("share_bills", True))
+    if share_bills:
+        await conn.execute(
+            """
+            UPDATE bills
+            SET last_paid_month = ?, paid_by_user_id = ?, updated_at = ?
+            WHERE id = ? AND (user_id = ? OR (scope = 'household' AND household_id = ?))
+            """,
+            (month, user_id, now, bill_id, user_id, hid),
+        )
+    else:
+        await conn.execute(
+            "UPDATE bills SET last_paid_month = ?, paid_by_user_id = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (month, user_id, now, bill_id, user_id),
+        )
+    await conn.commit()
+
+
+async def toggle_bill_scope(
+    conn: aiosqlite.Connection, user_id: int, bill_id: int
+) -> Optional[str]:
+    """Переключить счёт между личным ('personal') и общим ('household')."""
+    bill = await get_bill_by_id(conn, user_id, bill_id)
+    if not bill:
+        return None
+    new_scope = "personal" if bill.get("scope") == "household" else "household"
+    hid = await get_or_create_household(conn, user_id) if new_scope == "household" else None
+    now = utc_now_str()
     await conn.execute(
-        "UPDATE bills SET last_paid_month = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-        (month, now, bill_id, user_id),
+        "UPDATE bills SET scope = ?, household_id = ?, updated_at = ? WHERE id = ?",
+        (new_scope, hid, now, int(bill_id)),
     )
     await conn.commit()
+    return new_scope
 
 
 async def bills_due_soon(
@@ -4207,13 +4445,15 @@ async def upsert_meal_plan_slot(
 ) -> Dict[str, Any]:
     """Создать или обновить слот питания (breakfast/lunch/dinner) на дату."""
     now = utc_now_str()
+    hid = await get_or_create_household(conn, user_id)
     ing_json = json.dumps(list(ingredients or []), ensure_ascii=False)
     await conn.execute(
         """
         INSERT INTO meal_plans
-        (user_id, plan_date, meal_slot, title, recipe_id, time_minutes, ingredients_json, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, household_id, plan_date, meal_slot, title, recipe_id, time_minutes, ingredients_json, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, plan_date, meal_slot) DO UPDATE SET
+            household_id = excluded.household_id,
             title = excluded.title,
             recipe_id = excluded.recipe_id,
             time_minutes = excluded.time_minutes,
@@ -4223,6 +4463,7 @@ async def upsert_meal_plan_slot(
         """,
         (
             user_id,
+            hid,
             plan_date,
             meal_slot,
             title.strip(),
@@ -4250,15 +4491,33 @@ async def list_meal_plans_range(
     end_date: str,
 ) -> List[Dict[str, Any]]:
     """Получить расписание блюд в диапазоне дат, отсортированное по дате и слоту."""
-    cur = await conn.execute(
-        """
-        SELECT * FROM meal_plans
-        WHERE user_id = ? AND plan_date >= ? AND plan_date <= ?
-        ORDER BY plan_date ASC, id ASC
-        """,
-        (user_id, start_date, end_date),
-    )
-    items = [_decode_meal_plan_row(r) for r in await cur.fetchall()]
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_plan = bool((house or {}).get("settings", {}).get("share_meal_plan", True))
+    if share_plan:
+        cur = await conn.execute(
+            """
+            SELECT * FROM meal_plans
+            WHERE (household_id = ? OR user_id = ?) AND plan_date >= ? AND plan_date <= ?
+            ORDER BY updated_at ASC, id ASC
+            """,
+            (hid, user_id, start_date, end_date),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            SELECT * FROM meal_plans
+            WHERE user_id = ? AND plan_date >= ? AND plan_date <= ?
+            ORDER BY updated_at ASC, id ASC
+            """,
+            (user_id, start_date, end_date),
+        )
+    by_slot: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in await cur.fetchall():
+        d = _decode_meal_plan_row(r)
+        key = (str(d.get("plan_date") or ""), str(d.get("meal_slot") or ""))
+        by_slot[key] = d
+    items = list(by_slot.values())
     items.sort(key=lambda r: (str(r.get("plan_date") or ""), _MEAL_SLOT_ORDER.get(str(r.get("meal_slot") or ""), 9)))
     return items
 
@@ -4281,14 +4540,27 @@ async def mark_meal_plan_status(
 ) -> bool:
     """Обновить статус блюда в меню (planned/cooked/skipped)."""
     now = utc_now_str()
-    cur = await conn.execute(
-        """
-        UPDATE meal_plans
-        SET status = ?, updated_at = ?
-        WHERE user_id = ? AND plan_date = ? AND meal_slot = ?
-        """,
-        (status, now, user_id, plan_date, meal_slot),
-    )
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_plan = bool((house or {}).get("settings", {}).get("share_meal_plan", True))
+    if share_plan:
+        cur = await conn.execute(
+            """
+            UPDATE meal_plans
+            SET status = ?, updated_at = ?
+            WHERE (household_id = ? OR user_id = ?) AND plan_date = ? AND meal_slot = ?
+            """,
+            (status, now, hid, user_id, plan_date, meal_slot),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            UPDATE meal_plans
+            SET status = ?, updated_at = ?
+            WHERE user_id = ? AND plan_date = ? AND meal_slot = ?
+            """,
+            (status, now, user_id, plan_date, meal_slot),
+        )
     await conn.commit()
     return (cur.rowcount or 0) > 0
 
@@ -4299,13 +4571,25 @@ async def get_recent_meal_recipe_ids(
     since_date: str,
 ) -> List[str]:
     """Вернуть список ID рецептов из недавнего/текущего меню с даты since_date."""
-    cur = await conn.execute(
-        """
-        SELECT DISTINCT recipe_id FROM meal_plans
-        WHERE user_id = ? AND plan_date >= ? AND recipe_id != ''
-        """,
-        (user_id, since_date),
-    )
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_plan = bool((house or {}).get("settings", {}).get("share_meal_plan", True))
+    if share_plan:
+        cur = await conn.execute(
+            """
+            SELECT DISTINCT recipe_id FROM meal_plans
+            WHERE (household_id = ? OR user_id = ?) AND plan_date >= ? AND recipe_id != ''
+            """,
+            (hid, user_id, since_date),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            SELECT DISTINCT recipe_id FROM meal_plans
+            WHERE user_id = ? AND plan_date >= ? AND recipe_id != ''
+            """,
+            (user_id, since_date),
+        )
     return [str(r["recipe_id"]) for r in await cur.fetchall() if r["recipe_id"]]
 
 
@@ -4316,10 +4600,19 @@ async def clear_meal_plans_range(
     end_date: str,
 ) -> int:
     """Удалить слоты меню в диапазоне дат (например, при пересборке)."""
-    cur = await conn.execute(
-        "DELETE FROM meal_plans WHERE user_id = ? AND plan_date >= ? AND plan_date <= ?",
-        (user_id, start_date, end_date),
-    )
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_plan = bool((house or {}).get("settings", {}).get("share_meal_plan", True))
+    if share_plan:
+        cur = await conn.execute(
+            "DELETE FROM meal_plans WHERE (household_id = ? OR user_id = ?) AND plan_date >= ? AND plan_date <= ?",
+            (hid, user_id, start_date, end_date),
+        )
+    else:
+        cur = await conn.execute(
+            "DELETE FROM meal_plans WHERE user_id = ? AND plan_date >= ? AND plan_date <= ?",
+            (user_id, start_date, end_date),
+        )
     await conn.commit()
     return int(cur.rowcount or 0)
 
@@ -4793,6 +5086,7 @@ async def upsert_user_recipe(
 ) -> Dict[str, Any]:
     """Сохранить или обновить личный рецепт пользователя в таблице user_recipes."""
     now = utc_now_str()
+    hid = await get_or_create_household(conn, user_id)
     clean_key = (recipe_key or "").strip() or generate_user_recipe_key()
     clean_title = str(title or "Рецепт").strip()
     clean_desc = str(desc or "").strip()
@@ -4804,11 +5098,12 @@ async def upsert_user_recipe(
     await conn.execute(
         """
         INSERT INTO user_recipes (
-            user_id, recipe_key, title, desc, tags_json, base_servings, time_minutes,
+            user_id, household_id, recipe_key, title, desc, tags_json, base_servings, time_minutes,
             ingredients_json, steps_json, source, source_label, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, recipe_key) DO UPDATE SET
+            household_id = excluded.household_id,
             title = excluded.title,
             desc = excluded.desc,
             tags_json = excluded.tags_json,
@@ -4822,6 +5117,7 @@ async def upsert_user_recipe(
         """,
         (
             user_id,
+            hid,
             clean_key,
             clean_title,
             clean_desc,
@@ -4846,17 +5142,41 @@ async def list_user_recipes(
     *,
     limit: int = 300,
 ) -> List[Dict[str, Any]]:
-    """Вернуть личные рецепты пользователя (сначала свежие)."""
-    cur = await conn.execute(
-        """
-        SELECT * FROM user_recipes
-        WHERE user_id = ?
-        ORDER BY updated_at DESC, id DESC
-        LIMIT ?
-        """,
-        (user_id, max(1, int(limit or 300))),
-    )
-    return [_user_recipe_row_to_dict(r) for r in await cur.fetchall()]
+    """Вернуть рецепты пользователя (и общего дома при включённом share_recipes)."""
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_recipes = bool((house or {}).get("settings", {}).get("share_recipes", True))
+    eff_limit = max(1, int(limit or 300))
+    if share_recipes:
+        cur = await conn.execute(
+            """
+            SELECT * FROM user_recipes
+            WHERE user_id = ? OR household_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, hid, eff_limit),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            SELECT * FROM user_recipes
+            WHERE user_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, eff_limit),
+        )
+    seen_keys: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for row in await cur.fetchall():
+        item = _user_recipe_row_to_dict(row)
+        k = item["id"]
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        out.append(item)
+    return out
 
 
 async def get_user_recipe_by_key(
@@ -4864,14 +5184,28 @@ async def get_user_recipe_by_key(
     user_id: int,
     recipe_key: str,
 ) -> Optional[Dict[str, Any]]:
-    """Получить личный рецепт пользователя по ключу recipe_key."""
+    """Получить рецепт пользователя (или дома) по ключу recipe_key."""
     key = str(recipe_key or "").strip()
     if not key:
         return None
-    cur = await conn.execute(
-        "SELECT * FROM user_recipes WHERE user_id = ? AND recipe_key = ?",
-        (user_id, key),
-    )
+    hid = await get_or_create_household(conn, user_id)
+    house = await get_household(conn, hid)
+    share_recipes = bool((house or {}).get("settings", {}).get("share_recipes", True))
+    if share_recipes:
+        cur = await conn.execute(
+            """
+            SELECT * FROM user_recipes
+            WHERE (user_id = ? OR household_id = ?) AND recipe_key = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (user_id, hid, key),
+        )
+    else:
+        cur = await conn.execute(
+            "SELECT * FROM user_recipes WHERE user_id = ? AND recipe_key = ?",
+            (user_id, key),
+        )
     row = await cur.fetchone()
     return _user_recipe_row_to_dict(row) if row else None
 

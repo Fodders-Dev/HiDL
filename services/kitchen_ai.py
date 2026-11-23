@@ -1267,6 +1267,7 @@ async def import_cart_items(
     *,
     total_amount: Optional[float] = None,
     expense_category: str = "продукты",
+    expense_scope: str = "personal",
     sync_shopping: bool = True,
     now_utc: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
@@ -1330,7 +1331,8 @@ async def import_cart_items(
         if amt > 0:
             recorded_total = round(amt, 2)
             cat = str(expense_category or "продукты").strip() or "продукты"
-            expense_id = await repo.add_expense(db, user_id, recorded_total, cat)
+            eff_scope = "household" if expense_scope == "household" else "personal"
+            expense_id = await repo.add_expense(db, user_id, recorded_total, cat, scope=eff_scope)
 
     return {
         "ok": True,

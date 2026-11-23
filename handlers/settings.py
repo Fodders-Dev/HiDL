@@ -1,4 +1,6 @@
 import datetime
+import html
+import os
 
 from aiogram import Router, types
 from aiogram.filters import Command
@@ -8,6 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from services import household_service
 from utils import texts
 from utils.sender import safe_edit
 from utils.time import is_valid_timezone, parse_hhmm
@@ -41,6 +44,51 @@ def _cancel_settings_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ Отмена", callback_data="settings:main")]
         ]
     )
+
+
+async def _render_household_screen(db, user: dict) -> tuple[str, InlineKeyboardMarkup]:
+    hid = await repo.get_or_create_household(db, int(user["id"]))
+    house = await repo.get_household(db, hid)
+    members = await repo.list_household_members(db, hid)
+    code = str((house or {}).get("invite_code") or f"H{user['id']}")
+    cfg = (house or {}).get("settings") or {}
+    bot_username = os.getenv("BOT_USERNAME", "HiDL_bot").strip().lstrip("@") or "HiDL_bot"
+    deep_link = f"https://t.me/{bot_username}?start=house_{code}"
+
+    member_names = ", ".join(html.escape(str(m.get("name") or f"User {m['id']}")) for m in members)
+    lines = [
+        "🏠 <b>Наш дом</b>",
+        f"👥 Участники ({len(members)}): {member_names or 'только ты'}",
+        f"🔑 Код приглашения: <code>{html.escape(code)}</code>",
+        f"🔗 Ссылка для партнёра:\n<code>{html.escape(deep_link)}</code>",
+        "",
+        "Что делите вместе (холодильник и общий список покупок — всегда общие):",
+    ]
+    rec_on = bool(cfg.get("share_recipes", True))
+    bills_on = bool(cfg.get("share_bills", True))
+    notif_on = bool(cfg.get("notify_partner", True))
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{'✅' if rec_on else '⭕️'} Общие рецепты и меню",
+            callback_data="settings:household_toggle:share_recipes",
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅' if bills_on else '⭕️'} Общие счета",
+            callback_data="settings:household_toggle:share_bills",
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅' if notif_on else '⭕️'} Уведомления дома",
+            callback_data="settings:household_toggle:notify_partner",
+        )],
+        [
+            InlineKeyboardButton(text="🔄 Новый код", callback_data="settings:household_regen"),
+            InlineKeyboardButton(text="🔗 Ввести код", callback_data="settings:household_join"),
+        ],
+    ]
+    if len(members) > 1:
+        rows.append([InlineKeyboardButton(text="🚪 Выйти из дома", callback_data="settings:household_leave")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _handle_settings_cancel(message: types.Message, state: FSMContext, db) -> bool:
@@ -326,46 +374,43 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
         )
     elif action == "household":
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-
-        await safe_edit(
-            callback.message,
-            "Общий дом — это когда несколько человек делят одну кладовку и бытовую химию.\n\n"
-            "Можно создать дом и дать код партнёру, либо присоединиться по коду.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="🏠 Создать общий дом",
-                            callback_data="settings:household_create",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="🔗 Присоединиться по коду",
-                            callback_data="settings:household_join",
-                        )
-                    ],
-                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
-                ]
-            ),
-        )
+        text, kb = await _render_household_screen(db, user)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
     elif action == "household_create":
-        from db import repositories as repo_mod
-
         user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-        household_id = await repo_mod.get_or_create_household(db, user["id"])
-        # достанем код
-        cursor = await db.execute(
-            "SELECT invite_code FROM households WHERE id = ?", (household_id,)
-        )
-        row = await cursor.fetchone()
-        code = row["invite_code"] if row and row["invite_code"] else f"H{user['id']}"
-        await callback.message.answer(
-            "Создала общий дом. Передай партнёру этот код, чтобы он присоединился:\n"
-            f"`{code}`",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(user),
-        )
+        text, kb = await _render_household_screen(db, user)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    elif action == "household_regen":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        hid = await repo.get_or_create_household(db, user["id"])
+        await repo.regenerate_household_invite_code(db, hid)
+        text, kb = await _render_household_screen(db, user)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer("Обновила код приглашения 🔄")
+        return
+    elif action == "household_toggle" and len(parts) >= 3:
+        key = parts[2]
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        hid = await repo.get_or_create_household(db, user["id"])
+        house = await repo.get_household(db, hid)
+        cur_settings = (house or {}).get("settings") or {}
+        if key == "share_recipes":
+            new_val = not bool(cur_settings.get("share_recipes", True))
+            await repo.update_household_settings(db, hid, share_recipes=new_val, share_meal_plan=new_val)
+        elif key in {"share_bills", "notify_partner"}:
+            new_val = not bool(cur_settings.get(key, True))
+            await repo.update_household_settings(db, hid, **{key: new_val})
+        text, kb = await _render_household_screen(db, user)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer("Сохранено")
+        return
+    elif action == "household_leave":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        await repo.leave_household(db, user["id"])
+        text, kb = await _render_household_screen(db, user)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer("Ты вышел(-а) в свой личный дом.")
+        return
     elif action == "household_join":
         await state.set_state(SettingsState.household_join)
         await callback.message.answer(
@@ -952,8 +997,15 @@ async def settings_household_join(message: types.Message, state: FSMContext, db)
         return
     await repo_mod.set_user_household(db, user["id"], household["id"])
     await state.clear()
+    actor_name = html.escape(str(user.get("name") or "Партнёр"))
+    await household_service.notify_household_partners(
+        getattr(message, "bot", None),
+        db,
+        dict(user),
+        f"🏠 <b>{actor_name}</b> присоединился(-ась) к общему дому по коду.",
+    )
     await message.answer(
-        "Подключила тебя к общему дому. Теперь кладовка продуктов и бытовая химия будут общими для вас.",
+        "Подключила тебя к общему дому. Теперь холодильник, список покупок, общие рецепты, меню и общие счета синхронизированы.",
         reply_markup=main_menu_keyboard(user),
     )
 

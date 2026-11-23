@@ -7,6 +7,7 @@ import html
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from services import household_service
 from utils import texts
 from utils.time import is_valid_timezone, parse_hhmm, tzinfo_from_string
 from utils.profile import is_student_mode
@@ -33,22 +34,55 @@ async def _handle_reg_cancel(message: types.Message, state: FSMContext) -> bool:
     return False
 
 
+def _extract_house_invite_code(text: str | None) -> str:
+    parts = (text or "").strip().split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("house_"):
+        return parts[1][len("house_") :].strip()
+    return ""
+
+
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext, db) -> None:
+    invite_code = _extract_house_invite_code(message.text)
     user = await repo.get_user_by_telegram_id(db, message.from_user.id)
     if user:
-        safe_name = html.escape(str(user["name"] or ""))
+        user_d = dict(user)
+        safe_name = html.escape(str(user_d.get("name") or ""))
+        if invite_code:
+            house = await repo.get_household_by_code(db, invite_code)
+            if house:
+                await repo.set_user_household(db, user_d["id"], int(house["id"]))
+                user_d["household_id"] = int(house["id"])
+                await household_service.notify_household_partners(
+                    getattr(message, "bot", None),
+                    db,
+                    user_d,
+                    f"🏠 <b>{safe_name}</b> присоединился(-ась) к общему дому по приглашению.",
+                )
+                await message.answer(
+                    f"🏠 Подключила тебя к общему дому!\n"
+                    "Теперь холодильник, список покупок, общие рецепты, меню и общие счета синхронизированы.",
+                    reply_markup=main_menu_keyboard(user_d),
+                )
+            else:
+                await message.answer(
+                    "Код приглашения в дом не найден или устарел. Можно ввести свежий в ⚙ Настройки → Общий дом.",
+                    reply_markup=main_menu_keyboard(user_d),
+                )
+            return
         if is_student_mode(user):
             greeting = f"С возвращением, {safe_name}! Продолжим с планом, занятиями или напоминаниями?"
         else:
             greeting = f"С возвращением, {safe_name}! Чем помочь сегодня?"
         await message.answer(
             greeting,
-            reply_markup=main_menu_keyboard(dict(user)),
+            reply_markup=main_menu_keyboard(user_d),
         )
         return
 
     await state.clear()
+    if invite_code:
+        await state.update_data(pending_house_code=invite_code)
     first_name = message.from_user.first_name or "друг"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -181,10 +215,25 @@ async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
         gender=data.get("gender", "neutral"),
     )
     await repo.ensure_user_routines(db, user_id)
+    pending_code = str(data.get("pending_house_code") or "").strip()
+    joined_house_note = ""
+    if pending_code:
+        house = await repo.get_household_by_code(db, pending_code)
+        if house:
+            await repo.set_user_household(db, user_id, int(house["id"]))
+            new_user = dict(await repo.get_user(db, user_id))
+            await household_service.notify_household_partners(
+                getattr(message, "bot", None),
+                db,
+                new_user,
+                f"🏠 <b>{html.escape(str(data['name']))}</b> присоединился(-ась) к общему дому по приглашению.",
+            )
+            joined_house_note = "\n\n🏠 Кстати, подключила тебя к общему дому по приглашению!"
     # Аудит запускаем по желанию через меню Дом -> План
     await state.clear()
     await message.answer(
-        f"Принято, {data['name']}! Добавила базовые настройки.\n\n"
+        f"Принято, {data['name']}! Добавила базовые настройки."
+        f"{joined_house_note}\n\n"
         "Главное меню внизу: Сегодня, Еда, Дом, Деньги, Спорт, Покупки,\n"
         "Расписание, Дневник, Кафе фокуса, Настройки.\n\n"
         "Если захочешь, мы настроим план по дому из раздела 🧹 Дом — там я задам пару вопросов и соберу список регулярных дел.\n\n"

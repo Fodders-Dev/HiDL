@@ -147,6 +147,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
             invite_code TEXT UNIQUE,
+            settings_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL
         );
 
@@ -264,6 +265,8 @@ async def init_db(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            household_id INTEGER,
+            scope TEXT NOT NULL DEFAULT 'personal',
             amount REAL NOT NULL,
             category TEXT NOT NULL,
             note TEXT DEFAULT '',
@@ -305,10 +308,13 @@ async def init_db(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS bills (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            household_id INTEGER,
+            scope TEXT NOT NULL DEFAULT 'personal',
             title TEXT NOT NULL,
             amount REAL DEFAULT 0,
             day_of_month INTEGER DEFAULT 1,
             last_paid_month TEXT DEFAULT '',
+            paid_by_user_id INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -622,6 +628,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS meal_plans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            household_id INTEGER,
             plan_date TEXT NOT NULL,
             meal_slot TEXT NOT NULL,
             title TEXT NOT NULL,
@@ -641,6 +648,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS user_recipes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            household_id INTEGER,
             recipe_key TEXT NOT NULL,
             title TEXT NOT NULL,
             desc TEXT NOT NULL DEFAULT '',
@@ -1328,6 +1336,7 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS meal_plans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            household_id INTEGER,
             plan_date TEXT NOT NULL,
             meal_slot TEXT NOT NULL,
             title TEXT NOT NULL,
@@ -1347,6 +1356,7 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS user_recipes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
+            household_id INTEGER,
             recipe_key TEXT NOT NULL,
             title TEXT NOT NULL,
             desc TEXT NOT NULL DEFAULT '',
@@ -1801,6 +1811,54 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
             "tags": "",
         },
     ]
+
+    # --- Stage 1: Общий дом (households, bills, expenses, meal_plans, user_recipes) ---
+    households_info = await conn.execute_fetchall("PRAGMA table_info(households);")
+    households_cols = {row["name"] for row in households_info}
+    if households_info and "settings_json" not in households_cols:
+        await conn.execute("ALTER TABLE households ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}';")
+
+    expenses_info = await conn.execute_fetchall("PRAGMA table_info(expenses);")
+    expenses_cols = {row["name"] for row in expenses_info}
+    if expenses_info and "scope" not in expenses_cols:
+        await conn.execute("ALTER TABLE expenses ADD COLUMN scope TEXT NOT NULL DEFAULT 'personal';")
+    if expenses_info and "household_id" not in expenses_cols:
+        await conn.execute("ALTER TABLE expenses ADD COLUMN household_id INTEGER;")
+
+    bills_mig_info = await conn.execute_fetchall("PRAGMA table_info(bills);")
+    bills_mig_cols = {row["name"] for row in bills_mig_info}
+    if bills_mig_info and "scope" not in bills_mig_cols:
+        await conn.execute("ALTER TABLE bills ADD COLUMN scope TEXT NOT NULL DEFAULT 'personal';")
+    if bills_mig_info and "household_id" not in bills_mig_cols:
+        await conn.execute("ALTER TABLE bills ADD COLUMN household_id INTEGER;")
+    if bills_mig_info and "paid_by_user_id" not in bills_mig_cols:
+        await conn.execute("ALTER TABLE bills ADD COLUMN paid_by_user_id INTEGER;")
+
+    mp_info = await conn.execute_fetchall("PRAGMA table_info(meal_plans);")
+    mp_cols = {row["name"] for row in mp_info}
+    if mp_info and "household_id" not in mp_cols:
+        await conn.execute("ALTER TABLE meal_plans ADD COLUMN household_id INTEGER;")
+    if mp_info:
+        await conn.execute(
+            """
+            UPDATE meal_plans
+            SET household_id = (SELECT household_id FROM users WHERE users.id = meal_plans.user_id)
+            WHERE household_id IS NULL
+            """
+        )
+
+    ur_info = await conn.execute_fetchall("PRAGMA table_info(user_recipes);")
+    ur_cols = {row["name"] for row in ur_info}
+    if ur_info and "household_id" not in ur_cols:
+        await conn.execute("ALTER TABLE user_recipes ADD COLUMN household_id INTEGER;")
+    if ur_info:
+        await conn.execute(
+            """
+            UPDATE user_recipes
+            SET household_id = (SELECT household_id FROM users WHERE users.id = user_recipes.user_id)
+            WHERE household_id IS NULL
+            """
+        )
 
     existing_articles = await conn.execute_fetchall(
         "SELECT title FROM knowledge_articles;"
