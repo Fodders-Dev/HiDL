@@ -1,4 +1,5 @@
 import datetime
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -11,7 +12,7 @@ from db.database import connect, init_db
 from handlers import finance, home_supplies, home_tasks, kitchen, pause, pulse, schedule
 from keyboards.common import food_menu_keyboard, money_menu_keyboard, more_menu_keyboard
 from middlewares.error_log import ErrorLogMiddleware
-from services import advice_service, kitchen_ai
+from services import advice_service, context_builder, inbox_service, kitchen_ai
 from services.inbox_parser import (
     _extract_duration_minutes,
     _extract_relative_delta,
@@ -270,6 +271,192 @@ class QALiveFixesTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(await repo.get_user_by_telegram_id(self.db, 999999))
         bot_msg.answer.assert_awaited_once()
+
+    def _make_fake_inbox_llm(self, payload: dict):
+        return SimpleNamespace(
+            is_configured=lambda: True,
+            complete_json=AsyncMock(
+                return_value=SimpleNamespace(
+                    ok=True,
+                    data=payload,
+                    provider="mock",
+                    model="mock",
+                    text=json.dumps(payload, ensure_ascii=False),
+                    error=None,
+                )
+            ),
+        )
+
+    async def test_pulse_log_fresh_duplicate_and_multi_item(self) -> None:
+        now_wake = datetime.datetime(2026, 11, 23, 5, 10, 0)  # 08:10 MSK
+        await repo.upsert_pulse_checkin(
+            self.db,
+            self.user_id,
+            "2026-11-23",
+            "wake",
+            "sleep",
+            now_wake.isoformat(),
+            now_wake.isoformat(),
+            status="pending",
+        )
+        fake_wake_llm = self._make_fake_inbox_llm(
+            {
+                "intent": "capture",
+                "items": [
+                    {
+                        "kind": "pulse_log",
+                        "title": "Подъём",
+                        "category": "wake",
+                        "source_quote": "я проснулся",
+                    }
+                ],
+            }
+        )
+        out_wake = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=777001,
+            message_id=201,
+            text="я проснулся",
+            now_utc=now_wake,
+            llm_client_instance=fake_wake_llm,
+        )
+        self.assertNotIn("Записала:", out_wake.reply_text)
+        self.assertIn("Режим:", out_wake.reply_text)
+        self.assertIn("Сон и карма", out_wake.reply_text)
+        self.assertIn("+4 кармы", out_wake.reply_text)
+        wake_datas = _all_callback_datas(out_wake.reply_markup)
+        wake_texts = _all_button_texts(out_wake.reply_markup)
+        self.assertIn("pulse:hub", wake_datas)
+        self.assertIn("🌙 Сон и карма", wake_texts)
+        self.assertTrue(any(d.startswith("inbox:reclass:") and d.endswith(":diary") for d in wake_datas))
+        self.assertIn("📓 В дневник", wake_texts)
+        self.assertFalse(any(d.startswith("inbox:edit:") for d in wake_datas))
+
+        # Duplicate pulse_log ("я поел" twice)
+        now_lunch = datetime.datetime(2026, 11, 23, 9, 0, 0)  # 12:00 MSK
+        out_eat1 = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=777001,
+            message_id=202,
+            text="я поел",
+            now_utc=now_lunch,
+        )
+        self.assertIn("+3 кармы", out_eat1.reply_text)
+        karma_mid = (await repo.get_or_create_karma_state(self.db, self.user_id))["score"]
+
+        out_eat2 = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=777001,
+            message_id=203,
+            text="я поел",
+            now_utc=datetime.datetime(2026, 11, 23, 9, 5, 0),
+        )
+        self.assertNotIn("Записала:", out_eat2.reply_text)
+        self.assertIn("уже отмечен сегодня", out_eat2.reply_text)
+        karma_after_dup = (await repo.get_or_create_karma_state(self.db, self.user_id))["score"]
+        self.assertEqual(karma_after_dup, karma_mid)
+
+        # Multi-item inbox message with pulse_log + shopping keeps "Записала:" and edit/undo buttons
+        fake_multi_llm = self._make_fake_inbox_llm(
+            {
+                "intent": "capture",
+                "items": [
+                    {
+                        "kind": "pulse_log",
+                        "title": "Ужин",
+                        "category": "dinner",
+                        "source_quote": "я поужинал",
+                    },
+                    {
+                        "kind": "shopping",
+                        "title": "Молоко",
+                        "source_quote": "надо купить молоко",
+                    },
+                ],
+            }
+        )
+        out_multi = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=777001,
+            message_id=204,
+            text="я поужинал и надо купить молоко",
+            now_utc=datetime.datetime(2026, 11, 23, 16, 0, 0),
+            llm_client_instance=fake_multi_llm,
+        )
+        self.assertIn("Записала:", out_multi.reply_text)
+        multi_datas = _all_callback_datas(out_multi.reply_markup)
+        self.assertTrue(any(d.startswith("inbox:edit:") for d in multi_datas))
+        self.assertTrue(any(d.startswith("inbox:undo:") for d in multi_datas))
+
+    async def test_pulse_log_late_wake_after_missed_clears_sleep_and_updates_context(self) -> None:
+        await repo.update_user_sleep_confirmed(
+            self.db,
+            self.user_id,
+            "2026-11-23",
+            "2026-11-22T21:00:00",
+        )
+        await repo.upsert_pulse_checkin(
+            self.db,
+            self.user_id,
+            "2026-11-23",
+            "wake",
+            "sleep",
+            "2026-11-23T05:00:00",
+            "2026-11-23T05:00:00",
+            status="missed",
+        )
+        self.user = dict(await repo.get_user(self.db, self.user_id))
+        karma_before = (await repo.get_or_create_karma_state(self.db, self.user_id))["score"]
+
+        now_late = datetime.datetime(2026, 11, 23, 7, 13, 0)  # 10:13 MSK
+        fake_wake_llm = self._make_fake_inbox_llm(
+            {
+                "intent": "capture",
+                "items": [
+                    {
+                        "kind": "pulse_log",
+                        "title": "Подъём",
+                        "category": "wake",
+                        "source_quote": "Я проснулся только сейчас",
+                    }
+                ],
+            }
+        )
+        out_late = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=777001,
+            message_id=301,
+            text="Я проснулся только сейчас",
+            now_utc=now_late,
+            llm_client_instance=fake_wake_llm,
+        )
+        self.assertNotIn("Записала:", out_late.reply_text)
+        self.assertIn("уже был пропущен", out_late.reply_text)
+        self.assertIn("сняла ночной режим", out_late.reply_text)
+        self.assertIn("10:13", out_late.reply_text)
+
+        karma_after = (await repo.get_or_create_karma_state(self.db, self.user_id))["score"]
+        self.assertEqual(karma_after, karma_before)
+
+        user_after = dict(await repo.get_user(self.db, self.user_id))
+        self.assertFalse(bool(user_after.get("sleep_confirmed_at")))
+
+        chk_after = await repo.get_pulse_checkin(self.db, self.user_id, "2026-11-23", "wake")
+        meta = json.loads(chk_after.get("meta_json") or "{}")
+        self.assertEqual(meta.get("late_wake_at_local"), "10:13")
+
+        snap = await context_builder.build_user_day_snapshot(
+            self.db,
+            user_after,
+            now_utc=datetime.datetime(2026, 11, 23, 7, 15, 0),
+        )
+        llm_ctx = context_builder.format_context_for_llm(snap)
+        self.assertIn("поздний подъём отмечен в 10:13", llm_ctx)
 
 
 if __name__ == "__main__":

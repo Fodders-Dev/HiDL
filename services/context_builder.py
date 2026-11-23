@@ -203,6 +203,15 @@ async def build_user_day_snapshot(
     checkins = await repo.list_pulse_checkins_for_date(db, user_id, local_date)
     slot_status = {str(c.get("slot_key")): str(c.get("status")) for c in checkins
                    if not student or c.get("slot_key") not in {"lunch", "dinner"}}
+    wake_chk = next((c for c in checkins if str(c.get("slot_key")) == "wake"), None)
+    late_wake_time = ""
+    if wake_chk:
+        try:
+            wake_meta = json.loads(wake_chk.get("meta_json") or "{}")
+            if isinstance(wake_meta, dict):
+                late_wake_time = str(wake_meta.get("late_wake_at_local") or "").strip()
+        except Exception:
+            late_wake_time = ""
 
     plan_rows = rows_to_dicts(await repo.list_day_plan_items(db, user_id, local_date))
     pending_tasks = [p for p in plan_rows if not p.get("done")]
@@ -246,6 +255,7 @@ async def build_user_day_snapshot(
         "karma_mode": karma_mode,
         "karma_state": karma_state,
         "slot_status": slot_status,
+        "late_wake_time": late_wake_time,
         "pending_tasks": pending_tasks,
         "done_tasks_count": done_tasks_count,
         "reminders": reminders[:5],
@@ -308,11 +318,18 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         else f"просрочен на {abs(mins_left)} мин!"
     )
 
+    pulse_core = (
+        "спокойный ритм дня"
+        if student
+        else f"{ate_note}, {'ночной отбой=подтверждён' if snapshot.get('sleep_confirmed') else 'ночной отбой=нет'}"
+    )
+    if snapshot.get("late_wake_time"):
+        pulse_core += f", поздний подъём отмечен в {snapshot['late_wake_time']}"
     lines = [
         "=== Снимок дня пользователя ===",
         f"Сейчас: {snapshot['local_date']} {snapshot['local_time']} ({snapshot['timezone']}), подъём {snapshot['wake_up_time']}, отбой {snapshot['sleep_time']} ({sleep_left_str}).",
         f"Карма: {score}/100 ({mode['emoji']} {mode['label']}), долги: {debts_str}. {tone_directives.get(mode_code, '')}",
-        f"Пульс: {'спокойный ритм дня' if student else ate_note + ', ' + ('ночной отбой=подтверждён' if snapshot.get('sleep_confirmed') else 'ночной отбой=нет')}, ЧП-заморозка={'да' if snapshot.get('sick_freeze_active') else 'нет'}.",
+        f"Пульс: {pulse_core}, ЧП-заморозка={'да' if snapshot.get('sick_freeze_active') else 'нет'}.",
         f"Задачи на сегодня (открыто {len(snapshot['pending_tasks'])}, закрыто {snapshot['done_tasks_count']}): {pending_str}.",
     ]
     if student:

@@ -601,7 +601,26 @@ async def complete_checkin(
         resolved_at_utc=now.isoformat(),
     )
     if not changed:
-        return await _already_resolved_result(db, user, updated or checkin, is_wake=slot_key == "wake")
+        current_chk = updated or checkin
+        if slot_key == "wake" and str(current_chk.get("status") or "") == "missed":
+            tz = user.get("timezone") or "UTC"
+            local_hhmm = format_time_local(now, tz)
+            await repo.clear_user_sleep_confirmed(db, int(user["id"]))
+            await repo.update_sleep_ping(db, int(user["id"]), "morning", local_date_str(now, tz))
+            current_meta = _load_meta(current_chk)
+            current_meta["late_wake_at_local"] = local_hhmm
+            current_meta["late_wake_at_utc"] = now.isoformat()
+            await repo.update_pulse_checkin(
+                db,
+                checkin_id,
+                meta_json=json.dumps(current_meta, ensure_ascii=False),
+            )
+            current_chk = await repo.get_pulse_checkin_by_id(db, checkin_id) or current_chk
+            res = await _already_resolved_result(db, user, current_chk, is_wake=True)
+            res["late_wake_recorded"] = True
+            res["local_time"] = local_hhmm
+            return res
+        return await _already_resolved_result(db, user, current_chk, is_wake=slot_key == "wake")
     winning = updated or checkin
     if slot_key == "wake":
         await repo.clear_user_sleep_confirmed(db, int(user["id"]))

@@ -75,7 +75,12 @@ async def _handle_already_resolved(
         and checkin.get("slot_key") == "wake"
         and (current_pair == stored_pair or _has_wake_checklist(callback.message))
     )
-    await callback.answer("Карточка уже закрыта ✅")
+    ans_text = (
+        "Поздний подъём отмечен, ночной режим снят"
+        if result.get("late_wake_recorded")
+        else "Карточка уже закрыта ✅"
+    )
+    await callback.answer(ans_text)
     if not preserve_hub and not preserve_wake:
         await _clear_callback_markup(callback)
     return True

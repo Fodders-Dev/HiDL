@@ -23,7 +23,7 @@ from services.inbox_parser import (
 )
 from utils.pantry import format_quantity
 from utils.rows import rows_to_dicts
-from utils.time import format_date_display, local_date_str, parse_hhmm
+from utils.time import format_date_display, format_time_local, local_date_str, parse_hhmm
 from utils.profile import is_student_mode
 
 KIND_LABELS = {
@@ -129,8 +129,27 @@ def _format_action_line(action: dict[str, Any]) -> str:
     if kind == "pulse_log":
         delta = int(payload.get("delta") or 0)
         score_after = payload.get("score_after")
-        delta_txt = f" (+{delta} кармы → {score_after}/100)" if delta > 0 and score_after is not None else ""
-        return f"💓 Режим: {title}{delta_txt}"
+        already_resolved = bool(payload.get("already_resolved"))
+        prev_status = str(payload.get("prev_status") or "")
+        late_wake_recorded = bool(payload.get("late_wake_recorded"))
+        local_time = str(payload.get("local_time") or "").strip()
+
+        if already_resolved and prev_status == "missed":
+            if late_wake_recorded:
+                t_part = f" в {_esc(local_time)}" if local_time else ""
+                return (
+                    f"💓 Режим: «{title}» уже был пропущен раньше (карма без изменений), "
+                    f"но я отметила, что ты встал{t_part}, и сняла ночной режим."
+                )
+            return f"💓 Режим: чек-ин «{title}» уже был пропущен раньше — карма не изменилась."
+        if already_resolved and prev_status == "done":
+            return f"💓 Режим: «{title}» уже отмечен сегодня — повторно карму не начисляла."
+
+        time_prefix = f"{_esc(local_time)}, " if local_time else ""
+        if delta > 0 and score_after is not None:
+            return f"💓 Режим: {title} — отмечено в «Сон и карма» ({time_prefix}+{delta} кармы → {score_after}/100)"
+        time_note = f" ({_esc(local_time)})" if local_time else ""
+        return f"💓 Режим: {title} — отмечено в «Сон и карма»{time_note}"
     if kind in {"rollover_tasks", "shift_bedtime"}:
         if action.get("status") == "awaiting_confirm":
             return f"⏳ Подтвердить: {title}"
@@ -212,7 +231,15 @@ def build_inbox_keyboard(
 
     active_or_clar = [a for a in actions if a.get("status") in {"active", "clarifying"}]
     ctrl_row: list[InlineKeyboardButton] = []
-    if active_or_clar:
+    if len(active_or_clar) == 1 and active_or_clar[0].get("item_kind") == "pulse_log" and not awaiting:
+        ctrl_row.append(InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub"))
+        ctrl_row.append(
+            InlineKeyboardButton(
+                text="📓 В дневник",
+                callback_data=f"inbox:reclass:{int(active_or_clar[0]['id'])}:diary",
+            )
+        )
+    elif active_or_clar:
         ctrl_row.append(InlineKeyboardButton(text="✏️ Исправить", callback_data=f"inbox:edit:{inbox_id}"))
         ctrl_row.append(InlineKeyboardButton(text="↩️ Отменить всё", callback_data=f"inbox:undo:{inbox_id}"))
     if llm_error:
@@ -264,12 +291,21 @@ def render_inbox_summary(
                 for act in active:
                     lines.append(_format_action_line(act))
     elif active or skipped:
-        if active:
-            lines.append("Записала:")
-            for act in active:
+        if (
+            len(active) == 1
+            and active[0].get("item_kind") == "pulse_log"
+            and not skipped
+            and not clarifying
+            and not awaiting
+        ):
+            lines.append(_format_action_line(active[0]))
+        else:
+            if active:
+                lines.append("Записала:")
+                for act in active:
+                    lines.append(_format_action_line(act))
+            for act in skipped:
                 lines.append(_format_action_line(act))
-        for act in skipped:
-            lines.append(_format_action_line(act))
     elif not clarifying and not awaiting:
         lines.append("Запись сохранена, активных пунктов сейчас нет.")
 
@@ -504,6 +540,8 @@ async def _persist_parsed_items(
                 )
         elif kind == "pulse_log":
             slot = (item.category or "lunch").strip().lower()
+            tz = user.get("timezone") or "UTC"
+            local_hhmm = format_time_local(now, tz)
             if slot == "bedtime":
                 p_res = await pulse_service.confirm_bedtime(db, user, now_utc=now)
                 cid = int((p_res.get("checkin") or {}).get("id") or 0) or None
@@ -542,6 +580,9 @@ async def _persist_parsed_items(
                 cid = int(chk["id"])
                 p_res = await pulse_service.complete_checkin(db, user, cid, now_utc=now)
                 karma = p_res.get("karma") or {}
+            already_resolved = bool(p_res.get("already_resolved") or p_res.get("already_marked"))
+            prev_status = str(p_res.get("status") or ("done" if p_res.get("already_marked") else ""))
+            late_wake_recorded = bool(p_res.get("late_wake_recorded"))
             action_id = await repo.create_inbox_action(
                 db,
                 user_id=user["id"],
@@ -555,6 +596,10 @@ async def _persist_parsed_items(
                     "slot": slot,
                     "delta": int(karma.get("delta") or 0),
                     "score_after": karma.get("score_after"),
+                    "already_resolved": already_resolved,
+                    "prev_status": prev_status,
+                    "late_wake_recorded": late_wake_recorded,
+                    "local_time": local_hhmm,
                     "model_note": item.model_note,
                 },
                 status="active",
