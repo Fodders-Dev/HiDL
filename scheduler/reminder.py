@@ -404,12 +404,15 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
-            if _sleep_window_active(user, now):
+            if _sleep_window_active(user, now) or pulse_service._confirmed_sleep_active(user, now):
+                continue
+            if pulse_service.is_day_off(user, local_date):
                 continue
 
             local_hhmm = format_time_local(now, tz)
             now_t = parse_hhmm(local_hhmm)
-            wake_t = parse_hhmm(str(user.get("wake_up_time") or "08:00")) or datetime.time(8, 0)
+            eff_wake, _, _ = pulse_service.get_effective_schedule(user, local_date)
+            wake_t = parse_hhmm(eff_wake) or datetime.time(8, 0)
             if now_t is None:
                 continue
             now_m = now_t.hour * 60 + now_t.minute
@@ -998,7 +1001,11 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
-            if _sleep_window_active(user, now):
+            if _sleep_window_active(user, now) or pulse_service._confirmed_sleep_active(user, now):
+                continue
+            if pulse_service.is_day_off(user, local_date):
+                continue
+            if str(user.get("weight_skip_until") or "").strip() >= local_date:
                 continue
 
             last = str(user.get("last_weight_prompt") or "").strip()
@@ -1007,7 +1014,8 @@ class ReminderScheduler:
 
             local_hhmm = format_time_local(now, tz)
             now_t = parse_hhmm(local_hhmm)
-            wake_t = parse_hhmm(str(user.get("wake_up_time") or "08:00")) or datetime.time(8, 0)
+            eff_wake, _, _ = pulse_service.get_effective_schedule(user, local_date)
+            wake_t = parse_hhmm(eff_wake) or datetime.time(8, 0)
             if now_t is None:
                 continue
             now_m = now_t.hour * 60 + now_t.minute
@@ -1051,22 +1059,25 @@ class ReminderScheduler:
             )
             tip_line = f"\n\n<i>💡 {_html_mod.escape(cards[0]['action_rule'])}</i>" if cards else ""
 
+            since_7d = (today_d - datetime.timedelta(days=6)).isoformat()
+            already_fined_7d = (
+                await repo.has_karma_event_recent(self.conn, uid, "weigh_in_missed", since_7d)
+                if (days_since is not None and days_since >= 7 and coach != "gentle")
+                else True
+            )
+            should_fine = days_since is not None and days_since >= 7 and coach != "gentle" and not already_fined_7d
             if days_since is not None and days_since >= 7 and coach != "gentle":
-                kres = await karma_service.record_karma_event(
-                    self.conn,
-                    user,
-                    domain="tasks",
-                    event_type="weigh_in_missed",
-                    delta=-5,
-                    reason="Пропуск весов 7+ дней",
-                    now_utc=now,
-                )
-                k_delta = int(kres.get("delta") or 0)
-                karma_line = (
-                    f"<b>Карма {k_delta:+d} → {kres.get('score_after', 70)}/100.</b> "
-                    if k_delta != 0
-                    else "<b>(заморозка ЧП защитила карму)</b> "
-                )
+                k_state_now = await repo.get_or_create_karma_state(self.conn, uid)
+                cur_score = int(k_state_now.get("score") if k_state_now.get("score") is not None else 70)
+                if should_fine:
+                    sick_now = karma_service.is_sick_freeze_active(user, now)
+                    karma_line = (
+                        "<b>(заморозка ЧП защитила карму)</b> "
+                        if sick_now
+                        else f"<b>Карма -5 → {max(0, cur_score - 5)}/100.</b> "
+                    )
+                else:
+                    karma_line = ""
                 msg = (
                     f"⚖ <b>Неделя без весов ({days_since} дн.)!</b>\n"
                     f"{karma_line}Когда прячешься от цифр, легко незаметно откатиться на пару кг.\n"
@@ -1104,6 +1115,16 @@ class ReminderScheduler:
                 parse_mode="HTML",
             )
             if sent:
+                if should_fine:
+                    await karma_service.record_karma_event(
+                        self.conn,
+                        user,
+                        domain="tasks",
+                        event_type="weigh_in_missed",
+                        delta=-5,
+                        reason="Пропуск весов 7+ дней",
+                        now_utc=now,
+                    )
                 await repo.update_weight_prompt(self.conn, uid, local_date)
                 sent_count += 1
         return sent_count
@@ -1521,14 +1542,17 @@ class ReminderScheduler:
             local_date = local_date_str(now, tz)
             if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
                 continue
+            if user.get("quiet_mode"):
+                continue
             if str(user.get("nutrition_checkin_last_date") or "") == local_date:
                 continue
-            if _sleep_window_active(user, now):
+            if _sleep_window_active(user, now) or pulse_service._confirmed_sleep_active(user, now):
                 continue
 
             local_hhmm = format_time_local(now, tz)
             now_t = parse_hhmm(local_hhmm)
-            sleep_t = parse_hhmm(str(user.get("sleep_time") or "23:00"))
+            _, eff_sleep, _ = pulse_service.get_effective_schedule(user, local_date)
+            sleep_t = parse_hhmm(eff_sleep)
             if now_t is None or sleep_t is None:
                 continue
             now_m = now_t.hour * 60 + now_t.minute
@@ -1571,41 +1595,36 @@ class ReminderScheduler:
                 tail = advice["summary_line"]
                 head = "🎯 <b>Вечерний разбор дня</b>"
 
+            late_night = now_t.hour >= 21 or now_t.hour < 5
             mov_txt = (
                 f"Движение сегодня: ~{kcal_burned_today} ккал"
                 if kcal_burned_today > 0
-                else "Движение: ещё можно успеть 3-минутный микро-старт"
+                else (
+                    "Движение: на сегодня фокус на сон, 3-мин старт перенеси на завтра утром"
+                    if late_night
+                    else "Движение: ещё можно успеть 3-минутный микро-старт"
+                )
             )
             karma_note = ""
+            karma_event_spec: Optional[Tuple[str, str, int, str]] = None
+            k_state_now = await repo.get_or_create_karma_state(self.conn, uid)
+            cur_score = int(k_state_now.get("score") if k_state_now.get("score") is not None else 70)
+            sick_now = karma_service.is_sick_freeze_active(user, now)
             if meals_cnt > 0 and float(eat.get("protein_g") or 0) >= float(tgt["protein_g"]) * 0.8 and int(eat["kcal"]) <= int(tgt["kcal"]) + 150:
                 if not await repo.has_karma_event_today(self.conn, uid, local_date, "nutrition_on_track"):
-                    await repo.add_points(self.conn, uid, 3, local_date=local_date)
-                    kres = await karma_service.record_karma_event(
-                        self.conn,
-                        user,
-                        domain="food",
-                        event_type="nutrition_on_track",
-                        delta=3,
-                        reason="Точный день по КБЖУ",
-                        now_utc=now,
-                    )
-                    karma_note = f"\n✨ <b>+3 кармы за точный день по КБЖУ</b> ({kres.get('score_after', 70)}/100)"
+                    karma_event_spec = ("food", "nutrition_on_track", 3, "Точный день по КБЖУ")
+                    preview_after = cur_score if sick_now else min(100, cur_score + 3)
+                    karma_note = f"\n✨ <b>+3 кармы за точный день по КБЖУ</b> ({preview_after}/100)"
             elif coach == "strict" and int(week.get("count") or 0) == 0 and (
                 int(eat["kcal"]) > int(tgt["kcal"]) + 250 or (meals_cnt == 0 and not tgt.get("is_estimated", True))
             ):
-                kres = await karma_service.record_karma_event(
-                    self.conn,
-                    user,
-                    domain="tasks",
-                    event_type="fitness_discipline_miss",
-                    delta=-4,
-                    reason="Сбой режима питания/движения",
-                    now_utc=now,
-                )
-                k_delta = int(kres.get("delta") or 0)
-                if k_delta != 0:
+                if not sick_now and not await repo.has_karma_event_today(
+                    self.conn, uid, local_date, "fitness_discipline_miss"
+                ):
+                    karma_event_spec = ("tasks", "fitness_discipline_miss", -4, "Сбой режима питания/движения")
+                    preview_after = max(0, cur_score - 4)
                     karma_note = (
-                        f"\n⚠️ <b>Карма {k_delta:+d} → {kres.get('score_after', 70)}/100:</b> "
+                        f"\n⚠️ <b>Карма -4 → {preview_after}/100:</b> "
                         "завтра правило «Никогда не пропускай дважды» — начни с 3-мин старта и белковой еды."
                     )
 
@@ -1628,16 +1647,34 @@ class ReminderScheduler:
                 f"🏃 {mov_txt}\n"
                 f"💡 {tail}{karma_note}{coach_tip}"
             )
+            second_btn = (
+                InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")
+                if late_night
+                else InlineKeyboardButton(text="🫠 3 мин сейчас", callback_data="fit:lazy")
+            )
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
-                        InlineKeyboardButton(text="🫠 3 мин сейчас", callback_data="fit:lazy"),
+                        second_btn,
                     ]
                 ]
             )
             sent = await self._safe_send_message(user, local_date, msg, reply_markup=kb, parse_mode="HTML")
             if sent:
+                if karma_event_spec is not None:
+                    ev_dom, ev_type, ev_delta, ev_reason = karma_event_spec
+                    if ev_delta > 0:
+                        await repo.add_points(self.conn, uid, ev_delta, local_date=local_date)
+                    await karma_service.record_karma_event(
+                        self.conn,
+                        user,
+                        domain=ev_dom,
+                        event_type=ev_type,
+                        delta=ev_delta,
+                        reason=ev_reason,
+                        now_utc=now,
+                    )
                 await repo.update_user_coach_settings(
                     self.conn, uid, nutrition_checkin_last_date=local_date
                 )

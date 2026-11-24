@@ -509,6 +509,14 @@ async def cb_pulse_rollover(callback: types.CallbackQuery, db) -> None:
     to_date = (datetime.date.fromisoformat(from_date) + datetime.timedelta(days=1)).isoformat()
 
     moved = await repo.rollover_unfinished_day_plan_items(db, int(user["id"]), from_date, to_date)
+    await repo.transition_pulse_checkin(
+        db,
+        cid,
+        user_id=int(user["id"]),
+        allowed_statuses=("pending", "snoozed"),
+        status="done",
+        resolved_at_utc=now.isoformat(),
+    )
     if moved > 0:
         await karma_service.record_karma_event(
             db,
@@ -577,19 +585,57 @@ def _schedule_menu_payload(user: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
         if we_w_raw and we_s_raw
         else "• Выходные: совпадают с буднями"
     )
+    extra_lines: list[str] = []
+    day_off = str(user.get("day_off_date") or "").strip()
+    if day_off:
+        extra_lines.append(f"• 🛌 Выходной (без будильника): <b>{day_off}</b>")
+    s_ov_d = str(user.get("sleep_override_date") or "").strip()
+    s_ov_t = str(user.get("sleep_override_time") or "").strip()
+    if s_ov_d and s_ov_t:
+        extra_lines.append(f"• 🌙 Разовый сдвиг отбоя ({s_ov_d}): <b>{s_ov_t}</b>")
+    extra_txt = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
     text = (
         "<b>⏰ Расписание сна и подъёма</b>\n\n"
         f"• Будни: подъём <b>{wd_w}</b> · отбой <b>{wd_s}</b>\n"
-        f"{we_line}\n\n"
+        f"{we_line}{extra_txt}\n\n"
         "Пульс дня автоматически ставит подъём и протокол отбоя (-60м и -15м) по этому графику."
     )
     rows = [
         [InlineKeyboardButton(text="✏️ Изменить будни и выходные", callback_data="pulse:schedule_edit")],
+        [
+            InlineKeyboardButton(text="🛌 Завтра без будильника", callback_data="pulse:dayoff:tomorrow"),
+            InlineKeyboardButton(text="🛌 Сегодня выходной", callback_data="pulse:dayoff:today"),
+        ],
     ]
+    if day_off:
+        rows.append([InlineKeyboardButton(text="🔄 Снять выходной", callback_data="pulse:dayoff:clear")])
     if we_w_raw and we_s_raw:
         rows.append([InlineKeyboardButton(text="🔄 Сбросить выходные (= будни)", callback_data="pulse:schedule_clear_we")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="pulse:hub")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pulse:dayoff:"))
+async def cb_pulse_dayoff(callback: types.CallbackQuery, db) -> None:
+    mode = callback.data.split(":", 2)[2]
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    now = datetime.datetime.utcnow()
+    tz = user.get("timezone") or "UTC"
+    today_d = local_date_str(now, tz)
+    if mode == "clear":
+        await repo.set_user_day_off(db, int(user["id"]), "")
+        toast = "Выходной снят."
+    elif mode == "today":
+        await repo.set_user_day_off(db, int(user["id"]), today_d)
+        toast = f"Сегодня ({today_d}) без будильника."
+    else:
+        tom_d = (datetime.date.fromisoformat(today_d) + datetime.timedelta(days=1)).isoformat()
+        await repo.set_user_day_off(db, int(user["id"]), tom_d)
+        toast = f"Завтра ({tom_d}) без будильника."
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    text, kb = _schedule_menu_payload(user)
+    await safe_edit(callback.message, text, reply_markup=kb)
+    await callback.answer(toast)
 
 
 @router.callback_query(lambda c: c.data == "pulse:schedule_menu")

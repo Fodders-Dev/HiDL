@@ -5,12 +5,19 @@ from __future__ import annotations
 import datetime
 import html
 import json
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from db import repositories as repo
 from services import calendar_service, karma_service
-from utils.time import format_time_local, local_date_str, parse_hhmm, tzinfo_from_string
+from utils.time import (
+    format_time_local,
+    local_date_plus_days,
+    local_date_str,
+    parse_hhmm,
+    tzinfo_from_string,
+)
 from utils.profile import is_student_mode
 
 if TYPE_CHECKING:
@@ -142,24 +149,39 @@ async def _clear_saved_card(bot, card_ref: Tuple[Optional[int], Optional[int]]) 
     await safe_delete_or_clear_markup(bot, chat_id, message_id)
 
 
+def is_day_off(user: Dict[str, Any], local_date: str) -> bool:
+    """Проверить, отмечен ли на указанную дату разовый выходной / день без будильника."""
+    return str(user.get("day_off_date") or "").strip() == str(local_date or "").strip()
+
+
 def get_effective_schedule(
     user: Dict[str, Any], local_date: str
 ) -> Tuple[str, str, bool]:
-    """Вернуть (wake_HHMM, sleep_HHMM, is_weekend) с учётом выходных и нормализации H:MM."""
+    """Вернуть (wake_HHMM, sleep_HHMM, is_weekend) с учётом выходных и разовых сдвигов."""
     dt = datetime.date.fromisoformat(local_date)
     is_weekend = dt.weekday() >= 5
 
     wd_wake = _normalize_hhmm(user.get("wake_up_time"), "08:00")
     wd_sleep = _normalize_hhmm(user.get("sleep_time"), "23:00")
 
-    if not is_weekend:
-        return wd_wake, wd_sleep, False
+    if is_weekend:
+        raw_we_wake = str(user.get("weekend_wake_up_time") or "").strip()
+        raw_we_sleep = str(user.get("weekend_sleep_time") or "").strip()
+        wake = _normalize_hhmm(raw_we_wake, wd_wake) if parse_hhmm(raw_we_wake) else wd_wake
+        sleep = _normalize_hhmm(raw_we_sleep, wd_sleep) if parse_hhmm(raw_we_sleep) else wd_sleep
+    else:
+        wake, sleep = wd_wake, wd_sleep
 
-    raw_we_wake = str(user.get("weekend_wake_up_time") or "").strip()
-    raw_we_sleep = str(user.get("weekend_sleep_time") or "").strip()
-    we_wake = _normalize_hhmm(raw_we_wake, wd_wake) if parse_hhmm(raw_we_wake) else wd_wake
-    we_sleep = _normalize_hhmm(raw_we_sleep, wd_sleep) if parse_hhmm(raw_we_sleep) else wd_sleep
-    return we_wake, we_sleep, True
+    if str(user.get("wake_override_date") or "").strip() == local_date:
+        raw_ow = str(user.get("wake_override_time") or "").strip()
+        if parse_hhmm(raw_ow):
+            wake = _normalize_hhmm(raw_ow, wake)
+    if str(user.get("sleep_override_date") or "").strip() == local_date:
+        raw_os = str(user.get("sleep_override_time") or "").strip()
+        if parse_hhmm(raw_os):
+            sleep = _normalize_hhmm(raw_os, sleep)
+
+    return wake, sleep, is_weekend
 
 
 def compute_daily_slots(
@@ -581,6 +603,7 @@ def build_pulse_message(
                 InlineKeyboardButton(text="⏰ Через 30 мин", callback_data=f"pulse:snooze:{cid}:30"),
             ],
             [
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pulse:skip:{cid}"),
                 InlineKeyboardButton(text="🆘 Нет сил", callback_data="help:menu"),
             ],
         ]
@@ -609,7 +632,10 @@ def build_pulse_message(
                 InlineKeyboardButton(text="🪥 Зубы почистил", callback_data=f"pulse:hygiene:{cid}:teeth"),
                 InlineKeyboardButton(text="✅ Сворачиваю день", callback_data=f"pulse:done:{cid}"),
             ],
-            [InlineKeyboardButton(text="⏰ Ещё 20 мин", callback_data=f"pulse:snooze:{cid}:20")],
+            [
+                InlineKeyboardButton(text="⏰ Ещё 20 мин", callback_data=f"pulse:snooze:{cid}:20"),
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pulse:skip:{cid}"),
+            ],
         ]
     elif slot_key == "bedtime":
         rows = [
@@ -737,7 +763,7 @@ async def complete_checkin(
     )
     if not changed:
         current_chk = updated or checkin
-        if slot_key == "wake" and str(current_chk.get("status") or "") == "missed":
+        if slot_key == "wake" and str(current_chk.get("status") or "") in {"missed", "ignored"}:
             tz = user.get("timezone") or "UTC"
             local_d = local_date_str(now, tz)
             local_hhmm = format_time_local(now, tz)
@@ -842,10 +868,20 @@ async def confirm_bedtime(
     local_date = local_date_str(now, tz)
     user_id = int(user["id"])
 
+    target_date = local_date
+    if checkin_id is None:
+        local_hhmm = format_time_local(now, tz)
+        eff_wake, _, _ = get_effective_schedule(user, local_date)
+        if _hhmm_to_min(local_hhmm) < min(360, _hhmm_to_min(eff_wake)):
+            prev_d = (datetime.date.fromisoformat(local_date) - datetime.timedelta(days=1)).isoformat()
+            prev_chk = await repo.get_pulse_checkin(db, user_id, prev_d, "bedtime")
+            if prev_chk is not None or _hhmm_to_min(local_hhmm) < 360:
+                target_date = prev_d
+
     checkin = (
         await repo.get_pulse_checkin_by_id(db, checkin_id)
         if checkin_id is not None
-        else await repo.get_pulse_checkin(db, user_id, local_date, "bedtime")
+        else await repo.get_pulse_checkin(db, user_id, target_date, "bedtime")
     )
     if checkin_id is not None and checkin is None:
         return {"ok": False, "error": "Чек-ин не найден."}
@@ -853,7 +889,7 @@ async def confirm_bedtime(
         checkin = await repo.upsert_pulse_checkin(
             db,
             user_id,
-            local_date,
+            target_date,
             "bedtime",
             "sleep",
             now.isoformat(),
@@ -1065,15 +1101,25 @@ async def skip_checkin(
     if not changed:
         return await _already_resolved_result(db, user, updated or checkin)
     winning = updated or checkin
-    karma_res = await karma_service.record_karma_event(
-        db,
-        user,
-        domain=domain,
-        event_type="checkin_skip",
-        delta=-4,
-        reason=f"Пропущен чек-ин «{title}»",
-        now_utc=now,
-    )
+    if str(winning.get("slot_key") or "") == "breakfast" and meta.get("gentle"):
+        state = await repo.get_or_create_karma_state(db, int(user["id"]))
+        score_now = int(state.get("score") if state.get("score") is not None else 70)
+        karma_res = {
+            "delta": 0,
+            "score_after": score_now,
+            "mode": karma_service.get_karma_mode(score_now, user),
+            "frozen": False,
+        }
+    else:
+        karma_res = await karma_service.record_karma_event(
+            db,
+            user,
+            domain=domain,
+            event_type="checkin_skip",
+            delta=-4,
+            reason=f"Пропущен чек-ин «{title}»",
+            now_utc=now,
+        )
     return {
         "ok": True,
         "checkin": winning,
@@ -1154,15 +1200,24 @@ async def schedule_adhoc_snooze(
     }
 
 
+_EARLY_WAKE_RE = re.compile(
+    r"(?iu)^(?:(?:я|вот|только|сейчас|уже)\s+)*(?:встал[аи]?|проснул(?:ся|ась)|доброе\s+утро)\b"
+)
+
+
 async def check_night_violation(
     db,
     user: Dict[str, Any],
     now_utc: Optional[datetime.datetime] = None,
+    *,
+    text: str = "",
 ) -> Optional[str]:
     """Поймать пользователя за ночным онлайном после подтверждённого отбоя."""
     if is_student_mode(user):
         return None
     if not user.get("pulse_enabled", 1):
+        return None
+    if text and _EARLY_WAKE_RE.search(text.strip()):
         return None
     confirmed_at = _parse_iso_utc(user.get("sleep_confirmed_at"))
     if confirmed_at is None:
@@ -1201,6 +1256,12 @@ async def check_night_violation(
 
     await repo.update_user_night_catch(db, int(user["id"]), now.isoformat())
     local_hhmm = now_local.strftime("%H:%M")
+
+    if last_catch is not None and last_catch >= confirmed_at:
+        return (
+            f"🌙 <b>Напоминаю: на часах {local_hhmm}</b> — ты уже подтвердил отбой.\n"
+            "Повторный штраф не ставлю, но постарайся отложить телефон и поспать."
+        )
 
     if karma_service.is_sick_freeze_active(user, now):
         return (
@@ -1305,13 +1366,23 @@ async def _safe_bot_send(
     local_date: str,
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
+    *,
+    db=None,
 ) -> Optional[Any]:
     telegram_id = user.get("telegram_id")
     if not telegram_id:
         return None
     try:
         return await bot.send_message(chat_id=telegram_id, text=text, reply_markup=reply_markup)
-    except Exception:
+    except Exception as exc:
+        if type(exc).__name__ == "TelegramForbiddenError" and db is not None and user.get("id"):
+            pause_until = local_date_plus_days(
+                datetime.datetime.utcnow(), str(user.get("timezone") or "UTC"), 30
+            )
+            try:
+                await repo.set_user_pause(db, int(user["id"]), pause_until)
+            except Exception:
+                pass
         return None
 
 
@@ -1341,6 +1412,8 @@ async def process_pulse_tick(
 
         wellness_row = await repo.get_wellness(db, uid)
         wellness = dict(wellness_row) if wellness_row else None
+        prev_date = (datetime.date.fromisoformat(local_date) - datetime.timedelta(days=1)).isoformat()
+        prev_slots = compute_daily_slots(user, wellness, prev_date)
         slots = compute_daily_slots(user, wellness, local_date)
         wake_slot = next((s for s in slots if s["slot_key"] == "wake"), None)
 
@@ -1354,21 +1427,30 @@ async def process_pulse_tick(
                 user["sleep_confirmed_date"] = None
 
         sleep_locked = _confirmed_sleep_active(user, now)
-        for slot in slots:
-            if sleep_locked and slot["slot_key"] != "wake":
-                continue
-            sched_utc = slot["scheduled_at_utc"]
-            # Окно создания 120 минут защищает от шквала просроченных утренних пингов при рестарте вечером.
-            if sched_utc <= now <= sched_utc + datetime.timedelta(minutes=120):
-                await repo.upsert_pulse_checkin(
-                    db,
-                    uid,
-                    local_date,
-                    slot["slot_key"],
-                    slot["domain"],
-                    sched_utc.isoformat(),
-                    sched_utc.isoformat(),
-                )
+        day_off_today = is_day_off(user, local_date)
+        day_off_prev = is_day_off(user, prev_date)
+        candidate_groups = (
+            (prev_date, prev_slots, day_off_prev),
+            (local_date, slots, day_off_today),
+        )
+        for slot_date, group_slots, group_day_off in candidate_groups:
+            for slot in group_slots:
+                if group_day_off and slot["slot_key"] == "wake":
+                    continue
+                if sleep_locked and slot["slot_key"] != "wake":
+                    continue
+                sched_utc = slot["scheduled_at_utc"]
+                # Окно создания 120 минут защищает от шквала просроченных утренних пингов при рестарте вечером.
+                if sched_utc <= now <= sched_utc + datetime.timedelta(minutes=120):
+                    await repo.upsert_pulse_checkin(
+                        db,
+                        uid,
+                        slot_date,
+                        slot["slot_key"],
+                        slot["domain"],
+                        sched_utc.isoformat(),
+                        sched_utc.isoformat(),
+                    )
 
     due_checkins = await repo.list_due_pulse_checkins(db, now.isoformat())
     for checkin in due_checkins:
@@ -1389,6 +1471,22 @@ async def process_pulse_tick(
             continue
 
         slot_key = str(checkin.get("slot_key") or "")
+        chk_local_date = str(checkin.get("local_date") or "")
+        sched_dt = _parse_iso_utc(checkin.get("scheduled_at_utc"))
+        if (
+            chk_local_date
+            and chk_local_date < local_date
+            and sched_dt is not None
+            and (now - sched_dt) > datetime.timedelta(hours=6)
+        ):
+            changed, _ = await repo.transition_pulse_checkin(
+                db, int(checkin["id"]), user_id=uid, allowed_statuses=("pending", "snoozed"),
+                expected_fields=_transition_snapshot(checkin), status="skipped",
+                resolved_at_utc=now.isoformat(), card_chat_id=None, card_message_id=None,
+            )
+            if changed:
+                await _clear_saved_card(bot, _card_ref(checkin))
+            continue
         if is_student_mode(user) and slot_key in {"breakfast", "lunch", "dinner"}:
             changed, transitioned = await repo.transition_pulse_checkin(
                 db, int(checkin["id"]), user_id=uid, allowed_statuses=("pending", "snoozed"),
@@ -1476,7 +1574,7 @@ async def process_pulse_tick(
                 f"❌ <b>Чек-ин «{html.escape(str(title))}» пропущен (игнор 3/3).</b>\n"
                 f"Карма: <b>{karma_res['delta']}</b> → <b>{karma_res['score_after']}/100</b>. Я это запомнила."
             )
-            await _safe_bot_send(bot, user, local_date, msg)
+            await _safe_bot_send(bot, user, local_date, msg, db=db)
             sent_or_resolved += 1
             continue
 
@@ -1494,7 +1592,7 @@ async def process_pulse_tick(
             user=user,
         )
         old_card = _card_ref(checkin)
-        sent_msg = await _safe_bot_send(bot, user, local_date, text, reply_markup=kb)
+        sent_msg = await _safe_bot_send(bot, user, local_date, text, reply_markup=kb, db=db)
         if sent_msg is None:
             continue
 

@@ -529,12 +529,19 @@ async def fit_scale_cancel(callback: types.CallbackQuery, state: FSMContext, db)
 
 
 @router.callback_query(lambda c: c.data == "fit:weigh_skip")
-async def fit_weigh_skip_cb(callback: types.CallbackQuery) -> None:
+async def fit_weigh_skip_cb(callback: types.CallbackQuery, db) -> None:
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    from utils.time import local_date_plus_days
+
+    until_date = local_date_plus_days(
+        datetime.datetime.utcnow(), str(user.get("timezone") or "UTC"), 3
+    )
+    await repo.set_user_weight_skip_until(db, int(user["id"]), until_date)
     await safe_edit(
         callback.message,
-        "⏭ Ок, зафиксировала. Напомню утром — главное не пропадай с весов на неделю!",
+        "⏭ Ок, напомню про весы через 3 дня — главное не пропадай с весов надолго!",
     )
-    await callback.answer()
+    await callback.answer("Отложено на 3 дня")
 
 
 def _scale_doc_mime(doc: Any) -> Optional[str]:

@@ -58,7 +58,7 @@ async def _existing_menu_user(db, telegram_id: int) -> dict[str, Any] | None:
 async def handle_free_text_inbox(message: types.Message, db) -> None:
     """Единая точка входа для произвольного текста из natural_handler."""
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    night_notice = await pulse_service.check_night_violation(db, user)
+    night_notice = await pulse_service.check_night_violation(db, user, text=getattr(message, "text", None) or "")
     reply_msg = getattr(message, "reply_to_message", None)
     reply_context = str(
         getattr(reply_msg, "text", None) or getattr(reply_msg, "caption", None) or ""
@@ -91,7 +91,7 @@ async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> N
     if current and (current.startswith("InboxEditState:") or current.startswith("MealAddState:")):
         await state.clear()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
-    night_notice = await pulse_service.check_night_violation(db, user)
+    night_notice = await pulse_service.check_night_violation(db, user, text=getattr(message, "text", None) or "")
     reply_msg = getattr(message, "reply_to_message", None)
     reply_context = str(
         getattr(reply_msg, "text", None) or getattr(reply_msg, "caption", None) or ""

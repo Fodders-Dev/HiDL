@@ -500,11 +500,7 @@ async def cal_shift_bedtime(callback: types.CallbackQuery, db) -> None:
         return
     user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
     local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    eff_wake, _, is_weekend = pulse_service.get_effective_schedule(user, local_date)
-    if is_weekend:
-        await repo.update_user_weekend_schedule(db, user["id"], eff_wake, target_hhmm)
-    else:
-        await repo.update_user_sleep(db, user["id"], target_hhmm)
+    await repo.set_user_sleep_override(db, user["id"], local_date, target_hhmm)
 
     refreshed_row = await repo.get_user(db, user["id"])
     refreshed = dict(refreshed_row) if refreshed_row else user

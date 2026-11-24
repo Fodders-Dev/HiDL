@@ -152,6 +152,52 @@ async def update_user_sleep(
     await conn.commit()
 
 
+async def set_user_day_off(conn: aiosqlite.Connection, user_id: int, date_str: str) -> None:
+    """Установить или сбросить разовый выходной (без утреннего будильника)."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET day_off_date = ?, updated_at = ? WHERE id = ?",
+        (str(date_str or "").strip(), now, int(user_id)),
+    )
+    await conn.commit()
+
+
+async def set_user_sleep_override(
+    conn: aiosqlite.Connection, user_id: int, date_str: str, hhmm: str
+) -> None:
+    """Установить разовый сдвиг отбоя только на одну дату."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET sleep_override_date = ?, sleep_override_time = ?, updated_at = ? WHERE id = ?",
+        (str(date_str or "").strip(), str(hhmm or "").strip(), now, int(user_id)),
+    )
+    await conn.commit()
+
+
+async def set_user_wake_override(
+    conn: aiosqlite.Connection, user_id: int, date_str: str, hhmm: str
+) -> None:
+    """Установить разовый сдвиг подъёма только на одну дату."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET wake_override_date = ?, wake_override_time = ?, updated_at = ? WHERE id = ?",
+        (str(date_str or "").strip(), str(hhmm or "").strip(), now, int(user_id)),
+    )
+    await conn.commit()
+
+
+async def set_user_weight_skip_until(
+    conn: aiosqlite.Connection, user_id: int, date_str: str
+) -> None:
+    """Отложить утренний запрос взвешивания до указанной даты."""
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE users SET weight_skip_until = ?, updated_at = ? WHERE id = ?",
+        (str(date_str or "").strip(), now, int(user_id)),
+    )
+    await conn.commit()
+
+
 async def update_sleep_mode(
     conn: aiosqlite.Connection,
     user_id: int,
@@ -2342,6 +2388,20 @@ async def has_karma_event_today(
     cur = await conn.execute(
         "SELECT 1 FROM karma_events WHERE user_id = ? AND local_date = ? AND event_type = ? LIMIT 1",
         (int(user_id), str(local_date), str(event_type)),
+    )
+    return (await cur.fetchone()) is not None
+
+
+async def has_karma_event_recent(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    event_type: str,
+    since_date: str,
+) -> bool:
+    """Проверить, фиксировалось ли событие кармы указанного типа начиная с since_date."""
+    cur = await conn.execute(
+        "SELECT 1 FROM karma_events WHERE user_id = ? AND local_date >= ? AND event_type = ? LIMIT 1",
+        (int(user_id), str(since_date), str(event_type)),
     )
     return (await cur.fetchone()) is not None
 

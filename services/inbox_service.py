@@ -151,7 +151,7 @@ def _format_action_line(action: dict[str, Any]) -> str:
         late_wake_recorded = bool(payload.get("late_wake_recorded"))
         local_time = str(payload.get("local_time") or "").strip()
 
-        if already_resolved and prev_status == "missed":
+        if already_resolved and prev_status in {"missed", "ignored"}:
             if late_wake_recorded:
                 t_part = f" в {_esc(local_time)}" if local_time else ""
                 return (
@@ -1162,6 +1162,26 @@ async def _persist_parsed_items(
                     payload={"previous_wake": prev_wake, "new_wake": target_hhmm, "model_note": item.model_note},
                     status="active",
                 )
+            elif item.category == "no_alarm":
+                target_d = (
+                    (datetime.date.fromisoformat(local_date) + datetime.timedelta(days=1)).isoformat()
+                    if "завтра" in (item.source_quote or "").lower()
+                    else local_date
+                )
+                prev_day_off = str(user.get("day_off_date") or "")
+                await repo.set_user_day_off(db, user["id"], target_d)
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="shift_wake",
+                    target_table="user_day_off",
+                    target_id=user["id"],
+                    title=f"Без будильника на {format_date_display(target_d)}",
+                    source_quote=item.source_quote,
+                    payload={"day_off_date": target_d, "previous_day_off": prev_day_off, "model_note": item.model_note},
+                    status="active",
+                )
             else:
                 action_id = await repo.create_inbox_action(
                     db,
@@ -1172,7 +1192,7 @@ async def _persist_parsed_items(
                     target_id=None,
                     title="Режим без будильника на завтра (уточни время подъёма HH:MM, чтобы изменить расписание)",
                     source_quote=item.source_quote,
-                    payload={"no_alarm": item.category == "no_alarm", "model_note": item.model_note},
+                    payload={"no_alarm": False, "model_note": item.model_note},
                     status="skipped",
                 )
         elif kind == "task_delete":
@@ -2672,6 +2692,11 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
         if prev_wake:
             await repo.update_user_wake(db, user_id, prev_wake)
         return
+    if table == "user_day_off":
+        if action.get("status") == "skipped":
+            return
+        await repo.set_user_day_off(db, user_id, str(payload.get("previous_day_off") or ""))
+        return
     tid = action.get("target_id")
     if table == "pantry_items":
         if tid:
@@ -2819,13 +2844,8 @@ async def confirm_inbox_action(
         target_hhmm = str(payload.get("target_hhmm") or "").strip()
         if not target_hhmm:
             return False, "Не удалось определить время отбоя."
-        is_weekend = bool(payload.get("is_weekend"))
         local_date = str(payload.get("local_date") or local_date_str(now, user.get("timezone") or "UTC"))
-        eff_wake, _, _ = pulse_service.get_effective_schedule(user, local_date)
-        if is_weekend:
-            await repo.update_user_weekend_schedule(db, user["id"], eff_wake, target_hhmm)
-        else:
-            await repo.update_user_sleep(db, user["id"], target_hhmm)
+        await repo.set_user_sleep_override(db, user["id"], local_date, target_hhmm)
 
         refreshed_user_row = await repo.get_user(db, user["id"])
         refreshed_user = dict(refreshed_user_row) if refreshed_user_row else dict(user)

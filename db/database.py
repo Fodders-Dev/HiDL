@@ -138,6 +138,12 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             sleep_confirmed_date TEXT,
             sleep_confirmed_at TEXT,
             night_catch_last_at TEXT,
+            day_off_date TEXT NOT NULL DEFAULT '',
+            wake_override_date TEXT NOT NULL DEFAULT '',
+            wake_override_time TEXT NOT NULL DEFAULT '',
+            sleep_override_date TEXT NOT NULL DEFAULT '',
+            sleep_override_time TEXT NOT NULL DEFAULT '',
+            weight_skip_until TEXT NOT NULL DEFAULT '',
             profile_mode TEXT NOT NULL DEFAULT 'adult',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -2076,6 +2082,12 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
         ("coach_mode", "TEXT NOT NULL DEFAULT 'balanced'"),
         ("nutrition_checkin_enabled", "INTEGER NOT NULL DEFAULT 1"),
         ("nutrition_checkin_last_date", "TEXT NOT NULL DEFAULT ''"),
+        ("day_off_date", "TEXT NOT NULL DEFAULT ''"),
+        ("wake_override_date", "TEXT NOT NULL DEFAULT ''"),
+        ("wake_override_time", "TEXT NOT NULL DEFAULT ''"),
+        ("sleep_override_date", "TEXT NOT NULL DEFAULT ''"),
+        ("sleep_override_time", "TEXT NOT NULL DEFAULT ''"),
+        ("weight_skip_until", "TEXT NOT NULL DEFAULT ''"),
     ):
         if users_fit_info and col_name not in users_fit_cols:
             await conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")
