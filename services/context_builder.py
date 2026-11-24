@@ -8,7 +8,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from db import repositories as repo
-from services import calendar_service, karma_service, pulse_service
+from services import calendar_service, fitness_nutrition, karma_service, pulse_service
 from utils.rows import rows_to_dicts
 from utils.profile import is_student_mode
 from utils.time import format_time_local, local_date_str, parse_hhmm
@@ -240,6 +240,16 @@ async def build_user_day_snapshot(
     if student:
         patterns = [p for p in patterns if p != "late_night_drift"]
 
+    nutrition_advice: Optional[Dict[str, Any]] = None
+    body_trend: Optional[Dict[str, Any]] = None
+    week_workouts: Optional[Dict[str, Any]] = None
+    equipment: List[str] = []
+    if not student:
+        nutrition_advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now)
+        body_trend = await repo.body_metrics_trend(db, user_id, days=30)
+        week_workouts = await repo.workout_stats_week(db, user_id, local_date)
+        equipment = repo.get_user_equipment(user)
+
     return {
         "local_date": local_date,
         "local_time": local_hhmm,
@@ -266,6 +276,13 @@ async def build_user_day_snapshot(
         "meal_plan_today": [] if student else meal_plan_today,
         "meal_profile": meal_profile,
         "student_mode": student,
+        "weight_goal": str(user.get("weight_goal") or "loss"),
+        "coach_mode": str(user.get("coach_mode") or "balanced"),
+        "coach_directive": fitness_nutrition.get_coach_directive(user, student=student),
+        "nutrition_advice": nutrition_advice,
+        "body_trend": body_trend,
+        "week_workouts": week_workouts,
+        "equipment": equipment,
         "portrait_text": memory.get("portrait_text") or "",
         "patterns": patterns,
     }
@@ -336,6 +353,38 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         lines.append("Профиль: ученик. Тон спокойный и бережный; не дави, не стыди и не используй нотации или КАПС.")
     else:
         lines.append(f"Питание: {DIET_LABELS.get(snapshot['meal_profile'], snapshot['meal_profile'])}. Холодильник: {pantry_str}. Покупки: {shop_str}.")
+        if snapshot.get("coach_directive"):
+            lines.append(str(snapshot["coach_directive"]))
+        n_adv = snapshot.get("nutrition_advice")
+        if isinstance(n_adv, dict):
+            tgt = n_adv.get("targets") or {}
+            eat = n_adv.get("eaten") or {}
+            if not tgt.get("mindful_mode"):
+                lines.append(
+                    f"КБЖУ сегодня: съедено {int(round(eat.get('kcal') or 0))}/{int(tgt.get('kcal') or 0)} ккал "
+                    f"(Б {eat.get('protein_g', 0):g}/{tgt.get('protein_g', 0)}г, "
+                    f"Ж {eat.get('fat_g', 0):g}/{tgt.get('fat_g', 0)}г, "
+                    f"У {eat.get('carbs_g', 0):g}/{tgt.get('carbs_g', 0)}г). "
+                    f"{n_adv.get('summary_line', '')}"
+                )
+        trend = snapshot.get("body_trend") or {}
+        latest_w = trend.get("latest") if isinstance(trend, dict) else None
+        if isinstance(latest_w, dict) and latest_w.get("weight"):
+            w_bits = [f"{float(latest_w['weight']):.1f} кг"]
+            if latest_w.get("body_fat_pct") is not None:
+                w_bits.append(f"жир {float(latest_w['body_fat_pct']):.1f}%")
+            if latest_w.get("muscle_mass_kg") is not None:
+                w_bits.append(f"мышцы {float(latest_w['muscle_mass_kg']):.1f} кг")
+            if trend.get("fat_delta") is not None:
+                w_bits.append(f"жир за {trend.get('days', 30)}д {float(trend['fat_delta']):+.1f}%")
+            lines.append("Тело/весы: " + ", ".join(w_bits) + ".")
+        wk = snapshot.get("week_workouts") or {}
+        eq = snapshot.get("equipment") or []
+        if eq or int(wk.get("count") or 0) > 0:
+            lines.append(
+                f"Спорт: инвентарь [{fitness_nutrition.format_equipment_labels(eq)}], "
+                f"за 7 дн. тренировок: {int(wk.get('count') or 0)} ({int(wk.get('total_minutes') or 0)} мин)."
+            )
     meal_plan_today = snapshot.get("meal_plan_today") or []
     if meal_plan_today:
         slot_names = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин"}

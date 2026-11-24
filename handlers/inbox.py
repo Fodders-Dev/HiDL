@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import html
+import io
 import json
 from typing import Any, Optional
 
@@ -15,9 +16,10 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import advice_service, inbox_service, pulse_service
+from services import advice_service, fitness_nutrition, inbox_service, pulse_service
 from services.inbox_parser import resolve_temporal_expression
 from utils.menu_match import match_menu_label
+from utils.profile import is_student_mode
 from utils.sender import safe_edit
 from utils.time import format_date_display, local_date_str
 from utils.user import ensure_user
@@ -98,6 +100,115 @@ async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> N
         reply_text,
         reply_markup=outcome.reply_markup or main_menu_keyboard(user),
     )
+
+
+@router.message(StateFilter(None), F.photo)
+async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db) -> None:
+    """Обработать фото тарелки, этикетки или умных весов прямо из общего чата."""
+    if await state.get_state():
+        return
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    if is_student_mode(user):
+        return
+    photo = message.photo[-1]
+    buf = io.BytesIO()
+    dl = await message.bot.download(photo, destination=buf)
+    img_bytes = buf.getvalue()
+    if not img_bytes and dl is not None:
+        if hasattr(dl, "getvalue"):
+            img_bytes = dl.getvalue()
+        elif isinstance(dl, (bytes, bytearray)):
+            img_bytes = bytes(dl)
+    if not img_bytes:
+        await message.answer("Не удалось загрузить фото — попробуй ещё раз или напиши текстом.")
+        return
+
+    uid = int(user["id"])
+    caption = (message.caption or "").strip()
+    low_cap = caption.lower()
+    now_utc = datetime.datetime.utcnow()
+
+    # 1. Если ждём уточнение по недавней еде -> фото этикетки или тарелки сразу уточняет и сохраняет!
+    pending = await repo.get_active_pending_meal(db, uid, now_utc=now_utc)
+    if pending is not None:
+        combined_cap = f"{pending['raw_text']} {caption}".strip()
+        parsed = await fitness_nutrition.parse_meal_input(
+            raw_text=combined_cap,
+            image_bytes=img_bytes,
+            image_mime="image/jpeg",
+            db=db,
+            user_id=uid,
+            allow_clarification=False,
+        )
+        if parsed.get("ok"):
+            committed = await inbox_service.commit_pending_meal(
+                db, user, pending, refined_meal=parsed, status="refined", now_utc=now_utc
+            )
+            label_note = "\n🏷 <i>Этикетку запомнила на будущее.</i>" if parsed.get("is_nutrition_label") else ""
+            rem_line = ""
+            if not committed["advice"]["targets"].get("mindful_mode"):
+                rem = committed["advice"]["remaining"]
+                rem_line = f"\nОстаток на сегодня: <b>{rem['kcal']} ккал</b> · белок +{rem['protein_g']} г"
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✏️ Поправить", callback_data=f"kbju:refine:{committed['meal_id']}"),
+                        InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                    ]
+                ]
+            )
+            await message.answer(
+                f"✅ Уточнила по фото и записала: <b>{_esc(committed['title'])}</b>\n"
+                f"🔥 <b>{committed['kcal']} ккал</b> (Б {committed['protein_g']:g}/Ж {committed['fat_g']:g}/У {committed['carbs_g']:g})"
+                f"{rem_line}{label_note}",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+    # 2. Если в подписи явно про весы/замер тела -> распознаём умные весы
+    if any(w in low_cap for w in ("вес", "весы", "жир", "мышц", "scale")):
+        scale_res = await fitness_nutrition.parse_smart_scale_input(
+            raw_text=caption,
+            image_bytes=img_bytes,
+            image_mime="image/jpeg",
+        )
+        if scale_res.get("ok"):
+            await repo.add_weight(
+                db,
+                uid,
+                float(scale_res["weight"]),
+                body_fat_pct=scale_res.get("body_fat_pct"),
+                muscle_mass_kg=scale_res.get("muscle_mass_kg"),
+                water_pct=scale_res.get("water_pct"),
+                visceral_fat=scale_res.get("visceral_fat"),
+                bmi=scale_res.get("bmi"),
+                source=str(scale_res.get("source") or "scale_photo"),
+            )
+            trend = await repo.body_metrics_trend(db, uid, days=30)
+            fb = fitness_nutrition.format_body_trend_feedback(trend, str(user.get("weight_goal") or "loss"))
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⚖ Тело и весы", callback_data="fit:body")]]
+            )
+            await message.answer(
+                f"⚖ Записала замер с фото: <b>{float(scale_res['weight']):.1f} кг</b>.\n{_esc(fb)}",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+    # 3. Обычное фото еды или этикетки из чата -> показываем 1-тап превью КБЖУ
+    from handlers import nutrition
+
+    parsed_meal = await fitness_nutrition.parse_meal_input(
+        raw_text=caption,
+        image_bytes=img_bytes,
+        image_mime="image/jpeg",
+        db=db,
+        user_id=uid,
+        allow_clarification=False,
+    )
+    await nutrition._show_meal_preview(message, state, parsed_meal)
 
 
 def _build_edit_list_view(

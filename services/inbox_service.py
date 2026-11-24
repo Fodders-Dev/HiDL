@@ -14,7 +14,16 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
-from services import advice_service, calendar_service, context_builder, karma_service, kitchen_ai, pulse_service, stt
+from services import (
+    advice_service,
+    calendar_service,
+    context_builder,
+    fitness_nutrition,
+    karma_service,
+    kitchen_ai,
+    pulse_service,
+    stt,
+)
 from services.inbox_parser import (
     InboxParseResult,
     ParsedInboxItem,
@@ -37,6 +46,10 @@ KIND_LABELS = {
     "pulse_log": ("💓", "Режим и карма"),
     "rollover_tasks": ("➡️", "Перенос хвостов"),
     "shift_bedtime": ("🌙", "Сдвиг отбоя"),
+    "meal_log": ("🔥", "КБЖУ"),
+    "weight_log": ("⚖", "Весы"),
+    "workout_log": ("🏋️", "Тренировка"),
+    "pending_meal": ("🍽", "Уточнить еду"),
     "expense": ("💸", "Трата"),
     "diary": ("📓", "Дневник"),
     "idea": ("💡", "Идея"),
@@ -150,6 +163,39 @@ def _format_action_line(action: dict[str, Any]) -> str:
             return f"💓 Режим: {title} — отмечено в «Сон и карма» ({time_prefix}+{delta} кармы → {score_after}/100)"
         time_note = f" ({_esc(local_time)})" if local_time else ""
         return f"💓 Режим: {title} — отмечено в «Сон и карма»{time_note}"
+    if kind == "meal_log":
+        kcal = int(round(float(payload.get("kcal") or 0)))
+        p_g = float(payload.get("protein_g") or 0)
+        f_g = float(payload.get("fat_g") or 0)
+        c_g = float(payload.get("carbs_g") or 0)
+        src_map = {
+            "openfoodfacts": " · Open Food Facts",
+            "web_search": " · из меню в сети",
+            "my_label": " · твоя этикетка",
+            "text_label": " · с этикетки",
+            "vision_label": " · с этикетки",
+        }
+        src_note = src_map.get(str(payload.get("lookup_source") or payload.get("source") or ""), "")
+        rem_note = f"\n   {payload['remaining_line']}" if payload.get("remaining_line") else ""
+        return (
+            f"🔥 <b>{title}</b> — <b>{kcal} ккал</b> "
+            f"(Б {p_g:g}/Ж {f_g:g}/У {c_g:g}){src_note}{rem_note}"
+        )
+    if kind == "weight_log":
+        w = payload.get("weight")
+        bits = [f"<b>{float(w):.1f} кг</b>"] if w else [title]
+        if payload.get("body_fat_pct") is not None:
+            bits.append(f"жир {float(payload['body_fat_pct']):.1f}%")
+        if payload.get("muscle_mass_kg") is not None:
+            bits.append(f"мышцы {float(payload['muscle_mass_kg']):.1f} кг")
+        trend_note = f"\n   {_esc(payload['trend_note'])}" if payload.get("trend_note") else ""
+        return f"⚖ Замер тела: {' · '.join(bits)}{trend_note}"
+    if kind == "workout_log":
+        dur = int(payload.get("duration_min") or 15)
+        kb = int(payload.get("kcal_burned") or 0)
+        delta = int(payload.get("karma_delta") or 0)
+        k_txt = f", +{delta} кармы" if delta > 0 else ""
+        return f"🏋️ Тренировка: {title} ({dur} мин · ~{kb} ккал{k_txt})"
     if kind in {"rollover_tasks", "shift_bedtime"}:
         if action.get("status") == "awaiting_confirm":
             return f"⏳ Подтвердить: {title}"
@@ -176,38 +222,55 @@ def build_inbox_keyboard(
         first = clarifying[0]
         aid = first["id"]
         payload = _load_payload(first)
-        candidates = payload.get("candidate_times") or []
-        resolved_date = payload.get("resolved_date")
-        if candidates:
+        if first.get("item_kind") == "pending_meal":
+            pid = int(payload.get("pending_meal_id") or first.get("target_id") or 0)
+            est_k = int(round(float(payload.get("kcal") or 0)))
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"🕒 {t}",
-                        callback_data=f"inbox:clarify_time:{aid}:{t.replace(':', '_')}",
-                    )
-                    for t in candidates[:3]
+                        text=f"✅ ~{est_k} ккал",
+                        callback_data=f"kbju:pcommit:{pid}:1",
+                    ),
+                    InlineKeyboardButton(
+                        text="🍽 Полпорции",
+                        callback_data=f"kbju:pcommit:{pid}:0.5",
+                    ),
                 ]
             )
-        elif not resolved_date:
+            rows.append([InlineKeyboardButton(text="❌ Не писать", callback_data=f"kbju:pdrop:{pid}")])
+        else:
+            candidates = payload.get("candidate_times") or []
+            resolved_date = payload.get("resolved_date")
+            if candidates:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"🕒 {t}",
+                            callback_data=f"inbox:clarify_time:{aid}:{t.replace(':', '_')}",
+                        )
+                        for t in candidates[:3]
+                    ]
+                )
+            elif not resolved_date:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text="Сегодня 19:00",
+                            callback_data=f"inbox:clarify_preset:{aid}:today_19",
+                        ),
+                        InlineKeyboardButton(
+                            text="Завтра 12:00",
+                            callback_data=f"inbox:clarify_preset:{aid}:tomorrow_12",
+                        ),
+                    ]
+                )
             rows.append(
                 [
-                    InlineKeyboardButton(
-                        text="Сегодня 19:00",
-                        callback_data=f"inbox:clarify_preset:{aid}:today_19",
-                    ),
-                    InlineKeyboardButton(
-                        text="Завтра 12:00",
-                        callback_data=f"inbox:clarify_preset:{aid}:tomorrow_12",
-                    ),
+                    InlineKeyboardButton(text="🕒 Своё время", callback_data=f"inbox:clarify_custom:{aid}"),
+                    InlineKeyboardButton(text="✅ Как задачу", callback_data=f"inbox:clarify_task:{aid}"),
+                    InlineKeyboardButton(text="✖️ Убрать", callback_data=f"inbox:clarify_drop:{aid}"),
                 ]
             )
-        rows.append(
-            [
-                InlineKeyboardButton(text="🕒 Своё время", callback_data=f"inbox:clarify_custom:{aid}"),
-                InlineKeyboardButton(text="✅ Как задачу", callback_data=f"inbox:clarify_task:{aid}"),
-                InlineKeyboardButton(text="✖️ Убрать", callback_data=f"inbox:clarify_drop:{aid}"),
-            ]
-        )
 
     awaiting = [a for a in actions if a.get("status") == "awaiting_confirm"]
     for act in awaiting:
@@ -239,7 +302,13 @@ def build_inbox_keyboard(
                 callback_data=f"inbox:reclass:{int(active_or_clar[0]['id'])}:diary",
             )
         )
-    elif active_or_clar:
+    elif len(active_or_clar) == 1 and active_or_clar[0].get("item_kind") == "meal_log" and not awaiting:
+        meal_tid = int(active_or_clar[0].get("target_id") or 0)
+        if meal_tid:
+            ctrl_row.append(InlineKeyboardButton(text="✏️ Уточнить", callback_data=f"kbju:refine:{meal_tid}"))
+        ctrl_row.append(InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"))
+        ctrl_row.append(InlineKeyboardButton(text="↩️ Отменить", callback_data=f"inbox:undo:{inbox_id}"))
+    elif active_or_clar and not (len(active_or_clar) == 1 and active_or_clar[0].get("item_kind") == "pending_meal"):
         ctrl_row.append(InlineKeyboardButton(text="✏️ Исправить", callback_data=f"inbox:edit:{inbox_id}"))
         ctrl_row.append(InlineKeyboardButton(text="↩️ Отменить всё", callback_data=f"inbox:undo:{inbox_id}"))
     if llm_error:
@@ -293,7 +362,7 @@ def render_inbox_summary(
     elif active or skipped:
         if (
             len(active) == 1
-            and active[0].get("item_kind") == "pulse_log"
+            and active[0].get("item_kind") in {"pulse_log", "meal_log", "weight_log", "workout_log"}
             and not skipped
             and not clarifying
             and not awaiting
@@ -313,10 +382,24 @@ def render_inbox_summary(
         lines.append("⚠️ Модель не ответила — разобрала по простым правилам, исходный текст сохранила.")
 
     if clarifying:
-        first_payload = _load_payload(clarifying[0])
-        title = _esc(first_payload.get("title") or clarifying[0].get("title") or "напоминание")
-        question = _esc(first_payload.get("question") or "Уточни дату и время.")
-        lines.append(f"❓ Напоминание «{title}»: {question}")
+        first_c = clarifying[0]
+        first_payload = _load_payload(first_c)
+        if first_c.get("item_kind") == "pending_meal":
+            title = _esc(first_payload.get("title") or first_c.get("title") or "Еда")
+            est_k = int(round(float(first_payload.get("kcal") or 0)))
+            est_p = float(first_payload.get("protein_g") or 0)
+            est_f = float(first_payload.get("fat_g") or 0)
+            est_c = float(first_payload.get("carbs_g") or 0)
+            question = _esc(first_payload.get("question") or "Уточни порцию или состав?")
+            lines.append(
+                f"❓ <b>{title}</b> (пока ~{est_k} ккал · Б{est_p:g}/Ж{est_f:g}/У{est_c:g})\n"
+                f"{question}\n"
+                "<i>Ответь текстом, фото этикетки или жми кнопку — если промолчишь, через 10 мин запишу примерно сама.</i>"
+            )
+        else:
+            title = _esc(first_payload.get("title") or first_c.get("title") or "напоминание")
+            question = _esc(first_payload.get("question") or "Уточни дату и время.")
+            lines.append(f"❓ Напоминание «{title}»: {question}")
 
     if awaiting:
         for act in awaiting:
@@ -341,6 +424,200 @@ def _compute_end_hhmm(start_hhmm: str, duration_minutes: int) -> str:
     return f"{en_min // 60:02d}:{en_min % 60:02d}"
 
 
+async def commit_pending_meal(
+    db,
+    user: dict[str, Any],
+    pending: dict[str, Any],
+    *,
+    mult: float = 1.0,
+    status: str = "committed",
+    refined_meal: Optional[dict[str, Any]] = None,
+    now_utc: Optional[datetime.datetime] = None,
+) -> dict[str, Any]:
+    """Зафиксировать pending-черновик еды (целиком, полпорции или после уточнения) в meal_logs."""
+    now = now_utc or datetime.datetime.utcnow()
+    uid = int(user["id"])
+    tz = user.get("timezone") or "UTC"
+    local_date = str(pending.get("local_date") or local_date_str(now, tz))
+    est = refined_meal or pending.get("estimated") or {}
+    m_mult = max(0.25, min(4.0, float(mult or 1.0)))
+
+    title = str(est.get("title") or pending.get("title") or "Приём пищи").strip()
+    if m_mult != 1.0 and refined_meal is None and f"{m_mult:g}" not in title:
+        title = f"{title} ({m_mult:g} порц.)"
+    kcal = int(round(max(0.0, float(est.get("kcal") or 0) * m_mult)))
+    protein_g = round(max(0.0, float(est.get("protein_g") or 0) * m_mult), 1)
+    fat_g = round(max(0.0, float(est.get("fat_g") or 0) * m_mult), 1)
+    carbs_g = round(max(0.0, float(est.get("carbs_g") or 0) * m_mult), 1)
+    slot = str(est.get("meal_slot") or pending.get("meal_slot") or "snack")
+    base_src = str(est.get("lookup_source") or pending.get("source") or "voice")
+    src = f"{base_src}_approx" if status == "auto_committed" and "approx" not in base_src else base_src
+
+    meal_id = await repo.add_meal_log(
+        db,
+        uid,
+        local_date,
+        title,
+        meal_slot=slot,
+        servings=m_mult,
+        kcal=kcal,
+        protein_g=protein_g,
+        fat_g=fat_g,
+        carbs_g=carbs_g,
+        source=src,
+    )
+    await repo.resolve_pending_meal(db, int(pending["id"]), status=status, resolved_meal_id=meal_id)
+
+    # Закрываем возможный clarifying-action от исходного сообщения
+    if pending.get("inbox_message_id"):
+        old_acts = await repo.list_inbox_actions(
+            db, uid, int(pending["inbox_message_id"]), include_undone=False
+        )
+        for act in old_acts:
+            if act.get("item_kind") == "pending_meal" and act.get("status") == "clarifying":
+                await repo.update_inbox_action(
+                    db,
+                    uid,
+                    int(act["id"]),
+                    item_kind="meal_log",
+                    target_table="meal_logs",
+                    target_id=meal_id,
+                    title=title,
+                    status="active",
+                )
+        await _sync_parent_inbox_status(db, uid, int(pending["inbox_message_id"]))
+
+    advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now)
+    return {
+        "meal_id": meal_id,
+        "title": title,
+        "kcal": kcal,
+        "protein_g": protein_g,
+        "fat_g": fat_g,
+        "carbs_g": carbs_g,
+        "lookup_source": est.get("lookup_source") or "",
+        "advice": advice,
+    }
+
+
+async def _persist_meal_item(
+    db,
+    user: dict[str, Any],
+    inbox_row: dict[str, Any],
+    *,
+    source_quote: str,
+    title_hint: str,
+    local_date: str,
+    now_utc: datetime.datetime,
+    llm_client_instance: Optional[LLMClient] = None,
+    allow_clarification: bool = True,
+) -> int:
+    uid = int(user["id"])
+    inbox_id = int(inbox_row["id"])
+    source = str(inbox_row.get("source") or "text")
+    chat_id = int(inbox_row.get("chat_id") or 0)
+    raw_for_parse = (source_quote or title_hint or "").strip()
+
+    parsed_meal = await fitness_nutrition.parse_meal_input(
+        raw_text=raw_for_parse,
+        llm_client_instance=llm_client_instance,
+        db=db,
+        user_id=uid,
+        allow_clarification=allow_clarification,
+        allow_web_lookup=True,
+    )
+    if not parsed_meal.get("ok"):
+        parsed_meal = {
+            "ok": True,
+            "title": title_hint or raw_for_parse[:60] or "Приём пищи",
+            "meal_slot": "snack",
+            "kcal": 250,
+            "protein_g": 10.0,
+            "fat_g": 9.0,
+            "carbs_g": 30.0,
+            "estimated": True,
+            "needs_clarification": False,
+        }
+
+    meal_title = str(parsed_meal.get("title") or title_hint or "Приём пищи").strip()
+    meal_slot = str(parsed_meal.get("meal_slot") or "snack")
+    if allow_clarification and parsed_meal.get("needs_clarification") and parsed_meal.get("clarification_question"):
+        pending_id = await repo.create_pending_meal_clarification(
+            db,
+            uid,
+            chat_id,
+            local_date,
+            raw_for_parse,
+            meal_title,
+            meal_slot,
+            parsed_meal,
+            str(parsed_meal["clarification_question"]),
+            source=source,
+            inbox_message_id=inbox_id,
+            auto_commit_minutes=10,
+            now_utc=now_utc,
+        )
+        return await repo.create_inbox_action(
+            db,
+            user_id=uid,
+            inbox_message_id=inbox_id,
+            item_kind="pending_meal",
+            target_table="pending_meal_clarifications",
+            target_id=pending_id,
+            title=meal_title,
+            source_quote=source_quote,
+            payload={
+                "pending_meal_id": pending_id,
+                "title": meal_title,
+                "kcal": parsed_meal.get("kcal", 0),
+                "protein_g": parsed_meal.get("protein_g", 0),
+                "fat_g": parsed_meal.get("fat_g", 0),
+                "carbs_g": parsed_meal.get("carbs_g", 0),
+                "question": parsed_meal.get("clarification_question", ""),
+            },
+            status="clarifying",
+        )
+
+    eff_src = str(parsed_meal.get("lookup_source") or source)
+    meal_id = await repo.add_meal_log(
+        db,
+        uid,
+        local_date,
+        meal_title,
+        meal_slot=meal_slot,
+        kcal=float(parsed_meal.get("kcal") or 0),
+        protein_g=float(parsed_meal.get("protein_g") or 0),
+        fat_g=float(parsed_meal.get("fat_g") or 0),
+        carbs_g=float(parsed_meal.get("carbs_g") or 0),
+        source=eff_src,
+    )
+    advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
+    rem_line = ""
+    if not advice["targets"].get("mindful_mode"):
+        rem = advice["remaining"]
+        rem_line = f"Остаток: {rem['kcal']} ккал · Б +{rem['protein_g']} г"
+    return await repo.create_inbox_action(
+        db,
+        user_id=uid,
+        inbox_message_id=inbox_id,
+        item_kind="meal_log",
+        target_table="meal_logs",
+        target_id=meal_id,
+        title=meal_title,
+        source_quote=source_quote,
+        payload={
+            "kcal": parsed_meal.get("kcal", 0),
+            "protein_g": parsed_meal.get("protein_g", 0),
+            "fat_g": parsed_meal.get("fat_g", 0),
+            "carbs_g": parsed_meal.get("carbs_g", 0),
+            "lookup_source": parsed_meal.get("lookup_source") or "",
+            "source": eff_src,
+            "remaining_line": rem_line,
+        },
+        status="active",
+    )
+
+
 async def _persist_parsed_items(
     db,
     user: dict[str, Any],
@@ -348,6 +625,7 @@ async def _persist_parsed_items(
     parsed: InboxParseResult,
     local_date: str,
     now_utc: Optional[datetime.datetime] = None,
+    llm_client_instance: Optional[LLMClient] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     actions: list[dict[str, Any]] = []
     clarifications: list[dict[str, Any]] = []
@@ -357,7 +635,18 @@ async def _persist_parsed_items(
 
     for item in parsed.items:
         kind = item.kind
-        if is_student_mode(user) and kind in {"shopping", "shopping_remove", "pantry_add", "pantry_remove", "pantry_use", "meal_done", "expense"}:
+        if is_student_mode(user) and kind in {
+            "shopping",
+            "shopping_remove",
+            "pantry_add",
+            "pantry_remove",
+            "pantry_use",
+            "meal_done",
+            "expense",
+            "meal_log",
+            "weight_log",
+            "workout_log",
+        }:
             kind = "task" if kind == "shopping" else "diary"
         if kind == "task":
             item_id = await repo.add_day_plan_item(
@@ -525,6 +814,20 @@ async def _persist_parsed_items(
                     payload={"removed_item": dict(removed_p), "model_note": item.model_note},
                     status="active",
                 )
+            elif re.match(
+                r"(?iu)^(?:я\s+|мы\s+|уже\s+|только\s+что\s+)?(?:съел|доел|выпил|поел|позавтракал|пообедал|поужинал|перекусил)\b",
+                (item.source_quote or "").strip(),
+            ):
+                action_id = await _persist_meal_item(
+                    db,
+                    user,
+                    inbox_row,
+                    source_quote=item.source_quote,
+                    title_hint=item.title,
+                    local_date=local_date,
+                    now_utc=now,
+                    llm_client_instance=llm_client_instance,
+                )
             else:
                 action_id = await repo.create_inbox_action(
                     db,
@@ -538,6 +841,120 @@ async def _persist_parsed_items(
                     payload={"not_found": True, "model_note": item.model_note},
                     status="skipped",
                 )
+        elif kind == "meal_log":
+            action_id = await _persist_meal_item(
+                db,
+                user,
+                inbox_row,
+                source_quote=item.source_quote,
+                title_hint=item.title,
+                local_date=local_date,
+                now_utc=now,
+                llm_client_instance=llm_client_instance,
+            )
+        elif kind == "weight_log":
+            scale_res = await fitness_nutrition.parse_smart_scale_input(
+                raw_text=item.source_quote or item.title,
+                llm_client_instance=llm_client_instance,
+            )
+            if scale_res.get("ok"):
+                wid = await repo.add_weight(
+                    db,
+                    int(user["id"]),
+                    float(scale_res["weight"]),
+                    body_fat_pct=scale_res.get("body_fat_pct"),
+                    muscle_mass_kg=scale_res.get("muscle_mass_kg"),
+                    water_pct=scale_res.get("water_pct"),
+                    visceral_fat=scale_res.get("visceral_fat"),
+                    bmi=scale_res.get("bmi"),
+                    source=str(scale_res.get("source") or source),
+                )
+                trend = await repo.body_metrics_trend(db, int(user["id"]), days=30)
+                t_fb = fitness_nutrition.format_body_trend_feedback(
+                    trend, str(user.get("weight_goal") or "loss")
+                )
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="weight_log",
+                    target_table="weights",
+                    target_id=wid,
+                    title=f"{float(scale_res['weight']):.1f} кг",
+                    source_quote=item.source_quote,
+                    payload={
+                        "weight": scale_res["weight"],
+                        "body_fat_pct": scale_res.get("body_fat_pct"),
+                        "muscle_mass_kg": scale_res.get("muscle_mass_kg"),
+                        "trend_note": t_fb,
+                    },
+                    status="active",
+                )
+            else:
+                entry_id = await repo.create_journal_entry(
+                    db,
+                    user_id=user["id"],
+                    entry_type="diary",
+                    entry_date=local_date,
+                    source=source,
+                    user_text=item.source_quote,
+                    title=item.title,
+                    model_note=item.model_note,
+                    tags=item.tags,
+                    inbox_message_id=inbox_id,
+                )
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="diary",
+                    target_table="journal_entries",
+                    target_id=entry_id,
+                    title=item.title,
+                    source_quote=item.source_quote,
+                    payload={"model_note": item.model_note},
+                    status="active",
+                )
+        elif kind == "workout_log":
+            raw_w = item.source_quote or item.title
+            m_dur = re.search(r"(\d+)\s*(?:мин\w*|м)\b", raw_w.lower())
+            m_hr = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:час\w*|ч)\b", raw_w.lower())
+            if m_dur:
+                dur_min = max(2, min(180, int(m_dur.group(1))))
+            elif m_hr:
+                dur_min = max(5, min(180, int(round(float(m_hr.group(1).replace(",", ".")) * 60))))
+            else:
+                dur_min = 15
+            w_res = await fitness_nutrition.complete_workout(
+                db,
+                user,
+                {
+                    "title": item.title or "Тренировка",
+                    "duration_min": dur_min,
+                    "focus_area": "full_body",
+                    "equipment_used": ", ".join(repo.get_user_equipment(user)) or "свой вес",
+                    "intensity": "moderate" if dur_min >= 12 else "easy",
+                    "kcal_burned": max(20, int(round(dur_min * 6.0))),
+                },
+                is_lazy_start=(dur_min <= 6),
+                now_utc=now,
+            )
+            action_id = await repo.create_inbox_action(
+                db,
+                user_id=user["id"],
+                inbox_message_id=inbox_id,
+                item_kind="workout_log",
+                target_table="workout_logs",
+                target_id=int(w_res["log_id"]),
+                title=w_res["title"],
+                source_quote=item.source_quote,
+                payload={
+                    "duration_min": w_res["duration_min"],
+                    "kcal_burned": w_res["kcal_burned"],
+                    "karma_delta": w_res["karma_delta"],
+                },
+                status="active",
+            )
         elif kind == "pulse_log":
             slot = (item.category or "lunch").strip().lower()
             tz = user.get("timezone") or "UTC"
@@ -1386,6 +1803,72 @@ async def _build_query_response(
         )
         return "\n".join(lines), kb, {"query_type": "diary", "query_term": term}
 
+    if qt == "kbju":
+        if is_student_mode(user):
+            return (
+                "В режиме «Ученик» подсчёт калорий отключён — ориентируйся на спокойный ритм и самочувствие.",
+                None,
+                {"query_type": "kbju"},
+            )
+        from handlers import nutrition
+
+        txt, kb = await nutrition.render_kbju_card(db, user, now_utc=now_utc)
+        return txt, kb, {"query_type": "kbju"}
+
+    if qt == "meal_check":
+        if is_student_mode(user):
+            return (
+                "В режиме «Ученик» мы не считаем калории. Ешь спокойно по голоду и настроению — всё ок!",
+                None,
+                {"query_type": "meal_check"},
+            )
+        now = now_utc or datetime.datetime.utcnow()
+        tz = user.get("timezone") or "UTC"
+        local_date = local_date_str(now, tz)
+        cand = (parsed.query_term or raw_text).strip()
+        chk = await fitness_nutrition.evaluate_meal_check(
+            db,
+            user,
+            cand,
+            now_utc=now,
+            llm_client_instance=llm_client_instance,
+        )
+        if not chk.get("ok"):
+            return (
+                "Не совсем поняла блюдо для примерки — назови чуть конкретнее (например: «пицца 2 куска» или «блин в Теремке»).",
+                None,
+                {"query_type": "meal_check"},
+            )
+        dish = chk["dish"]
+        pid = await repo.create_pending_meal_clarification(
+            db,
+            int(user["id"]),
+            0,
+            local_date,
+            cand,
+            str(dish["title"]),
+            str(dish.get("meal_slot") or "snack"),
+            dish,
+            "",
+            status="check",
+            source="meal_check",
+            auto_commit_minutes=60,
+            now_utc=now,
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🍽 Всё-таки съел(а)", callback_data=f"kbju:pcommit:{pid}:1"),
+                    InlineKeyboardButton(text="🍽 Полпорции", callback_data=f"kbju:pcommit:{pid}:0.5"),
+                ],
+                [
+                    InlineKeyboardButton(text="🧊 Что из холодильника?", callback_data="kitchen:quick_pick"),
+                    InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                ],
+            ]
+        )
+        return chk["advice_html"], kb, {"query_type": "meal_check", "pending_id": pid}
+
     fallback_reply = _esc(parsed.reply_text) if parsed.reply_text else (
         "Не совсем поняла, где искать. Могу открыть план на сегодня или дневник."
     )
@@ -1412,6 +1895,110 @@ async def _analyze_and_persist(
     tz = user.get("timezone") or "UTC"
     local_date = inbox_row.get("local_date") or local_date_str(now_utc, tz)
     uid = int(user["id"])
+    inbox_id = int(inbox_row["id"])
+    preface_note = ""
+
+    # 0. Ленивое доуточнение еды: не мешаем обычной беседе!
+    if not is_student_mode(user):
+        pending = await repo.get_active_pending_meal(db, uid, now_utc=now_utc)
+        if pending is not None:
+            if fitness_nutrition.is_lazy_accept_reply(raw_text):
+                committed = await commit_pending_meal(
+                    db, user, pending, mult=1.0, status="committed", now_utc=now_utc
+                )
+                await repo.update_inbox_message(db, inbox_id, status="processed")
+                updated_row = await repo.get_inbox_message(db, uid, inbox_id) or inbox_row
+                v_line = _voice_prefix_line(updated_row)
+                rem_txt = ""
+                if not committed["advice"]["targets"].get("mindful_mode"):
+                    rem = committed["advice"]["remaining"]
+                    rem_txt = f"\nОстаток на сегодня: <b>{rem['kcal']} ккал</b> · белок +{rem['protein_g']} г"
+                reply_body = (
+                    f"👌 Без заморочек — записала примерно: <b>{_esc(committed['title'])}</b>\n"
+                    f"🔥 ~<b>{committed['kcal']} ккал</b> (Б {committed['protein_g']:g}/Ж {committed['fat_g']:g}/У {committed['carbs_g']:g}){rem_txt}"
+                )
+                reply_text = f"{v_line}\n\n{reply_body}" if v_line else reply_body
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="✏️ Уточнить", callback_data=f"kbju:refine:{committed['meal_id']}"),
+                            InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                        ]
+                    ]
+                )
+                return InboxProcessOutcome(
+                    inbox_id=inbox_id,
+                    status="processed",
+                    is_duplicate=False,
+                    source=updated_row.get("source") or "text",
+                    raw_text=raw_text,
+                    actions=[],
+                    clarifications=[],
+                    used_llm=False,
+                    reply_text=reply_text,
+                    reply_markup=kb,
+                )
+
+            if fitness_nutrition.looks_like_meal_clarification(raw_text):
+                combined = f"{pending['raw_text']} ({raw_text})"
+                refined = await fitness_nutrition.parse_meal_input(
+                    raw_text=combined,
+                    llm_client_instance=llm_client_instance,
+                    db=db,
+                    user_id=uid,
+                    allow_clarification=False,
+                    allow_web_lookup=True,
+                )
+                committed = await commit_pending_meal(
+                    db,
+                    user,
+                    pending,
+                    mult=1.0,
+                    status="refined",
+                    refined_meal=(refined if refined.get("ok") else None),
+                    now_utc=now_utc,
+                )
+                await repo.update_inbox_message(db, inbox_id, status="processed")
+                updated_row = await repo.get_inbox_message(db, uid, inbox_id) or inbox_row
+                v_line = _voice_prefix_line(updated_row)
+                rem_txt = ""
+                if not committed["advice"]["targets"].get("mindful_mode"):
+                    rem = committed["advice"]["remaining"]
+                    rem_txt = f"\nОстаток на сегодня: <b>{rem['kcal']} ккал</b> · белок +{rem['protein_g']} г"
+                reply_body = (
+                    f"✅ Уточнила и записала: <b>{_esc(committed['title'])}</b>\n"
+                    f"🔥 <b>{committed['kcal']} ккал</b> (Б {committed['protein_g']:g}/Ж {committed['fat_g']:g}/У {committed['carbs_g']:g}){rem_txt}"
+                )
+                reply_text = f"{v_line}\n\n{reply_body}" if v_line else reply_body
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="✏️ Поправить", callback_data=f"kbju:refine:{committed['meal_id']}"),
+                            InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                        ]
+                    ]
+                )
+                return InboxProcessOutcome(
+                    inbox_id=inbox_id,
+                    status="processed",
+                    is_duplicate=False,
+                    source=updated_row.get("source") or "text",
+                    raw_text=raw_text,
+                    actions=[],
+                    clarifications=[],
+                    used_llm=bool(refined.get("used_llm")),
+                    reply_text=reply_text,
+                    reply_markup=kb,
+                )
+
+            # Пользователь переключился на другую тему — тихо фиксируем прошлый приём примерно
+            auto_res = await commit_pending_meal(
+                db, user, pending, mult=1.0, status="auto_committed", now_utc=now_utc
+            )
+            preface_note = (
+                f"📌 Прошлый приём записала примерно: <i>{_esc(auto_res['title'])}</i> (~{auto_res['kcal']} ккал)\n\n"
+            )
+
     recent_ctx = _get_recent_context(uid, now_utc)
     snapshot = await context_builder.build_user_day_snapshot(db, user, now_utc=now_utc)
     ctx_for_llm = context_builder.format_context_for_llm(snapshot)
@@ -1423,8 +2010,6 @@ async def _analyze_and_persist(
         recent_context=recent_ctx,
         user_context_block=ctx_for_llm,
     )
-
-    inbox_id = int(inbox_row["id"])
 
     if parsed.intent == "query":
         await repo.update_inbox_message(
@@ -1448,6 +2033,8 @@ async def _analyze_and_persist(
         )
         voice_line = _voice_prefix_line(updated_row)
         reply_text = f"{voice_line}\n\n{body_text}" if voice_line else body_text
+        if preface_note:
+            reply_text = preface_note + reply_text
         _append_dialog_turn(uid, "user", raw_text, now_utc)
         _append_dialog_turn(uid, "assistant", body_text, now_utc, meta=query_meta)
         return InboxProcessOutcome(
@@ -1478,6 +2065,8 @@ async def _analyze_and_persist(
         chat_msg = _esc(parsed.reply_text or "На связи! Напиши или надиктуй, что сделать или записать.")
         voice_line = _voice_prefix_line(updated_row)
         reply_text = f"{voice_line}\n\n{chat_msg}" if voice_line else chat_msg
+        if preface_note:
+            reply_text = preface_note + reply_text
         _append_dialog_turn(uid, "user", raw_text, now_utc)
         _append_dialog_turn(uid, "assistant", chat_msg, now_utc, meta={"query_type": "none"})
         return InboxProcessOutcome(
@@ -1495,7 +2084,13 @@ async def _analyze_and_persist(
         )
 
     actions, clarifications = await _persist_parsed_items(
-        db, user, inbox_row, parsed, local_date, now_utc=now_utc
+        db,
+        user,
+        inbox_row,
+        parsed,
+        local_date,
+        now_utc=now_utc,
+        llm_client_instance=llm_client_instance,
     )
     support_reply = parsed.reply_text
     if parsed.intent == "support" and (not parsed.used_llm or not (support_reply or "").strip()):
@@ -1523,6 +2118,8 @@ async def _analyze_and_persist(
         intent=parsed.intent,
         support_reply=support_reply,
     )
+    if preface_note:
+        reply_text = preface_note + reply_text
     _append_dialog_turn(uid, "user", raw_text, now_utc)
     _append_dialog_turn(uid, "assistant", reply_text, now_utc, meta={"query_type": "none"})
     return InboxProcessOutcome(
@@ -1805,6 +2402,14 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
             await repo.mark_day_plan_item_done(db, int(completed_task_id), done=False)
     elif table == "expenses":
         await repo.delete_expense(db, user_id, tid_int)
+    elif table == "meal_logs":
+        await repo.delete_meal_log(db, user_id, tid_int)
+    elif table == "weights":
+        await repo.delete_weight_entry(db, user_id, tid_int)
+    elif table == "workout_logs":
+        await repo.delete_workout_log(db, user_id, tid_int)
+    elif table == "pending_meal_clarifications":
+        await repo.resolve_pending_meal(db, tid_int, status="cancelled")
 
 
 async def confirm_inbox_action(

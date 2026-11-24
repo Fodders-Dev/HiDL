@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
-from services import karma_service
+from services import karma_service, nutrition_web
 from utils.time import local_date_str
 
 EQUIPMENT_CATALOG: Tuple[Tuple[str, str, str], ...] = (
@@ -41,7 +41,42 @@ GOAL_LABELS: Dict[str, str] = {
     "recomp": "💪 Подтянуться (рекомпозиция)",
     "keep": "⚖ Поддерживать форму",
     "gain": "📈 Набрать массу",
+    "mindful": "🧘 Без подсчёта КБЖУ",
 }
+
+COACH_MODES: Dict[str, Tuple[str, str, str]] = {
+    "gentle": (
+        "🌱",
+        "Мягкий анти-лень",
+        "Ноль вины и давления: поддерживай за любой шаг, хвали за 3-минутный старт и мягко выравнивай следующий приём пищи.",
+    ),
+    "balanced": (
+        "🎯",
+        "Осознанный баланс",
+        "Короткие цифры, честный разбор плюсов и минусов блюда и практичная спокойная альтернатива.",
+    ),
+    "strict": (
+        "🔥",
+        "Тренер / фокус",
+        "Прямолинейно тормози перед лишним сахаром/жиром и держи фокус на белке и тренировках (без грубости и оскорблений).",
+    ),
+}
+
+
+def get_coach_directive(user: Dict[str, Any], *, student: bool = False) -> str:
+    """Сформировать короткую директиву цели и стиля коуча для промптов ИИ."""
+    goal_raw = str(user.get("weight_goal") or "loss").strip().lower()
+    if goal_raw == "maintain":
+        goal_raw = "keep"
+    mode_raw = str(user.get("coach_mode") or "balanced").strip().lower()
+    if student or goal_raw == "mindful":
+        return (
+            "Цель и тон: бережная забота о самочувствии и режиме БЕЗ жёсткого контроля калорий, "
+            "стыда или диетических ограничений."
+        )
+    emoji, label, hint = COACH_MODES.get(mode_raw, COACH_MODES["balanced"])
+    goal_label = GOAL_LABELS.get(goal_raw, GOAL_LABELS["loss"])
+    return f"Цель: {goal_label}. Стиль коуча: {emoji} {label} — {hint}"
 
 ACTIVITY_MULTIPLIERS: Dict[str, Tuple[str, float]] = {
     "sedentary": ("🪑 Малоподвижный (дом/офис)", 1.2),
@@ -199,6 +234,29 @@ _NUTRITION_DB: Dict[str, Tuple[float, float, float, float]] = {
     "сахар": (398, 0.0, 0.0, 99.8),
     "какао": (289, 24.3, 15.0, 27.9),
     "шоколад": (546, 5.5, 31.0, 58.0),
+    # Готовые блюда и напитки (средние ориентиры на 100 г / 100 мл)
+    "суп": (58, 2.6, 2.0, 6.8),
+    "борщ": (62, 2.6, 2.4, 7.2),
+    "салат": (98, 3.0, 6.5, 6.8),
+    "пицца": (255, 10.5, 10.0, 30.0),
+    "бургер": (260, 12.0, 13.0, 24.0),
+    "шаурма": (210, 9.5, 9.5, 21.5),
+    "шаверма": (210, 9.5, 9.5, 21.5),
+    "торт": (360, 4.5, 18.0, 45.0),
+    "мороженое": (210, 3.5, 11.0, 24.0),
+    "булочка": (310, 7.5, 10.0, 48.0),
+    "круассан": (406, 8.2, 21.0, 45.8),
+    "блин": (220, 6.5, 8.5, 29.0),
+    "сырник": (195, 11.0, 7.5, 20.0),
+    "ролл": (165, 6.5, 4.5, 24.0),
+    "латте": (48, 2.2, 2.0, 5.2),
+    "капучино": (42, 2.0, 1.8, 4.5),
+    "раф": (95, 2.0, 5.5, 9.5),
+    "кофе": (15, 0.5, 0.4, 2.0),
+    "смузи": (55, 1.0, 0.5, 12.0),
+    "батончик": (365, 18.0, 12.0, 42.0),
+    "йогурт": (72, 4.5, 2.5, 7.8),
+    "кефир": (51, 3.0, 2.5, 4.0),
 }
 
 _PIECE_WEIGHTS_G: Dict[str, float] = {
@@ -225,6 +283,28 @@ _PIECE_WEIGHTS_G: Dict[str, float] = {
     "хлеб": 35.0,
     "финики": 8.0,
     "чеснок": 5.0,
+    "суп": 320.0,
+    "борщ": 320.0,
+    "салат": 220.0,
+    "пицца": 250.0,
+    "бургер": 220.0,
+    "шаурма": 320.0,
+    "шаверма": 320.0,
+    "торт": 130.0,
+    "мороженое": 100.0,
+    "булочка": 90.0,
+    "круассан": 80.0,
+    "блин": 160.0,
+    "сырник": 75.0,
+    "ролл": 200.0,
+    "латте": 300.0,
+    "капучино": 250.0,
+    "раф": 300.0,
+    "кофе": 250.0,
+    "смузи": 300.0,
+    "батончик": 55.0,
+    "йогурт": 150.0,
+    "кефир": 250.0,
 }
 
 _SORTED_NUTRITION_KEYS = sorted(_NUTRITION_DB.keys(), key=len, reverse=True)
@@ -298,6 +378,8 @@ def calculate_daily_targets(
     act_label, mult = ACTIVITY_MULTIPLIERS.get(act_raw, ACTIVITY_MULTIPLIERS["light"])
 
     goal_raw = str(user.get("weight_goal") or "loss").strip().lower()
+    if goal_raw == "maintain":
+        goal_raw = "keep"
     if goal_raw not in GOAL_LABELS:
         goal_raw = "loss"
 
@@ -308,8 +390,8 @@ def calculate_daily_targets(
         kcal = max(1350.0, tdee * 0.85)
         protein_g = weight * 1.6
     elif goal_raw == "recomp":
-        kcal = max(1450.0, tdee * 0.93)
-        protein_g = weight * 1.7
+        kcal = max(1450.0, tdee * 0.90)
+        protein_g = weight * 1.8
     elif goal_raw == "gain":
         kcal = tdee * 1.10
         protein_g = weight * 1.7
@@ -348,7 +430,15 @@ def calculate_daily_targets(
         "weight_kg": round(weight, 1),
         "is_estimated": is_estimated,
         "workout_bonus_kcal": workout_bonus_kcal,
+        "mindful_mode": goal_raw == "mindful",
     }
+
+
+def _food_stem(key: str) -> str:
+    k = str(key or "").casefold().replace("ё", "е").strip()
+    if len(k) >= 5 and k.endswith(("а", "я", "о", "е", "ь", "ы", "и")):
+        return k[:-1]
+    return k
 
 
 def _match_nutrition_key(name: str) -> Optional[str]:
@@ -358,6 +448,12 @@ def _match_nutrition_key(name: str) -> Optional[str]:
     for key in _SORTED_NUTRITION_KEYS:
         if key.replace("ё", "е") in low:
             return key
+    for key in _SORTED_NUTRITION_KEYS:
+        stem = _food_stem(key)
+        if len(stem) >= 4 and stem in low:
+            return key
+    if "яиц" in low or "яич" in low or "яйц" in low:
+        return "яйцо"
     return None
 
 
@@ -384,8 +480,10 @@ def _ingredient_grams(name: str, qty: float, unit: str) -> float:
         return q * 30.0
     if u in {"шт", "piece", "pieces", "порц", ""}:
         for key, grams in _PIECE_WEIGHTS_G.items():
-            if key in low:
+            if key in low or (len(_food_stem(key)) >= 4 and _food_stem(key) in low):
                 return q * grams
+        if "яиц" in low or "яйц" in low:
+            return q * 55.0
         return q * 80.0
     return q * 60.0
 
@@ -582,18 +680,248 @@ def score_recipe_for_macros(
 
 
 _MEAL_PARSE_PROMPT = (
-    "Ты — нутриционист HiDL. По описанию или фото еды оцени блюдо и его КБЖУ за указанную порцию. "
-    "Ответь строго JSON-объектом вида: "
+    "Ты — нутриционист HiDL. По описанию, фото тарелки или фото этикетки/состава оцени КБЖУ за съеденную порцию.\n"
+    "Ответь СТРОГО валидным JSON-объектом вида:\n"
     "{\"title\": str, \"meal_slot\": \"breakfast\"|\"lunch\"|\"dinner\"|\"snack\", "
-    "\"kcal\": float, \"protein_g\": float, \"fat_g\": float, \"carbs_g\": float}. "
-    "Если на фото несколько продуктов, суммируй в одну общую запись с понятным названием."
+    "\"kcal\": float, \"protein_g\": float, \"fat_g\": float, \"carbs_g\": float, "
+    "\"is_nutrition_label\": bool, \"per_100g\": {\"kcal\": float, \"protein_g\": float, \"fat_g\": float, \"carbs_g\": float}|null, "
+    "\"serving_g\": float, \"brand_or_place\": str, "
+    "\"confidence\": \"high\"|\"medium\"|\"low\", \"needs_clarification\": bool, \"clarification_question\": str}.\n"
+    "Правила:\n"
+    "1. Если на фото таблица пищевой ценности (КБЖУ на 100 г/мл): поставь is_nutrition_label=true, заполни точные per_100g, "
+    "вытащи название продукта и в kcal/protein_g/fat_g/carbs_g посчитай порцию (из комментария пользователя или стандартной упаковки serving_g).\n"
+    "2. Если описание достаточно понятное (\"банан\", \"овсянка 80 г\", \"латте 300 мл\", \"гречка с тофу\", \"блин с ветчиной и сыром в теремке\"): "
+    "needs_clarification=false, clarification_question=\"\". Не мучай лишними вопросами.\n"
+    "3. Ставь needs_clarification=true и короткий вопрос (1 фраза по-русски, например \"Какие блины и сколько штук?\") "
+    "ТОЛЬКО если совсем непонятен размер/начинка/состав (\"поел суп\", \"блины в теремке\", \"кофе с булочкой\", \"съел торт\", \"пообедал в кафе\"), "
+    "но при этом всё равно заполни лучшую примерную оценку kcal/БЖУ."
 )
+
+_PER_100_MARKER_RE = re.compile(
+    r"(?iu)(?:на\s*100\s*(?:г|гр|g|мл|ml)|/\s*100\s*(?:г|гр|g|мл|ml)|100\s*(?:г|гр|g|мл|ml)\s*[-:])"
+)
+
+_LAZY_ACCEPT_EXACT: set[str] = {
+    "хз",
+    "похуй",
+    "пох",
+    "на похуй",
+    "пофиг",
+    "пофигу",
+    "по барабану",
+    "забей",
+    "на глаз",
+    "примерно",
+    "прикинь",
+    "сам прикинь",
+    "сама прикинь",
+    "как хочешь",
+    "не знаю",
+    "не помню",
+    "без понятия",
+    "норм",
+    "пойдет",
+    "пойдёт",
+    "сойдет",
+    "сойдёт",
+    "ок",
+    "да ок",
+    "ладно",
+    "лень",
+    "пропусти",
+    "отстань",
+    "так запиши",
+    "давай так",
+    "давай примерно",
+    "запиши примерно",
+    "хз примерно",
+    "да похуй",
+    "да пофиг",
+}
+
+_NON_CLARIFICATION_RE = re.compile(
+    r"(?iu)(?:^\s*/|\bнапомн|\bзадач|\bв\s+план|\bкупи\b|\bкупить\b|\bзакончил(?:ся|ась|ось|ись)\b|"
+    r"\bпотратил|\bв\s+календар|\bперенеси|\bвзвесил|\bустал|\bтрево|\bне\s+могу\s+уснуть|"
+    r"\bчто\s+на\s+сегодня|\bкакая\s+карма|\bчто\s+в\s+холодильник|\bдай\s+совет)"
+)
+
+_VAGUE_MEAL_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?iu)\b(?:блин[аы]?|сырник[аи]?)\b"),
+        "Сколько штук и какая начинка/добавка? (или ответь «хз» — запишу примерно)",
+    ),
+    (
+        re.compile(r"(?iu)\b(?:кофе|капучино|латте|раф|чай)\b.*\b(?:булоч\w*|десерт\w*|торт\w*|пирож\w*|печень\w*)\b"),
+        "Какой объём напитка (S/M/L) и какая именно выпечка? (или напиши «хз»)",
+    ),
+    (
+        re.compile(r"(?iu)\b(?:суп|борщ|солянк\w*|ух[ау]|щи|рамен)\b"),
+        "Примерно сколько мл/половников и что в нём? (или ответь «примерно»)",
+    ),
+    (
+        re.compile(r"(?iu)\bсалат\b"),
+        "Какой примерно салат (лёгкий с овощами или с майонезом/маслом) и какая порция? (или «хз»)",
+    ),
+    (
+        re.compile(r"(?iu)\b(?:пицц\w*|ролл\w*|торт\w*|пирог\w*|шаурм\w*|шаверм\w*|бургер\w*)\b"),
+        "Какая примерно начинка или сколько кусков/грамм? (или напиши «хз» — оценю примерно)",
+    ),
+    (
+        re.compile(r"(?iu)\b(?:в\s+кафе|в\s+ресторане|пообедал|поужинал|позавтракал|перекусил|доставк\w*)\b"),
+        "Что именно было в тарелке и большая ли порция? (или ответь «примерно»)",
+    ),
+)
+
+
+def is_lazy_accept_reply(text: str) -> bool:
+    """Проверить, отвечает ли пользователь в духе 'хз / похуй / запиши примерно'."""
+    raw = str(text or "").strip().casefold().replace("ё", "е")
+    if not raw or len(raw) > 70:
+        return False
+    norm = re.sub(r"[?!.,;:\"'«»()]+", " ", raw)
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if norm in _LAZY_ACCEPT_EXACT:
+        return True
+    if any(
+        tok in norm
+        for tok in ("похуй", "пофиг", "на глаз", "примерно", "сам прикинь", "сама прикинь", "не знаю", "забей")
+    ) and not _NON_CLARIFICATION_RE.search(norm):
+        return True
+    return False
+
+
+def looks_like_meal_clarification(text: str) -> bool:
+    """Отличить уточнение по прошлой еде (граммы, начинка, этикетка) от новой отдельной команды."""
+    raw = str(text or "").strip()
+    if not raw or len(raw) > 180:
+        return False
+    if _NON_CLARIFICATION_RE.search(raw):
+        return False
+    if raw.endswith("?"):
+        return False
+    low = raw.casefold().replace("ё", "е")
+    if is_lazy_accept_reply(low):
+        return True
+    if _PER_100_MARKER_RE.search(low) or re.search(
+        r"\b\d+(?:[.,]\d+)?\s*(?:г|гр|g|мл|ml|ккал|kcal|шт|куск|порц|половник|ложк)\b",
+        low,
+    ):
+        return True
+    if re.search(
+        r"(?iu)^(?:с\s+|на\s+|без\s+|два|две|три|пол|полов|маленьк|средн|больш|обычн|двойн|порц|кусок|куск)",
+        low,
+    ):
+        return True
+    return len(low.split()) <= 5 and not re.search(
+        r"(?iu)\b(?:позвонить|написать|оплатить|убрать|помыть|сделать|придумал|идея|кстати)\b",
+        low,
+    )
+
+
+def _detect_vague_meal(clean_text: str) -> Optional[str]:
+    """Вернуть 1 короткий вопрос ТОЛЬКО если описание еды реально размытое."""
+    raw = str(clean_text or "").strip()
+    low = raw.casefold().replace("ё", "е")
+    if not low:
+        return None
+    if _PER_100_MARKER_RE.search(low) or re.search(r"\b\d+\s*(?:ккал|kcal|калл|г|гр|g|мл|ml|кг|л)\b", low):
+        return None
+    if is_lazy_accept_reply(low) or any(w in low for w in ("примерно", "на глаз", "около ")):
+        return None
+    # Если уже есть уточнение начинки ("с ветчиной и сыром", "со сметаной", "с курицей") и размер/число или бренд с конкретным блюдом
+    has_filling = bool(re.search(r"(?iu)\bс(?:о)?\s+[а-яёa-z]{3,}", low)) and not re.search(
+        r"(?iu)\bкофе\s+с\s+булоч", low
+    )
+    has_count = bool(re.search(r"(?iu)\b(?:\d+\s*(?:шт|куск|блин|ролл|сырник)|два|две|три|пол)\b", low))
+    for pat, question in _VAGUE_MEAL_PATTERNS:
+        if pat.search(low):
+            if pat.pattern.find("блин") >= 0 and (has_filling and (has_count or not re.search(r"(?iu)\b(?:блин[аы]|сырник[аи])\b", low))):
+                return None
+            if pat.pattern.find("салат") >= 0 and (has_filling or any(w in low for w in ("цезарь", "греческ", "оливье", "винегрет", "овощн"))):
+                return None
+            if pat.pattern.find("пицц") >= 0 and (has_filling and (has_count or "цел" not in low)):
+                return None
+            if pat.pattern.find("в\\s+кафе") >= 0 and (has_filling or re.search(r"(?iu)(?:съел|выпил|блин|бургер|суп|паст|овсян|греч)", low)):
+                continue
+            return question
+    return None
+
+
+def _parse_label_math_offline(raw_text: str) -> Optional[Dict[str, Any]]:
+    """Распознать текст формата 'на 100 г 240 ккал б12 ж8 у30, съел 150 г' и посчитать порцию."""
+    text = re.sub(r"\s+", " ", str(raw_text or "").strip())
+    low = text.casefold().replace("ё", "е")
+    m_100 = _PER_100_MARKER_RE.search(low)
+    if not m_100:
+        return None
+    kcal_m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:ккал|kcal|калл)\b", low)
+    if not kcal_m:
+        return None
+    k100 = float(kcal_m.group(1).replace(",", "."))
+    if not (5.0 <= k100 <= 950.0):
+        return None
+    p_m = re.search(r"(?:б|белк[а-я]*|p)\s*[:=]?\s*(\d+(?:[.,]\d+)?)", low)
+    f_m = re.search(r"(?:ж|жир[а-я]*|f)\s*[:=]?\s*(\d+(?:[.,]\d+)?)", low)
+    c_m = re.search(r"(?:у|углев[а-я]*|c)\s*[:=]?\s*(\d+(?:[.,]\d+)?)", low)
+    p100 = float(p_m.group(1).replace(",", ".")) if p_m else round(k100 * 0.20 / 4.0, 1)
+    f100 = float(f_m.group(1).replace(",", ".")) if f_m else round(k100 * 0.28 / 9.0, 1)
+    c100 = float(c_m.group(1).replace(",", ".")) if c_m else round(k100 * 0.52 / 4.0, 1)
+
+    without_100 = low[: m_100.start()] + " " + low[m_100.end() :]
+    m_portion = re.search(
+        r"(?:съел[аи]?|выпил[аи]?|порц[а-я]*|взял[аи]?|вышло|упаковк[аиу]?|батончик)\s*(\d+(?:[.,]\d+)?)\s*(г|гр|g|мл|ml)\b",
+        without_100,
+    )
+    if m_portion:
+        grams = float(m_portion.group(1).replace(",", "."))
+    else:
+        candidates = [
+            float(m.group(1).replace(",", "."))
+            for m in re.finditer(r"(?<![бжуpfc\s])\b(\d+(?:[.,]\d+)?)\s*(г|гр|g|мл|ml)\b", without_100)
+        ]
+        if not candidates:
+            candidates = [
+                float(m.group(1).replace(",", "."))
+                for m in re.finditer(r"\b(\d+(?:[.,]\d+)?)\s*(г|гр|g|мл|ml)\b", without_100)
+                if not re.search(r"(?:б|ж|у|белк[а-я]*|жир[а-я]*|углев[а-я]*)\s*$", without_100[: m.start()])
+            ]
+        grams = candidates[-1] if candidates else 100.0
+    grams = max(5.0, min(2000.0, grams))
+    factor = grams / 100.0
+
+    prefix = text[: m_100.start()].strip(" -:,.")
+    prefix = re.sub(r"(?iu)^(?:этикетка|упаковка|съел[аи]?|выпил[аи]?)\s*[:,-]?\s*", "", prefix).strip()
+    title = prefix[:65] if len(prefix) >= 3 else f"Продукт ({int(round(grams))} г)"
+    return {
+        "title": title,
+        "brand": "",
+        "meal_slot": "snack",
+        "kcal": int(round(k100 * factor)),
+        "protein_g": round(p100 * factor, 1),
+        "fat_g": round(f100 * factor, 1),
+        "carbs_g": round(c100 * factor, 1),
+        "from_label": True,
+        "is_nutrition_label": True,
+        "serving_g": round(grams, 1),
+        "per_100g": {
+            "kcal": round(k100, 1),
+            "protein_g": round(p100, 1),
+            "fat_g": round(f100, 1),
+            "carbs_g": round(c100, 1),
+        },
+        "needs_clarification": False,
+        "clarification_question": "",
+    }
 
 
 def _parse_meal_offline(raw_text: str) -> Optional[Dict[str, Any]]:
     text = re.sub(r"\s+", " ", str(raw_text or "").strip())
     if not text:
         return None
+    label_res = _parse_label_math_offline(text)
+    if label_res is not None:
+        return label_res
+
     low = text.casefold().replace("ё", "е")
 
     # Явно указанные калории: "овсянка 350 ккал б12 ж8 у55"
@@ -651,14 +979,57 @@ def _parse_meal_offline(raw_text: str) -> Optional[Dict[str, Any]]:
     }
 
 
+async def _maybe_save_label_product(
+    db,
+    user_id: Optional[int],
+    title: str,
+    per_100g: Optional[Dict[str, Any]],
+    *,
+    brand: str = "",
+    serving_g: float = 100.0,
+    source: str = "label",
+) -> None:
+    if db is None or user_id is None or not isinstance(per_100g, dict):
+        return
+    try:
+        k100 = float(per_100g.get("kcal") or 0.0)
+    except (TypeError, ValueError):
+        k100 = 0.0
+    if k100 <= 0 or not title or title.lower().startswith("продукт ("):
+        return
+    clean_title = nutrition_web.normalize_food_query(title)
+    if len(clean_title) < 3:
+        return
+    await repo.upsert_user_food_product(
+        db,
+        int(user_id),
+        clean_title,
+        title.strip(),
+        brand=brand,
+        per_100g={
+            "kcal": round(k100, 1),
+            "protein_g": round(float(per_100g.get("protein_g") or per_100g.get("protein") or 0.0), 1),
+            "fat_g": round(float(per_100g.get("fat_g") or per_100g.get("fat") or 0.0), 1),
+            "carbs_g": round(float(per_100g.get("carbs_g") or per_100g.get("carbs") or 0.0), 1),
+        },
+        default_serving_g=float(serving_g or 100.0),
+        source=source,
+    )
+
+
 async def parse_meal_input(
     *,
     raw_text: str = "",
     image_bytes: Optional[bytes] = None,
     image_mime: str = "image/jpeg",
     llm_client_instance: Optional[LLMClient] = None,
+    db=None,
+    user_id: Optional[int] = None,
+    allow_clarification: bool = True,
+    allow_web_lookup: bool = True,
+    web_lookup_fn: Optional[nutrition_web.SearchFn] = None,
 ) -> Dict[str, Any]:
-    """Распознать приём пищи (КБЖУ) с фото тарелки/этикетки или из текста."""
+    """Распознать приём пищи (КБЖУ) по фото тарелки/этикетки, тексту, этикетке или меню в сети."""
     client = llm_client_instance or default_llm_client
     clean_text = str(raw_text or "").strip()
 
@@ -667,47 +1038,319 @@ async def parse_meal_input(
             return {"ok": False, "error": "llm_not_configured"}
         b64 = base64.b64encode(image_bytes).decode("ascii")
         data_url = f"data:{image_mime};base64,{b64}"
-        user_msg = "Оцени это блюдо и его КБЖУ." + (f" Комментарий: {clean_text}" if clean_text else "")
+        user_msg = (
+            "Оцени это фото: если это блюдо — посчитай КБЖУ тарелки; если это этикетка/состав — вытащи per_100g и посчитай порцию."
+            + (f" Комментарий: {clean_text}" if clean_text else "")
+        )
         res = await client.complete_json(
-            _MEAL_PARSE_PROMPT, user_msg, temperature=0.1, max_tokens=500, image_data_urls=[data_url]
+            _MEAL_PARSE_PROMPT, user_msg, temperature=0.1, max_tokens=600, image_data_urls=[data_url]
         )
         if not res.ok or not isinstance(res.data, dict):
             return {"ok": False, "error": res.error or "vision_parse_failed"}
-        norm = _normalize_nutrition_dict(res.data, estimated=True)
+        norm = _normalize_nutrition_dict(res.data, estimated=not bool(res.data.get("is_nutrition_label")))
         if not norm:
             return {"ok": False, "error": "no_meal_found"}
         slot = str(res.data.get("meal_slot") or "snack").strip().lower()
+        title = str(res.data.get("title") or clean_text or "Блюдо по фото").strip()
+        is_label = bool(res.data.get("is_nutrition_label"))
+        per_100 = res.data.get("per_100g") if isinstance(res.data.get("per_100g"), dict) else None
+        srv_g = float(res.data.get("serving_g") or 100.0) if res.data.get("serving_g") else 100.0
+
+        # Если пользователь в подписи указал точные граммы ("150 г") к фото этикетки — пересчитаем строго!
+        if is_label and per_100 and clean_text:
+            exp_g, _ = nutrition_web.extract_requested_grams_and_mult(clean_text, default_serving_g=srv_g)
+            if exp_g is not None and float(per_100.get("kcal") or 0) > 0:
+                fac = exp_g / 100.0
+                norm = {
+                    "kcal": int(round(float(per_100.get("kcal") or 0) * fac)),
+                    "protein_g": round(float(per_100.get("protein_g") or 0) * fac, 1),
+                    "fat_g": round(float(per_100.get("fat_g") or 0) * fac, 1),
+                    "carbs_g": round(float(per_100.get("carbs_g") or 0) * fac, 1),
+                    "estimated": False,
+                }
+                srv_g = exp_g
+
+        if is_label and per_100:
+            await _maybe_save_label_product(
+                db,
+                user_id,
+                title,
+                per_100,
+                brand=str(res.data.get("brand_or_place") or ""),
+                serving_g=srv_g,
+                source="vision_label",
+            )
+        clar_q = str(res.data.get("clarification_question") or "").strip() if allow_clarification else ""
+        needs_clar = bool(res.data.get("needs_clarification")) and bool(clar_q) and allow_clarification
         return {
             "ok": True,
             "used_llm": True,
-            "title": str(res.data.get("title") or clean_text or "Блюдо по фото").strip(),
+            "title": title,
             "meal_slot": slot if slot in {"breakfast", "lunch", "dinner", "snack"} else "snack",
+            "is_nutrition_label": is_label,
+            "per_100g": per_100 or {},
+            "serving_g": srv_g,
+            "needs_clarification": needs_clar,
+            "clarification_question": clar_q,
             **norm,
         }
 
     if not clean_text:
         return {"ok": False, "error": "empty_input"}
 
+    # 1. Прямая математика этикетки на 100 г в тексте ("на 100г 240 ккал ..., съел 150 г")
+    label_hit = _parse_label_math_offline(clean_text)
+    if label_hit is not None:
+        await _maybe_save_label_product(
+            db,
+            user_id,
+            label_hit["title"],
+            label_hit.get("per_100g"),
+            serving_g=float(label_hit.get("serving_g") or 100.0),
+            source="text_label",
+        )
+        return {"ok": True, "used_llm": False, "estimated": False, **label_hit}
+
+    # 2. Многоуровневый справочник: личные этикетки -> SQLite кэш -> OpenFoodFacts / Web Search
+    allow_net_now = bool(
+        allow_web_lookup
+        and (web_lookup_fn is not None or nutrition_web.needs_web_nutrition_lookup(clean_text))
+    )
+    lookup_rec = await nutrition_web.lookup_food_nutrition(
+        db,
+        user_id,
+        clean_text,
+        allow_network=allow_net_now,
+        llm_client_instance=client,
+        web_fn=web_lookup_fn,
+    )
+    vague_q = _detect_vague_meal(clean_text) if allow_clarification else None
+    if lookup_rec is not None:
+        scaled = nutrition_web.scale_lookup_record(lookup_rec, clean_text)
+        if scaled is not None:
+            return {
+                "ok": True,
+                "used_llm": scaled["lookup_source"] == "web_search",
+                "title": scaled["title"],
+                "meal_slot": "snack",
+                "kcal": scaled["kcal"],
+                "protein_g": scaled["protein_g"],
+                "fat_g": scaled["fat_g"],
+                "carbs_g": scaled["carbs_g"],
+                "estimated": scaled["lookup_source"] not in {"my_label", "openfoodfacts"},
+                "lookup_source": scaled["lookup_source"],
+                "lookup_url": scaled["lookup_url"],
+                "needs_clarification": bool(vague_q),
+                "clarification_question": vague_q or "",
+            }
+
+    # 3. Умный LLM-разбор (если настроен)
     if client.is_configured():
         res = await client.complete_json(
-            _MEAL_PARSE_PROMPT, f"Оцени КБЖУ съеденного:\n{clean_text}", temperature=0.1, max_tokens=500
+            _MEAL_PARSE_PROMPT, f"Оцени КБЖУ съеденного:\n{clean_text}", temperature=0.1, max_tokens=550
         )
         if res.ok and isinstance(res.data, dict):
             norm = _normalize_nutrition_dict(res.data, estimated=True)
             if norm:
                 slot = str(res.data.get("meal_slot") or "snack").strip().lower()
+                clar_q = str(res.data.get("clarification_question") or "").strip() if allow_clarification else ""
+                needs_clar = bool(res.data.get("needs_clarification")) and bool(clar_q) and allow_clarification
                 return {
                     "ok": True,
                     "used_llm": True,
                     "title": str(res.data.get("title") or clean_text[:60]).strip(),
                     "meal_slot": slot if slot in {"breakfast", "lunch", "dinner", "snack"} else "snack",
+                    "needs_clarification": needs_clar,
+                    "clarification_question": clar_q,
                     **norm,
                 }
 
+    # 4. Надёжный офлайн-fallback + мягкая проверка на расплывчатость
     offline = _parse_meal_offline(clean_text)
     if not offline:
         return {"ok": False, "error": "no_meal_found"}
-    return {"ok": True, "used_llm": False, **offline}
+    return {
+        "ok": True,
+        "used_llm": False,
+        "needs_clarification": bool(vague_q),
+        "clarification_question": vague_q or "",
+        **offline,
+    }
+
+
+def _mins_until_sleep_for_user(user: Dict[str, Any], now: datetime.datetime) -> int:
+    try:
+        from utils.time import format_time_local, parse_hhmm
+        local_hhmm = format_time_local(now, str(user.get("timezone") or "UTC"))
+        now_t = parse_hhmm(local_hhmm) or datetime.time(12, 0)
+        sleep_t = parse_hhmm(str(user.get("sleep_time") or "23:00")) or datetime.time(23, 0)
+        now_m = now_t.hour * 60 + now_t.minute
+        sleep_m = sleep_t.hour * 60 + sleep_t.minute
+        if sleep_m < now_m and now_m - sleep_m > 360:
+            sleep_m += 24 * 60
+        return sleep_m - now_m
+    except Exception:
+        return 180
+
+
+async def evaluate_meal_check(
+    db,
+    user: Dict[str, Any],
+    meal_text: str,
+    *,
+    now_utc: Optional[datetime.datetime] = None,
+    llm_client_instance: Optional[LLMClient] = None,
+    web_lookup_fn: Optional[nutrition_web.SearchFn] = None,
+) -> Dict[str, Any]:
+    """Примерить планируемое блюдо к остатку КБЖУ, времени до отбоя и цели/стилю коуча."""
+    now = now_utc or datetime.datetime.utcnow()
+    clean_meal = str(meal_text or "").strip()
+    if not clean_meal:
+        return {"ok": False, "error": "empty_meal"}
+
+    dish = await parse_meal_input(
+        raw_text=clean_meal,
+        llm_client_instance=llm_client_instance,
+        db=db,
+        user_id=int(user["id"]),
+        allow_clarification=False,
+        allow_web_lookup=True,
+        web_lookup_fn=web_lookup_fn,
+    )
+    if not dish.get("ok"):
+        return {"ok": False, "error": "dish_parse_failed"}
+
+    advice = await get_daily_nutrition_advice(db, user, now_utc=now)
+    targets = advice["targets"]
+    rem = advice["remaining"]
+    mindful = bool(targets.get("mindful_mode"))
+    coach_mode = str(user.get("coach_mode") or "balanced").strip().lower()
+    if coach_mode not in COACH_MODES:
+        coach_mode = "balanced"
+    mins_left = _mins_until_sleep_for_user(user, now)
+
+    d_kcal = int(round(float(dish.get("kcal") or 0)))
+    d_p = float(dish.get("protein_g") or 0)
+    d_f = float(dish.get("fat_g") or 0)
+    d_c = float(dish.get("carbs_g") or 0)
+
+    rem_after_kcal = int(rem["kcal"]) - d_kcal
+    rem_after_fat = round(float(rem["fat_g"]) - d_f, 1)
+
+    if mindful:
+        verdict = "fits"
+    elif rem_after_kcal >= -60 and rem_after_fat >= -5:
+        verdict = "fits"
+    elif rem_after_kcal >= -260:
+        verdict = "tight"
+    else:
+        verdict = "over"
+
+    # Лучшие быстрые альтернативы из холодильника
+    pantry_rows = await repo.list_pantry_items(db, int(user["id"]))
+    pantry_names = [str(dict(r).get("name") or "") for r in pantry_rows if dict(r).get("name")][:10]
+
+    src_note = ""
+    if dish.get("lookup_source") == "openfoodfacts":
+        src_note = " · Open Food Facts"
+    elif dish.get("lookup_source") == "web_search":
+        src_note = " · из меню в сети"
+    elif dish.get("lookup_source") == "my_label":
+        src_note = " · по твоей этикетке"
+
+    v_badge = (
+        "🧘 <b>Осознанный выбор</b>"
+        if mindful
+        else "✅ <b>Отлично вписывается</b>"
+        if verdict == "fits"
+        else "⚖ <b>На грани лимита</b>"
+        if verdict == "tight"
+        else "⚠️ <b>Будет перебор на сегодня</b>"
+    )
+    half_kcal = max(10, int(round(d_kcal * 0.5)))
+
+    client = llm_client_instance or default_llm_client
+    advice_body = ""
+    if client.is_configured():
+        directive = get_coach_directive(user)
+        pantry_line = ", ".join(pantry_names) if pantry_names else "холодильник не заполнен"
+        sys_p = (
+            "Ты — коуч по питанию HiDL. Пользователь ещё НЕ съел блюдо, а примеряет его к своему дню. "
+            "Ответь коротко (2–4 предложения, без ** и ## Markdown), опирайся ТОЛЬКО на точные цифры ниже и соблюдай стиль коуча."
+        )
+        usr_p = (
+            f"{directive}\n"
+            f"Кандидат: {dish['title']} — ~{d_kcal} ккал (Б {d_p:g}г / Ж {d_f:g}г / У {d_c:g}г).\n"
+            f"Остаток дня ДО этого блюда: {rem['kcal']} ккал, белка добрать {rem['protein_g']} г, лимит жиров {rem['fat_g']} г.\n"
+            f"До отбоя: {mins_left} мин.\n"
+            f"Дома в холодильнике: {pantry_line}.\n"
+            "Скажи, стоит ли есть целиком, взять полпорции или чем заменить/дополнить."
+        )
+        res = await client.complete_text(sys_p, usr_p, temperature=0.3, max_tokens=260)
+        if res.ok and res.text.strip():
+            from services.advice_service import _llm_text_to_safe_html
+            advice_body = _llm_text_to_safe_html(res.text)
+
+    if not advice_body:
+        late_note = " Уже поздно (до отбоя меньше часа) — тяжёлое перед сном хуже ложится." if mins_left <= 65 else ""
+        alt_note = f" Дома есть: {', '.join(pantry_names[:4])}." if pantry_names else ""
+        if mindful:
+            advice_body = (
+                f"Порция потянет примерно на {d_kcal} ккал (Б {d_p:g}г).{late_note} "
+                "Если хочется именно этого — съешь спокойно и без чувства вины, прислушиваясь к сытости."
+            )
+        elif verdict == "fits":
+            p_plus = " Отлично помогает добрать белок." if rem["protein_g"] >= 20 and d_p >= 14 else ""
+            advice_body = (
+                f"Спокойно влезает в норму: останется ещё ~{max(0, rem_after_kcal)} ккал на сегодня.{p_plus}{late_note}"
+            )
+        elif verdict == "tight":
+            if coach_mode == "gentle":
+                advice_body = (
+                    f"Вплотную к дневному лимиту ({rem_after_kcal:+} ккал). Если очень хочется — бери смело половину (~{half_kcal} ккал) или просто сделай более лёгкий приём позже.{late_note}"
+                )
+            elif coach_mode == "strict":
+                advice_body = (
+                    f"На грани ({rem_after_kcal:+} ккал{', по жирам перекос' if rem_after_fat < 0 else ''}). Лучше взять полпорции (~{half_kcal} ккал) и добрать белок.{alt_note}{late_note}"
+                )
+            else:
+                advice_body = (
+                    f"Почти впритык ({rem_after_kcal:+} ккал от остатка). Удобный компромисс — полпорции (~{half_kcal} ккал) или вариант с белком.{alt_note}{late_note}"
+                )
+        else:
+            over_k = abs(rem_after_kcal)
+            if coach_mode == "gentle":
+                advice_body = (
+                    f"Целиком даст +{over_k} ккал сверх нормы. Ничего страшного — можно взять полпорции (~{half_kcal} ккал) с овощами/водой или выбрать что-то полегче.{alt_note}{late_note}"
+                )
+            elif coach_mode == "strict":
+                advice_body = (
+                    f"Сейчас будет ощутимый перебор (+{over_k} ккал"
+                    + (f", жиры +{abs(rem_after_fat):g} г" if rem_after_fat < -2 else "")
+                    + f"). Тормози перед полной порцией — максимум полпорции (~{half_kcal} ккал) или белковая альтернатива.{alt_note}{late_note}"
+                )
+            else:
+                advice_body = (
+                    f"Целиком выйдет за дневной коридор (+{over_k} ккал). Если хочется — бери полпорции (~{half_kcal} ккал) или замени на вариант с высоким белком.{alt_note}{late_note}"
+                )
+
+    from html import escape as _esc
+    header = (
+        f"{v_badge}\n"
+        f"🍽 <b>{_esc(dish['title'])}</b>{src_note}\n"
+        f"🔥 ~<b>{d_kcal} ккал</b> (Б {d_p:g}г / Ж {d_f:g}г / У {d_c:g}г)\n"
+    )
+    if not mindful:
+        header += f"📊 Сейчас осталось: <b>{rem['kcal']} ккал</b> · белок +{rem['protein_g']} г\n"
+
+    return {
+        "ok": True,
+        "dish": dish,
+        "verdict": verdict,
+        "coach_mode": coach_mode,
+        "remaining_before": rem,
+        "advice_html": f"{header}\n{advice_body}".strip(),
+    }
 
 
 _SCALE_PARSE_PROMPT = (
@@ -764,7 +1407,7 @@ def _parse_scale_offline(raw_text: str) -> Optional[Dict[str, Any]]:
         except Exception:
             return None
 
-    w = _find(r"(?:вес|weight)\s*[:=]?\s*(\d+(?:\.\d+)?)")
+    w = _find(r"(?:вес(?:\s+(?:сейчас|сегодня|стал))?|weight|взвесил(?:ся|ась|ись)?|на\s+весах)\s*[:=-]?\s*(\d{2,3}(?:\.\d+)?)")
     if w is None:
         m0 = re.match(r"^\s*(\d{2,3}(?:\.\d+)?)\b", low)
         if m0:
@@ -1123,7 +1766,7 @@ async def generate_personal_workout(
     user_prompt = (
         f"Длительность: {duration_min} мин. Акцент: {FOCUS_LABELS.get(eff_focus, eff_focus)}.\n"
         f"Инвентарь дома: {eq_human}.\n"
-        f"Цель: {GOAL_LABELS.get(goal, goal)}. Вес: {weight_txt}.\n"
+        f"{get_coach_directive(user)} Вес: {weight_txt}.\n"
         f"Недавние акценты за неделю: {', '.join(recent_areas) or 'давно не тренировался'}."
     )
     res = await client.complete_json(sys_prompt, user_prompt, temperature=0.35, max_tokens=800)

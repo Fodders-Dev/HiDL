@@ -8,8 +8,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import repositories as repo
-from services import calendar_service, pulse_service
-from utils.time import format_date_display, local_date_str, should_trigger, tzinfo_from_string
+from services import calendar_service, fitness_nutrition, inbox_service, pulse_service
+from utils.time import format_date_display, format_time_local, local_date_str, parse_hhmm, should_trigger, tzinfo_from_string
 from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
 from utils.profile import is_student_mode
@@ -84,6 +84,8 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_pulse, "interval", seconds=60, id="pulse_tick")
         self.scheduler.add_job(self._tick_calendar_sync, "interval", minutes=15, id="calendar_sync_tick")
         self.scheduler.add_job(self._tick_calendar_alerts, "interval", seconds=60, id="calendar_alerts_tick")
+        self.scheduler.add_job(self._tick_pending_meals, "interval", minutes=2, id="pending_meals_autocommit")
+        self.scheduler.add_job(self._tick_nutrition_evening, "interval", minutes=15, id="nutrition_evening_checkin")
         self.scheduler.start()
 
     @staticmethod
@@ -1307,3 +1309,120 @@ class ReminderScheduler:
             sent = await self._safe_send_message(user, local_date, "\n".join(lines), reply_markup=kb)
             if sent:
                 await repo.update_daily_brief_sent(self.conn, user["id"], local_date)
+
+    async def _tick_pending_meals(self, now_utc: Optional[datetime.datetime] = None) -> int:
+        """Тихо зафиксировать просроченные черновики КБЖУ, если пользователь не стал уточнять."""
+        now = now_utc or datetime.datetime.utcnow()
+        due_rows = await repo.list_due_pending_meals(self.conn, now_utc=now)
+        committed = 0
+        for row in due_rows:
+            uid = int(row["user_id"])
+            user_row = await repo.get_user(self.conn, uid)
+            if not user_row or is_student_mode(user_row):
+                await repo.resolve_pending_meal(self.conn, int(row["id"]), status="cancelled")
+                continue
+            await inbox_service.commit_pending_meal(
+                self.conn,
+                dict(user_row),
+                row,
+                mult=1.0,
+                status="auto_committed",
+                now_utc=now,
+            )
+            committed += 1
+        return committed
+
+    async def _tick_nutrition_evening(self, now_utc: Optional[datetime.datetime] = None) -> int:
+        """Один короткий вечерний разбор дня по КБЖУ, цели и движению (не чаще 1 раза/день)."""
+        now = now_utc or datetime.datetime.utcnow()
+        users = await repo.list_users(self.conn)
+        sent_count = 0
+        for user_row in users:
+            user = dict(user_row)
+            if is_student_mode(user):
+                continue
+            if not int(user.get("nutrition_checkin_enabled", 1)):
+                continue
+            goal = str(user.get("weight_goal") or "loss").strip().lower()
+            if goal == "mindful":
+                continue
+            tz = str(user.get("timezone") or "UTC")
+            local_date = local_date_str(now, tz)
+            if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
+                continue
+            if str(user.get("nutrition_checkin_last_date") or "") == local_date:
+                continue
+            if _sleep_window_active(user, now):
+                continue
+
+            local_hhmm = format_time_local(now, tz)
+            now_t = parse_hhmm(local_hhmm)
+            sleep_t = parse_hhmm(str(user.get("sleep_time") or "23:00"))
+            if now_t is None or sleep_t is None:
+                continue
+            now_m = now_t.hour * 60 + now_t.minute
+            sleep_m = sleep_t.hour * 60 + sleep_t.minute
+            if sleep_m < now_m and sleep_m <= 360:
+                sleep_m += 24 * 60
+            mins_left = sleep_m - now_m
+            if not (60 <= mins_left <= 135):
+                continue
+
+            uid = int(user["id"])
+            advice = await fitness_nutrition.get_daily_nutrition_advice(self.conn, user, now_utc=now)
+            week = await repo.workout_stats_week(self.conn, uid, local_date)
+            meals_cnt = int(advice["eaten"].get("meals_count") or 0)
+            kcal_burned_today = int(week.get("today_kcal_burned") or 0)
+            if meals_cnt == 0 and kcal_burned_today == 0 and advice["targets"].get("is_estimated", True):
+                continue
+
+            tgt = advice["targets"]
+            eat = advice["eaten"]
+            rem = advice["remaining"]
+            coach = str(user.get("coach_mode") or "balanced").strip().lower()
+
+            if coach == "gentle":
+                tail = (
+                    f"Остаток ~{rem['kcal']} ккал — если голодно, выбери спокойный лёгкий перекус."
+                    if meals_cnt > 0
+                    else "Если забылось отметить еду — ничего страшного, главное высыпайся!"
+                )
+                head = "🌙 <b>Мягкий вечерний итог дня</b>"
+            elif coach == "strict":
+                p_miss = int(rem["protein_g"])
+                tail = (
+                    f"По белку недобор {p_miss} г — завтра докинь белка в первый приём пищи!"
+                    if p_miss >= 25
+                    else "По КБЖУ и белку держишь хороший ориентир, так держать!"
+                )
+                head = "🔥 <b>Вечерний чекпоинт тренера</b>"
+            else:
+                tail = advice["summary_line"]
+                head = "🎯 <b>Вечерний разбор дня</b>"
+
+            mov_txt = (
+                f"Движение сегодня: ~{kcal_burned_today} ккал"
+                if kcal_burned_today > 0
+                else "Движение: ещё можно успеть 3-минутный микро-старт"
+            )
+            msg = (
+                f"{head}\n"
+                f"🍽 КБЖУ: <b>{eat['kcal']}</b> / {tgt['kcal']} ккал (Б {eat['protein_g']:g}/{tgt['protein_g']}г)\n"
+                f"🏃 {mov_txt}\n"
+                f"💡 {tail}"
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                        InlineKeyboardButton(text="🫠 3 мин сейчас", callback_data="fit:lazy"),
+                    ]
+                ]
+            )
+            sent = await self._safe_send_message(user, local_date, msg, reply_markup=kb, parse_mode="HTML")
+            if sent:
+                await repo.update_user_coach_settings(
+                    self.conn, uid, nutrition_checkin_last_date=local_date
+                )
+                sent_count += 1
+        return sent_count

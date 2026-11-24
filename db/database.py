@@ -1976,6 +1976,60 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_workout_logs_user_date
             ON workout_logs(user_id, local_date);
+
+        CREATE TABLE IF NOT EXISTS nutrition_lookup_cache (
+            query_key TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL DEFAULT '',
+            per_100g_json TEXT NOT NULL DEFAULT '{}',
+            serving_g REAL NOT NULL DEFAULT 0,
+            kcal_serving REAL NOT NULL DEFAULT 0,
+            protein_g REAL NOT NULL DEFAULT 0,
+            fat_g REAL NOT NULL DEFAULT 0,
+            carbs_g REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS user_food_products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            brand TEXT NOT NULL DEFAULT '',
+            per_100g_json TEXT NOT NULL DEFAULT '{}',
+            default_serving_g REAL NOT NULL DEFAULT 100,
+            source TEXT NOT NULL DEFAULT 'label',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, name_key),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_food_products_user
+            ON user_food_products(user_id, name_key);
+
+        CREATE TABLE IF NOT EXISTS pending_meal_clarifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL DEFAULT 0,
+            local_date TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            title TEXT NOT NULL,
+            meal_slot TEXT NOT NULL DEFAULT 'snack',
+            estimated_json TEXT NOT NULL DEFAULT '{}',
+            question TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            source TEXT NOT NULL DEFAULT 'text',
+            inbox_message_id INTEGER,
+            created_at TEXT NOT NULL,
+            auto_commit_after TEXT NOT NULL,
+            resolved_meal_id INTEGER,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_meals_user_status
+            ON pending_meal_clarifications(user_id, status);
+        CREATE INDEX IF NOT EXISTS idx_pending_meals_due
+            ON pending_meal_clarifications(status, auto_commit_after);
         """
     )
 
@@ -1987,6 +2041,9 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
         ("activity_level", "TEXT DEFAULT 'light'"),
         ("equipment_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("custom_kcal_target", "INTEGER DEFAULT 0"),
+        ("coach_mode", "TEXT NOT NULL DEFAULT 'balanced'"),
+        ("nutrition_checkin_enabled", "INTEGER NOT NULL DEFAULT 1"),
+        ("nutrition_checkin_last_date", "TEXT NOT NULL DEFAULT ''"),
     ):
         if users_fit_info and col_name not in users_fit_cols:
             await conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")

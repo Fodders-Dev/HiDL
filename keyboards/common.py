@@ -98,7 +98,10 @@ def movement_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🏋️ Тренировка под мой дом", callback_data="fit:workout_menu")],
             [InlineKeyboardButton(text="⚖ Умные весы и параметры тела", callback_data="fit:body")],
             [InlineKeyboardButton(text="🧰 Мой инвентарь дома", callback_data="fit:gear")],
-            [InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today")],
+            [
+                InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                InlineKeyboardButton(text="🎯 Цель и коуч", callback_data="fit:coach_menu"),
+            ],
             [InlineKeyboardButton(text="📊 Прогресс за неделю", callback_data="fit:stats")],
             [
                 InlineKeyboardButton(text="🚶 Прогулка", callback_data="move:short"),

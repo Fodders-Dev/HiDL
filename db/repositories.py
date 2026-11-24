@@ -1066,6 +1066,46 @@ async def update_user_body(
     await conn.commit()
 
 
+async def update_user_coach_settings(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    weight_goal: str | None = None,
+    coach_mode: str | None = None,
+    nutrition_checkin_enabled: bool | int | None = None,
+    nutrition_checkin_last_date: str | None = None,
+) -> None:
+    """Обновить цель и настройки стиля коуча / вечернего разбора питания."""
+    now = utc_now_str()
+    fields = []
+    values: list[Any] = []
+    if weight_goal is not None:
+        g = str(weight_goal).strip().lower()
+        if g == "maintain":
+            g = "keep"
+        if g in {"loss", "recomp", "keep", "gain", "mindful"}:
+            fields.append("weight_goal = ?")
+            values.append(g)
+    if coach_mode is not None:
+        m = str(coach_mode).strip().lower()
+        if m in {"gentle", "balanced", "strict"}:
+            fields.append("coach_mode = ?")
+            values.append(m)
+    if nutrition_checkin_enabled is not None:
+        fields.append("nutrition_checkin_enabled = ?")
+        values.append(1 if nutrition_checkin_enabled else 0)
+    if nutrition_checkin_last_date is not None:
+        fields.append("nutrition_checkin_last_date = ?")
+        values.append(str(nutrition_checkin_last_date).strip())
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    values.append(now)
+    values.append(int(user_id))
+    await conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", tuple(values))
+    await conn.commit()
+
+
 async def set_user_pause(
     conn: aiosqlite.Connection, user_id: int, pause_until: str
 ) -> None:
@@ -5575,6 +5615,437 @@ async def workout_stats_week(
     }
 
 
+async def get_meal_log(
+    conn: aiosqlite.Connection, user_id: int, log_id: int
+) -> Optional[Dict[str, Any]]:
+    """Вернуть одну запись приёма пищи пользователя."""
+    cur = await conn.execute(
+        "SELECT * FROM meal_logs WHERE user_id = ? AND id = ?",
+        (int(user_id), int(log_id)),
+    )
+    row = await cur.fetchone()
+    return row_to_dict(row) if row else None
 
 
+async def update_meal_log(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    log_id: int,
+    *,
+    title: Optional[str] = None,
+    meal_slot: Optional[str] = None,
+    kcal: Optional[float] = None,
+    protein_g: Optional[float] = None,
+    fat_g: Optional[float] = None,
+    carbs_g: Optional[float] = None,
+    servings: Optional[float] = None,
+    source: Optional[str] = None,
+) -> bool:
+    """Обновить существующую запись КБЖУ."""
+    fields = []
+    values: list[Any] = []
+    if title is not None:
+        clean_title = str(title).strip()
+        if clean_title:
+            fields.append("title = ?")
+            values.append(clean_title)
+    if meal_slot is not None and meal_slot in {"breakfast", "lunch", "dinner", "snack"}:
+        fields.append("meal_slot = ?")
+        values.append(meal_slot)
+    if kcal is not None:
+        fields.append("kcal = ?")
+        values.append(round(max(0.0, float(kcal)), 1))
+    if protein_g is not None:
+        fields.append("protein_g = ?")
+        values.append(round(max(0.0, float(protein_g)), 1))
+    if fat_g is not None:
+        fields.append("fat_g = ?")
+        values.append(round(max(0.0, float(fat_g)), 1))
+    if carbs_g is not None:
+        fields.append("carbs_g = ?")
+        values.append(round(max(0.0, float(carbs_g)), 1))
+    if servings is not None:
+        fields.append("servings = ?")
+        values.append(round(max(0.1, float(servings)), 2))
+    if source is not None and str(source).strip():
+        fields.append("source = ?")
+        values.append(str(source).strip())
+    if not fields:
+        return False
+    values.extend([int(user_id), int(log_id)])
+    cur = await conn.execute(
+        f"UPDATE meal_logs SET {', '.join(fields)} WHERE user_id = ? AND id = ?",
+        tuple(values),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+async def delete_workout_log(
+    conn: aiosqlite.Connection, user_id: int, log_id: int
+) -> bool:
+    """Удалить личную запись тренировки по id."""
+    cur = await conn.execute(
+        "DELETE FROM workout_logs WHERE user_id = ? AND id = ?",
+        (int(user_id), int(log_id)),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+async def delete_weight_entry(
+    conn: aiosqlite.Connection, user_id: int, weight_id: int
+) -> bool:
+    """Удалить личную запись взвешивания по id."""
+    cur = await conn.execute(
+        "DELETE FROM weights WHERE user_id = ? AND id = ?",
+        (int(user_id), int(weight_id)),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+def _norm_food_key(raw: str) -> str:
+    txt = str(raw or "").casefold().replace("ё", "е")
+    txt = re.sub(r"[^\w\s]+", " ", txt)
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+async def get_nutrition_cache(
+    conn: aiosqlite.Connection, query_key: str, *, max_age_days: int = 30
+) -> Optional[Dict[str, Any]]:
+    """Получить закэшированный онлайн-результат КБЖУ, если он не устарел."""
+    qkey = _norm_food_key(query_key)
+    if not qkey:
+        return None
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=max(1, int(max_age_days)))).isoformat()
+    cur = await conn.execute(
+        "SELECT * FROM nutrition_lookup_cache WHERE query_key = ? AND datetime(updated_at) >= datetime(?)",
+        (qkey, cutoff),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    d = row_to_dict(row)
+    try:
+        per_100 = json.loads(d.get("per_100g_json") or "{}")
+    except Exception:
+        per_100 = {}
+    return {
+        "query_key": d["query_key"],
+        "title": d["title"],
+        "source": d.get("source") or "cache",
+        "source_url": d.get("source_url") or "",
+        "per_100g": per_100 if isinstance(per_100, dict) else {},
+        "serving_g": float(d.get("serving_g") or 0),
+        "kcal_serving": float(d.get("kcal_serving") or 0),
+        "protein_g": float(d.get("protein_g") or 0),
+        "fat_g": float(d.get("fat_g") or 0),
+        "carbs_g": float(d.get("carbs_g") or 0),
+        "cached": True,
+    }
+
+
+async def upsert_nutrition_cache(
+    conn: aiosqlite.Connection,
+    query_key: str,
+    *,
+    title: str,
+    source: str = "web_search",
+    source_url: str = "",
+    per_100g: Optional[Dict[str, Any]] = None,
+    serving_g: float = 0.0,
+    kcal_serving: float = 0.0,
+    protein_g: float = 0.0,
+    fat_g: float = 0.0,
+    carbs_g: float = 0.0,
+) -> None:
+    """Сохранить найденный в сети КБЖУ-справочник в кэш."""
+    qkey = _norm_food_key(query_key)
+    if not qkey:
+        return
+    now = utc_now_str()
+    await conn.execute(
+        """
+        INSERT INTO nutrition_lookup_cache (
+            query_key, title, source, source_url, per_100g_json,
+            serving_g, kcal_serving, protein_g, fat_g, carbs_g, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(query_key) DO UPDATE SET
+            title = excluded.title,
+            source = excluded.source,
+            source_url = excluded.source_url,
+            per_100g_json = excluded.per_100g_json,
+            serving_g = excluded.serving_g,
+            kcal_serving = excluded.kcal_serving,
+            protein_g = excluded.protein_g,
+            fat_g = excluded.fat_g,
+            carbs_g = excluded.carbs_g,
+            updated_at = excluded.updated_at
+        """,
+        (
+            qkey,
+            str(title or qkey).strip(),
+            str(source or "web_search").strip(),
+            str(source_url or "").strip(),
+            json.dumps(per_100g or {}, ensure_ascii=False),
+            round(max(0.0, float(serving_g or 0.0)), 1),
+            round(max(0.0, float(kcal_serving or 0.0)), 1),
+            round(max(0.0, float(protein_g or 0.0)), 1),
+            round(max(0.0, float(fat_g or 0.0)), 1),
+            round(max(0.0, float(carbs_g or 0.0)), 1),
+            now,
+        ),
+    )
+    await conn.commit()
+
+
+async def upsert_user_food_product(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    name_key: str,
+    title: str,
+    *,
+    brand: str = "",
+    per_100g: Optional[Dict[str, Any]] = None,
+    default_serving_g: float = 100.0,
+    source: str = "label",
+) -> None:
+    """Запомнить личный продукт (с этикетки/упаковки) пользователя по КБЖУ на 100 г."""
+    nkey = _norm_food_key(name_key or title)
+    if not nkey:
+        return
+    now = utc_now_str()
+    await conn.execute(
+        """
+        INSERT INTO user_food_products (
+            user_id, name_key, title, brand, per_100g_json,
+            default_serving_g, source, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, name_key) DO UPDATE SET
+            title = excluded.title,
+            brand = excluded.brand,
+            per_100g_json = excluded.per_100g_json,
+            default_serving_g = excluded.default_serving_g,
+            source = excluded.source,
+            updated_at = excluded.updated_at
+        """,
+        (
+            int(user_id),
+            nkey,
+            str(title or name_key).strip(),
+            str(brand or "").strip(),
+            json.dumps(per_100g or {}, ensure_ascii=False),
+            round(max(1.0, float(default_serving_g or 100.0)), 1),
+            str(source or "label").strip(),
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+
+
+async def find_user_food_product(
+    conn: aiosqlite.Connection, user_id: int, query_text: str
+) -> Optional[Dict[str, Any]]:
+    """Найти сохранённый продукт с этикетки пользователя по названию/ключу."""
+    qnorm = _norm_food_key(query_text)
+    if not qnorm:
+        return None
+    cur = await conn.execute(
+        "SELECT * FROM user_food_products WHERE user_id = ? ORDER BY datetime(updated_at) DESC LIMIT 80",
+        (int(user_id),),
+    )
+    rows = rows_to_dicts(await cur.fetchall())
+    if not rows:
+        return None
+    q_tokens = {w for w in qnorm.split() if len(w) >= 3}
+    best_row: Optional[Dict[str, Any]] = None
+    best_score = 0
+    for row in rows:
+        nkey = _norm_food_key(row.get("name_key") or row.get("title") or "")
+        if not nkey:
+            continue
+        if nkey == qnorm:
+            best_row = row
+            best_score = 100
+            break
+        if len(nkey) >= 4 and (nkey in qnorm or qnorm in nkey):
+            score = 50 + len(nkey)
+        else:
+            p_tokens = {w for w in nkey.split() if len(w) >= 3}
+            if not p_tokens:
+                continue
+            overlap = len(q_tokens & p_tokens)
+            if overlap == 0 or overlap < max(1, len(p_tokens) // 2 + len(p_tokens) % 2):
+                continue
+            score = overlap * 10
+        if score > best_score:
+            best_score = score
+            best_row = row
+    if not best_row:
+        return None
+    try:
+        per_100 = json.loads(best_row.get("per_100g_json") or "{}")
+    except Exception:
+        per_100 = {}
+    return {
+        "id": int(best_row["id"]),
+        "name_key": best_row["name_key"],
+        "title": best_row["title"],
+        "brand": best_row.get("brand") or "",
+        "per_100g": per_100 if isinstance(per_100, dict) else {},
+        "serving_g": float(best_row.get("default_serving_g") or 100.0),
+        "source": "my_label",
+        "source_url": "",
+    }
+
+
+async def count_user_food_products(conn: aiosqlite.Connection, user_id: int) -> int:
+    cur = await conn.execute(
+        "SELECT COUNT(*) AS cnt FROM user_food_products WHERE user_id = ?",
+        (int(user_id),),
+    )
+    row = await cur.fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+async def create_pending_meal_clarification(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    chat_id: int,
+    local_date: str,
+    raw_text: str,
+    title: str,
+    meal_slot: str,
+    estimated_dict: Dict[str, Any],
+    question: str,
+    *,
+    status: str = "pending",
+    source: str = "text",
+    inbox_message_id: Optional[int] = None,
+    auto_commit_minutes: int = 10,
+    now_utc: Optional[datetime.datetime] = None,
+) -> int:
+    """Создать черновик уточнения КБЖУ (с автокоммитом через N минут для ленивых)."""
+    now = now_utc or datetime.datetime.utcnow()
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    auto_after = now + datetime.timedelta(minutes=max(1, int(auto_commit_minutes or 10)))
+    eff_status = status if status in {"pending", "check"} else "pending"
+    cur = await conn.execute(
+        """
+        INSERT INTO pending_meal_clarifications (
+            user_id, chat_id, local_date, raw_text, title, meal_slot,
+            estimated_json, question, status, source, inbox_message_id,
+            created_at, auto_commit_after
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            int(chat_id or 0),
+            str(local_date),
+            str(raw_text or "").strip(),
+            str(title or "Приём пищи").strip(),
+            meal_slot if meal_slot in {"breakfast", "lunch", "dinner", "snack"} else "snack",
+            json.dumps(estimated_dict or {}, ensure_ascii=False),
+            str(question or "").strip(),
+            eff_status,
+            str(source or "text").strip(),
+            int(inbox_message_id) if inbox_message_id is not None else None,
+            now.isoformat(),
+            auto_after.isoformat(),
+        ),
+    )
+    await conn.commit()
+    return int(cur.lastrowid)
+
+
+def _decode_pending_meal(row: Any) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    d = row_to_dict(row)
+    try:
+        d["estimated"] = json.loads(d.get("estimated_json") or "{}")
+    except Exception:
+        d["estimated"] = {}
+    return d
+
+
+async def get_active_pending_meal(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    max_age_minutes: int = 45,
+    now_utc: Optional[datetime.datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Вернуть последний активный черновик уточнения еды для пользователя."""
+    now = now_utc or datetime.datetime.utcnow()
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    cutoff = (now - datetime.timedelta(minutes=max(5, int(max_age_minutes or 45)))).isoformat()
+    cur = await conn.execute(
+        """
+        SELECT * FROM pending_meal_clarifications
+        WHERE user_id = ? AND status = 'pending' AND datetime(created_at) >= datetime(?)
+        ORDER BY id DESC LIMIT 1
+        """,
+        (int(user_id), cutoff),
+    )
+    return _decode_pending_meal(await cur.fetchone())
+
+
+async def get_pending_meal_by_id(
+    conn: aiosqlite.Connection, user_id: int, pending_id: int
+) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT * FROM pending_meal_clarifications WHERE user_id = ? AND id = ?",
+        (int(user_id), int(pending_id)),
+    )
+    return _decode_pending_meal(await cur.fetchone())
+
+
+async def list_due_pending_meals(
+    conn: aiosqlite.Connection, now_utc: Optional[datetime.datetime] = None
+) -> List[Dict[str, Any]]:
+    """Вернуть просроченные pending-черновики еды для тихого автокоммита."""
+    now = now_utc or datetime.datetime.utcnow()
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    cur = await conn.execute(
+        """
+        SELECT * FROM pending_meal_clarifications
+        WHERE status = 'pending' AND datetime(auto_commit_after) <= datetime(?)
+        ORDER BY id ASC
+        LIMIT 50
+        """,
+        (now.isoformat(),),
+    )
+    return [d for r in await cur.fetchall() if (d := _decode_pending_meal(r))]
+
+
+async def resolve_pending_meal(
+    conn: aiosqlite.Connection,
+    pending_id: int,
+    *,
+    status: str = "committed",
+    resolved_meal_id: Optional[int] = None,
+) -> None:
+    eff_status = (
+        status
+        if status in {"committed", "auto_committed", "cancelled", "refined"}
+        else "committed"
+    )
+    await conn.execute(
+        """
+        UPDATE pending_meal_clarifications
+        SET status = ?, resolved_meal_id = COALESCE(?, resolved_meal_id)
+        WHERE id = ?
+        """,
+        (eff_status, int(resolved_meal_id) if resolved_meal_id is not None else None, int(pending_id)),
+    )
+    await conn.commit()
 

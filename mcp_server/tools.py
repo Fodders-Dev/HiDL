@@ -1216,6 +1216,11 @@ async def _tool_get_fitness_nutrition(
     trend = await repo.body_metrics_trend(db, user_id, days=30)
     workouts_week = await repo.workout_stats_week(db, user_id, local_date)
     equipment = repo.get_user_equipment(user)
+    coach_mode = str(user.get("coach_mode") or "balanced").strip().lower()
+    coach_emoji, coach_label, _ = fitness_nutrition.COACH_MODES.get(
+        coach_mode, fitness_nutrition.COACH_MODES["balanced"]
+    )
+    remembered_products_count = await repo.count_user_food_products(db, user_id)
     return {
         "local_date": advice["local_date"],
         "body_profile": {
@@ -1224,8 +1229,13 @@ async def _tool_get_fitness_nutrition(
             "sex": user.get("sex") or user.get("gender") or "",
             "activity_level": user.get("activity_level") or "light",
             "weight_goal": user.get("weight_goal") or "loss",
+            "goal_label": advice["targets"]["goal_label"],
             "weight_target": user.get("weight_target"),
+            "coach_mode": coach_mode,
+            "coach_label": f"{coach_emoji} {coach_label}",
+            "nutrition_checkin_enabled": bool(int(user.get("nutrition_checkin_enabled", 1))),
         },
+        "remembered_products_count": remembered_products_count,
         "equipment": equipment,
         "latest_scale": trend.get("latest"),
         "body_trend_30d": {

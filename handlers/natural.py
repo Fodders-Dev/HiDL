@@ -49,6 +49,10 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
     # Простые односоставные напоминания уже обработаны в handlers/custom_reminders.py.
     if is_single_clause_reminder(text_original):
         return
+    # Если пользователь только что получил уточнение по еде — ответы вида "ок", "ладно", "200 г" ведём в inbox
+    if not student and await repo.get_active_pending_meal(db, int(profile["id"])) is not None:
+        await handle_free_text_inbox(message, db)
+        return
     # быстрые намерения: сделал/позже/пропусти
     intent = match_simple_intent(text)
     if intent:
@@ -95,10 +99,16 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
 
     # Кладовка: короткий бытовой ввод вида "купила яблоки и бананы"
     pantry_patterns = [r"купил[аи]?", r"взял[аи]?", r"принес(?:ла)?", r"добавь в кладовку", r"закупил[аи]?"]
+    _food_log_exclude = (
+        "напом", "устал", "придумал", "иде", "надо", "нужно", "?",
+        "съел", "выпил", "поел", "хочу", "думаю", "планирую",
+        "в кафе", "в кофейн", "в теремк", "кофе", "латте", "капучино",
+        "шаурм", "шаверм", "пицц", "бургер", "ккал", "на 100", "блин", "сырник",
+    )
     is_single_sentence = (
         "\n" not in text_original
         and len([p for p in re.split(r"[.!?;]+", text_original) if p.strip()]) <= 1
-        and not any(k in text for k in ("напом", "устал", "придумал", "иде", "надо", "нужно", "?"))
+        and not any(k in text for k in _food_log_exclude)
     )
     pantry_match = not student and is_single_sentence and any(re.search(p, text) for p in pantry_patterns)
     if pantry_match:

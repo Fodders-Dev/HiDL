@@ -30,9 +30,24 @@ VALID_KINDS = {
     "pulse_log",
     "rollover_tasks",
     "shift_bedtime",
+    "meal_log",
+    "weight_log",
+    "workout_log",
 }
 VALID_INTENTS = {"capture", "query", "chat", "support"}
-VALID_QUERY_TYPES = {"none", "today", "calendar", "shopping", "food", "diary", "karma", "pantry", "advice"}
+VALID_QUERY_TYPES = {
+    "none",
+    "today",
+    "calendar",
+    "shopping",
+    "food",
+    "diary",
+    "karma",
+    "pantry",
+    "advice",
+    "meal_check",
+    "kbju",
+}
 
 WEEKDAY_STEMS = {
     "понедель": 0,
@@ -156,6 +171,8 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "karma": уровень кармы, долги по сферам, статус режима.
 - "pantry": что сейчас есть в холодильнике/кладовке дома.
 - "advice": запрос совета по текущей ситуации ("что мне сейчас делать", "дай совет").
+- "meal_check": пользователь только ДУМАЕТ / ПЛАНИРУЕТ / СПРАШИВАЕТ, стоит ли съесть или выпить конкретное блюдо/напиток ("думаю съесть мороженое", "хочу заказать шаурму, норм?", "можно мне сейчас латте с круассаном?"). В "query_term" верни чистое название блюда/напитка (НЕ создавай meal_log!).
+- "kbju": вопрос об остатке калорий, белка или балансе КБЖУ за сегодня ("сколько калорий осталось", "что мне добрать по белку", "мой кбжу").
 
 Допустимые типы элементов (kind):
 - "task": конкретное дело/задача с явным намерением сделать.
@@ -164,20 +181,23 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "shopping": что нужно купить или что закончилось дома.
 - "shopping_remove": убрать товар из списка покупок ("гречка нашлась, убери из покупок" -> title="Гречка").
 - "pantry_add": купленный или имеющийся дома продукт в холодильник ("купил тофу" -> title="Тофу"). Не используй для будущих покупок ("надо купить") или трат с суммой.
-- "pantry_remove": продукт съели/доели/просят убрать из холодильника ("съел огурцы", "убери молоко из холодильника" -> title="Огурцы").
-- "pulse_log": отметка режима Пульса дня (category: "wake"|"lunch"|"dinner"|"water"|"teeth"|"bedtime", например "я поел" -> category="lunch", "выпил воды" -> category="water", "почистил зубы" -> category="teeth", "ложусь спать/убрал телефон" -> category="bedtime").
+- "pantry_remove": явная просьба убрать/вычеркнуть/выкинуть продукт из холодильника ("убери молоко из холодильника" -> title="Молоко"). Для съеденных блюд используй meal_log!
+- "meal_log": пользователь сообщает, что КОНКРЕТНО съел, выпил или поел на приём пищи ("съел овсянку с бананом", "выпил капучино на овсяном в Surf Coffee", "на обед был борщ", "позавтракал сырниками"). В title укажи полное описание еды с граммами/местом.
+- "weight_log": замеры веса или умных весов ("взвесился 84.8, жир 22.1, мышцы 61").
+- "workout_log": выполненная тренировка/активность ("сделал 15 минут с гантелями", "пробежал 20 мин", "позанимался на турнике").
+- "pulse_log": только голая отметка Пульса БЕЗ конкретного блюда/названия еды (category: "wake"|"lunch"|"dinner"|"water"|"teeth"|"bedtime", например "я поел", "уже пообедал", "выпил воды", "почистил зубы", "ложусь спать"). Если сказано "съел овсянку и выпил воды" -> верни ОДНОВРЕМЕННО meal_log ("овсянка") и pulse_log (category="water").
 - "rollover_tasks": перенести незавершённые дела/хвосты дня на завтра ("перенеси хвосты на завтра").
 - "shift_bedtime": перенести время отбоя сегодня на час HH:MM (time_hint="HH:MM", например "ложусь в 00:30").
 - "expense": денежная трата ("потратил 450 на кофе" -> amount=450, category="кофе", title="Кофе").
 - "diary": мысли, переживания, усталость, самочувствие, события дня без поручения.
 - "idea": задумки, мечты, "хочу когда-нибудь...", проекты на будущее.
-- "done": то, что пользователь уже сделал.
+- "done": то, что пользователь уже сделал (кроме тренировок workout_log и еды meal_log).
 
 Строгие правила:
 1. Приветствия / "спасибо" / "ок" -> intent="chat", items=[], query_type="none", тёплый короткий reply (1-2 предложения по-русски в женском роде).
-2. Вопросы о плане на сегодня / списке покупок / что приготовить / карме / холодильнике / совете / заметках -> intent="query", соответствующий query_type (и query_term для diary), items=[] (НЕ создавай пустую запись в дневнике!).
+2. Вопросы о плане на сегодня / списке покупок / что приготовить / карме / холодильнике / совете / заметках / КБЖУ / примерке еды ("думаю съесть...") -> intent="query", соответствующий query_type (и query_term), items=[] (НЕ создавай пустую запись в дневнике или meal_log!).
 3. Тревога / бессонница / усталость без явной задачи или напоминания -> intent="support", практичный и тёплый/деловой reply с учётом «Снимка дня» И один элемент kind="diary".
-4. Если передан «Снимок дня пользователя» (время, карма, отбой, задачи, холодильник, диета), строго соблюдай директиву тона режима кармы и не выдумывай отсутствующие факты.
+4. Если передан «Снимок дня пользователя» (время, карма, отбой, задачи, холодильник, диета, цель и остаток КБЖУ), строго соблюдай директиву тона и стиля коуча и не выдумывай отсутствующие факты.
 5. Чистые мечты и задумки ("хочу когда-нибудь...") -> только kind="idea", НИКОГДА "task" или "reminder".
 6. Сохраняй "source_quote" дословным фрагментом исходного текста. В "model_note" пиши только пометку-гипотезу, не выдумывай факты.
 7. Для "shopping", "shopping_remove", "pantry_add", "pantry_remove" в "title" пиши чистое название товара (например "Гречка", "Овсяное молоко", "Тофу").
@@ -187,11 +207,11 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 {
   "intent": "capture|query|chat|support",
   "reply": "короткий ответ 1-2 предложения (для chat/support или пустого)",
-  "query_type": "none|today|calendar|shopping|food|diary|karma|pantry|advice",
+  "query_type": "none|today|calendar|shopping|food|diary|karma|pantry|advice|meal_check|kbju",
   "query_term": "",
   "items": [
     {
-      "kind": "task|reminder|calendar_event|shopping|shopping_remove|pantry_add|pantry_remove|pulse_log|rollover_tasks|shift_bedtime|expense|diary|idea|done",
+      "kind": "task|reminder|calendar_event|shopping|shopping_remove|pantry_add|pantry_remove|meal_log|weight_log|workout_log|pulse_log|rollover_tasks|shift_bedtime|expense|diary|idea|done",
       "title": "...",
       "source_quote": "...",
       "model_note": "",
@@ -644,8 +664,28 @@ _SHIFT_BEDTIME_RE = re.compile(
 )
 
 _PANTRY_REMOVE_RE = re.compile(
-    r"(?iu)(?:^(?:я\s+|мы\s+|уже\s+)?(?:съел[аи]?|доел[аи]?|выпил[аи]?)\s+(?!вод\w*\b)(.+)|"
-    r"(?:убер[иь]|удал[иь]|убрать|удалить|вычеркн[иь])\s+(.+?)\s+из\s+(?:холодильник\w*|кладовк\w*))"
+    r"(?iu)(?:^(?:я\s+|мы\s+|уже\s+)?(?:съел[аи]?|доел[аи]?)\s+([а-яёa-z-]+)$|"
+    r"(?:убер[иь]|удал[иь]|убрать|удалить|вычеркн[иь]|выкинул[аи]?)\s+(.+?)\s+из\s+(?:холодильник\w*|кладовк\w*))"
+)
+
+_WEIGHT_LOG_RE = re.compile(
+    r"(?iu)(?:^(?:я\s+|сегодня\s+|утром\s+)?(?:взвесил(?:ся|ась|ись)?|мой\s+вес|вес(?:\s+(?:сейчас|сегодня|стал))?)\s*[:=-]?\s*\d{2,3}(?:[.,]\d+)?\b|"
+    r"\b\d{2,3}(?:[.,]\d+)?\s*кг\b.*\bжир\b|\bжир\s+\d+(?:[.,]\d+)?\s*%)"
+)
+
+_WORKOUT_LOG_RE = re.compile(
+    r"(?iu)(?:^(?:я\s+|уже\s+|сегодня\s+)?(?:сделал[аи]?|пробежал[аи]?|отжал(?:ся|ась|ись)|подтянул(?:ся|ась|ись)|"
+    r"позанимал(?:ся|ась|ись)|потренировал(?:ся|ась|ись)|поприседал[аи]?|прош(?:ёл|ла)|проехал[аи]?)\b.*"
+    r"(?:\b\d+\s*(?:мин\w*|м|ч|час\w*|км|раз)\b.*\b(?:гантел\w*|турник\w*|резинк\w*|коврик\w*|дорожк\w*|вело\w*|эллипс\w*|тренировк\w*|присед\w*|отжиман\w*|подтягиван\w*|бег|планк\w*)\b|"
+    r"\b(?:гантел\w*|турник\w*|резинк\w*|коврик\w*|дорожк\w*|вело\w*|эллипс\w*|тренировк\w*|отжиман\w*|подтягиван\w*|планк\w*)\b)|"
+    r"\bтренировк[ауе]\s+(?:сделана|выполнена|готова|закончил\w*)\b)"
+)
+
+_MEAL_LOG_EXPLICIT_RE = re.compile(
+    r"(?iu)(?:^(?:я\s+|только\s+что\s+|сегодня\s+|утром\s+|днём\s+|вечером\s+|на\s+(?:завтрак|обед|ужин|перекус)\s+)*"
+    r"(?:съел[аи]?|доел[аи]?|перекусил[аи]?|позавтракал[аи]?|пообедал[аи]?|поужинал[аи]?|поел[аи]?)\s+(.+)|"
+    r"^(?:я\s+|сегодня\s+|утром\s+|только\s+что\s+)*выпил[аи]?\s+(?!вод[ауы]?\b)(.+)|"
+    r"^на\s+(?:завтрак|обед|ужин|перекус)\s+(?:был[аои]?|ел[аи]?|съел[аи]?)\s+(.+))"
 )
 
 _PANTRY_ADD_RE = re.compile(
@@ -658,9 +698,19 @@ _PULSE_NEG_RE = re.compile(r"(?iu)\bне\s+(?:поел|пообедал|поуж
 _PULSE_LOG_RULES = (
     (re.compile(r"(?iu)\b(?:убрал[аи]?\s+(?:телефон|мобил\w*)|ложусь(?:\s+спать)?|иду\s+спать)\b"), "bedtime", "Отбой"),
     (re.compile(r"(?iu)\bпочистил[аи]?\s+зуб\w*\b"), "teeth", "Чистка зубов"),
-    (re.compile(r"(?iu)\b(?:выпил[аи]?|попил[аи]?)\s+вод\w*\b"), "water", "Стакан воды"),
-    (re.compile(r"(?iu)\b(?:я\s+|уже\s+)?поужинал[аи]?\b"), "dinner", "Ужин"),
-    (re.compile(r"(?iu)\b(?:(?:я\s+|уже\s+)?(?:пообедал[аи]?|поел[аи]?|позавтракал[аи]?))\b"), "lunch", "Приём пищи"),
+    (re.compile(r"(?iu)\b(?:выпил[аи]?|попил[аи]?)\s+(?:стакан\s+)?вод\w*\b"), "water", "Стакан воды"),
+    (
+        re.compile(r"(?iu)^(?:я\s+|уже\s+|сегодня\s+|только\s+что\s+)*поужинал[аи]?(?:\s+(?:дома|хорошо|вкусно|плотно|уже))?$"),
+        "dinner",
+        "Ужин",
+    ),
+    (
+        re.compile(
+            r"(?iu)^(?:я\s+|уже\s+|сегодня\s+|только\s+что\s+)*(?:пообедал[аи]?|поел[аи]?|позавтракал[аи]?)(?:\s+(?:дома|хорошо|вкусно|плотно|уже))?$"
+        ),
+        "lunch",
+        "Приём пищи",
+    ),
     (re.compile(r"(?iu)^(?:я\s+)?(?:встал[аи]?|проснул(?:ся|ась))\b"), "wake", "Подъём"),
 )
 
@@ -840,7 +890,7 @@ def _split_clauses(raw_text: str) -> list[str]:
     text = (raw_text or "").strip()
     if not text:
         return []
-    primary = re.split(r"[.!?\n;]+", text)
+    primary = re.split(r"(?<!\d)\.(?!\d)|[!?\n;]+", text)
     clauses: list[str] = []
     for chunk in primary:
         piece = chunk.strip(" ,")
@@ -1106,6 +1156,18 @@ def parse_inbox_fallback(
                     title=_capitalize_first(clause),
                     source_quote=clause,
                 )
+        elif _WORKOUT_LOG_RE.search(clause):
+            item = ParsedInboxItem(
+                kind="workout_log",
+                title=_capitalize_first(clause),
+                source_quote=clause,
+            )
+        elif _WEIGHT_LOG_RE.search(clause):
+            item = ParsedInboxItem(
+                kind="weight_log",
+                title=_capitalize_first(clause),
+                source_quote=clause,
+            )
         elif _SHOPPING_TRIGGER_RE.search(clause):
             qty, unit = _extract_shopping_qty_unit(clause)
             item = ParsedInboxItem(
@@ -1135,6 +1197,12 @@ def parse_inbox_fallback(
                 continue
             item = ParsedInboxItem(
                 kind="diary",
+                title=_capitalize_first(clause),
+                source_quote=clause,
+            )
+        elif _MEAL_LOG_EXPLICIT_RE.search(clause):
+            item = ParsedInboxItem(
+                kind="meal_log",
                 title=_capitalize_first(clause),
                 source_quote=clause,
             )
@@ -1275,6 +1343,41 @@ _QUERY_ADVICE_RE = re.compile(
     r"что\s+мне\s+(?:сейчас\s+)?делать|не\s+знаю,?\s+(?:за\s+что\s+взяться|что\s+делать))\b"
 )
 
+_QUERY_KBJU_RE = re.compile(
+    r"(?iu)^(?:а\s+)?(?:покажи\s+|подскажи\s+|скажи\s+|глянь\s+)?"
+    r"(?:сколько\s+(?:у\s+меня\s+)?(?:осталось\s+)?(?:калорий|ккал|кбжу|белка|жиров|углеводов)(?:\s+осталось|\s+на\s+сегодня|\s+добрать)?|"
+    r"(?:что\s+)?(?:мне\s+)?(?:можно\s+)?(?:добрать|поесть)\s+по\s+(?:кбжу|белку|калориям)|"
+    r"(?:мой|мои)\s+(?:кбжу|калории)(?:\s+на\s+сегодня)?)\b"
+)
+
+_QUERY_MEAL_CHECK_THINK_RE = re.compile(
+    r"(?iu)^(?:я\s+|а\s+)?(?:думаю|хочу|собираюсь|планирую)\s+"
+    r"(?:сейчас\s+|вечером\s+|на\s+ночь\s+|на\s+ужин\s+|на\s+обед\s+)?"
+    r"(?:съесть|выпить|заказать|взять(?:\s+поесть)?)\s+(.+)"
+)
+
+_QUERY_MEAL_CHECK_ASK_RE = re.compile(
+    r"(?iu)^(?:а\s+)?(?:можно|стоит|норм|нормально|влезет|впишется)(?:\s+ли)?(?:\s+мне)?(?:\s+сейчас|\s+на\s+ночь|\s+на\s+ужин)?\s+"
+    r"(?:съесть|выпить|заказать|взять)\s+(.+)"
+)
+
+
+def _extract_meal_check_candidate(raw: str) -> Optional[str]:
+    txt = (raw or "").strip()
+    if not txt or _IDEA_GUARDRAIL_RE.search(txt):
+        return None
+    for pat in (_QUERY_MEAL_CHECK_THINK_RE, _QUERY_MEAL_CHECK_ASK_RE):
+        m = pat.search(txt)
+        if m:
+            cand = re.sub(
+                r"(?iu)(?:,?\s*(?:как\s+думаешь|стоит\s*(?:ли)?|норм\w*|можно\s*(?:ли)?|влезет\s*(?:ли)?|впишется\s*(?:ли)?|\?)+)+$",
+                "",
+                m.group(1),
+            ).strip(" ,.?!\"'«»")
+            if cand and len(cand) >= 2:
+                return cand
+    return None
+
 _MORE_FOLLOWUP_RE = re.compile(
     r"(?iu)^(?:а\s+ещ[её]|ещ[её](?:\s+вариант\w*|\s+совет\w*)?|что\s+ещ[её]|"
     r"други[ех]\s+вариант\w*|другое|другой\s+совет|дальше|а\s+что\s+ещ[её]|"
@@ -1373,6 +1476,11 @@ def _try_deterministic_intent(
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="karma")
     if _QUERY_PANTRY_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="pantry")
+    meal_cand = _extract_meal_check_candidate(raw)
+    if meal_cand:
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="meal_check", query_term=meal_cand)
+    if _QUERY_KBJU_RE.search(raw):
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="kbju")
     if _QUERY_ADVICE_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="advice", query_term=raw)
     if _QUERY_SHOPPING_RE.search(raw):
@@ -1443,7 +1551,15 @@ _KIND_ALIASES = {
     "холодильник": "pantry_add",
     "кладовка": "pantry_add",
     "убрать из холодильника": "pantry_remove",
-    "съел": "pantry_remove",
+    "съел": "meal_log",
+    "еда": "meal_log",
+    "кбжу": "meal_log",
+    "приём пищи": "meal_log",
+    "вес": "weight_log",
+    "весы": "weight_log",
+    "взвешивание": "weight_log",
+    "тренировка": "workout_log",
+    "спорт": "workout_log",
     "пульс": "pulse_log",
     "режим": "pulse_log",
     "перенос хвостов": "rollover_tasks",
@@ -1521,6 +1637,12 @@ _QUERY_TYPE_ALIASES = {
     "advice": "advice",
     "совет": "advice",
     "что делать": "advice",
+    "meal_check": "meal_check",
+    "примерка": "meal_check",
+    "стоит ли есть": "meal_check",
+    "kbju": "kbju",
+    "кбжу": "kbju",
+    "калории": "kbju",
 }
 
 
@@ -1674,6 +1796,16 @@ async def analyze_inbox_text(
             )
             if query_type != "none" and intent == "capture" and not items:
                 intent = "query"
+            # Защита: вопрос "думаю/хочу съесть ..." никогда не должен молча логироваться как meal_log
+            if (
+                len(_split_clauses(clean_text)) <= 1
+                and (_check_cand := _extract_meal_check_candidate(clean_text)) is not None
+                and all(it.kind in {"meal_log", "pantry_remove", "diary"} for it in items)
+            ):
+                intent = "query"
+                query_type = "meal_check"
+                query_term = _check_cand
+                items = []
             if intent != "capture" or items or reply or query_type != "none":
                 return InboxParseResult(
                     items=items,

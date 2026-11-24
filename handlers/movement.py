@@ -141,9 +141,12 @@ async def _render_body_card(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboa
             [InlineKeyboardButton(text="⚙️ Анкета тела и цель", callback_data="fit:profile_setup")],
             [
                 InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
-                InlineKeyboardButton(text="🧰 Инвентарь", callback_data="fit:gear"),
+                InlineKeyboardButton(text="🎯 Цель и коуч", callback_data="fit:coach_menu"),
             ],
-            [InlineKeyboardButton(text="⬅️ Спорт", callback_data="fit:menu")],
+            [
+                InlineKeyboardButton(text="🧰 Инвентарь", callback_data="fit:gear"),
+                InlineKeyboardButton(text="⬅️ Спорт", callback_data="fit:menu"),
+            ],
         ]
     )
     return "\n".join(lines), kb
@@ -357,6 +360,110 @@ async def fit_menu_cb(callback: types.CallbackQuery, state: FSMContext) -> None:
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+def _render_coach_menu(user: Dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
+    goal = str(user.get("weight_goal") or "loss").strip().lower()
+    if goal == "maintain":
+        goal = "keep"
+    coach = str(user.get("coach_mode") or "balanced").strip().lower()
+    if coach not in fitness_nutrition.COACH_MODES:
+        coach = "balanced"
+    checkin_on = bool(int(user.get("nutrition_checkin_enabled", 1)))
+
+    c_emoji, c_label, c_desc = fitness_nutrition.COACH_MODES[coach]
+    g_label = fitness_nutrition.GOAL_LABELS.get(goal, fitness_nutrition.GOAL_LABELS["loss"])
+
+    lines = [
+        "🎯 <b>Цель и стиль коуча HiDL</b>\n",
+        f"• Сейчас цель: <b>{_h(g_label)}</b>",
+        f"• Стиль общения: <b>{c_emoji} {_h(c_label)}</b>",
+        f"  <i>{_h(c_desc)}</i>",
+        f"• Вечерний разбор дня: <b>{'Вкл 🌙' if checkin_on else 'Выкл'}</b>",
+    ]
+    goal_items = [
+        ("loss", "🔥 Сброс"),
+        ("recomp", "💪 Рекомпозиция"),
+        ("keep", "⚖ Баланс"),
+        ("gain", "📈 Набор"),
+        ("mindful", "🧘 Без цифр"),
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    g_btns = [
+        InlineKeyboardButton(
+            text=("✅ " if k == goal else "") + lbl,
+            callback_data=f"fit:set_goal:{k}",
+        )
+        for k, lbl in goal_items
+    ]
+    for i in range(0, len(g_btns), 2):
+        rows.append(g_btns[i : i + 2])
+
+    c_btns = [
+        InlineKeyboardButton(
+            text=("✅ " if k == coach else "") + f"{em} {lbl.split()[0]}",
+            callback_data=f"fit:set_coach:{k}",
+        )
+        for k, (em, lbl, _) in fitness_nutrition.COACH_MODES.items()
+    ]
+    rows.append(c_btns)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"🌙 Вечерний разбор: {'Вкл' if checkin_on else 'Выкл'}",
+                callback_data="fit:toggle_checkin",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+            InlineKeyboardButton(text="⬅️ Спорт", callback_data="fit:menu"),
+        ]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(lambda c: c.data == "fit:coach_menu")
+async def fit_coach_menu_cb(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+    await state.clear()
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    text, kb = _render_coach_menu(user)
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("fit:set_goal:"))
+async def fit_set_goal_cb(callback: types.CallbackQuery, db) -> None:
+    goal = (callback.data or "").split(":")[2] if len((callback.data or "").split(":")) > 2 else "loss"
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    await repo.update_user_coach_settings(db, int(user["id"]), weight_goal=goal)
+    fresh = dict(await repo.get_user(db, int(user["id"])))
+    text, kb = _render_coach_menu(fresh)
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Цель обновлена ✅")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("fit:set_coach:"))
+async def fit_set_coach_cb(callback: types.CallbackQuery, db) -> None:
+    coach = (callback.data or "").split(":")[2] if len((callback.data or "").split(":")) > 2 else "balanced"
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    await repo.update_user_coach_settings(db, int(user["id"]), coach_mode=coach)
+    fresh = dict(await repo.get_user(db, int(user["id"])))
+    text, kb = _render_coach_menu(fresh)
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Стиль коуча обновлён ✅")
+
+
+@router.callback_query(lambda c: c.data == "fit:toggle_checkin")
+async def fit_toggle_checkin_cb(callback: types.CallbackQuery, db) -> None:
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    cur_on = bool(int(user.get("nutrition_checkin_enabled", 1)))
+    await repo.update_user_coach_settings(db, int(user["id"]), nutrition_checkin_enabled=not cur_on)
+    fresh = dict(await repo.get_user(db, int(user["id"])))
+    text, kb = _render_coach_menu(fresh)
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Настройка разбора обновлена")
 
 
 @router.callback_query(lambda c: c.data == "fit:body")

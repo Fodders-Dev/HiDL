@@ -461,6 +461,108 @@ class LLMClient:
             usage=res.usage,
         )
 
+    async def search_web_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_tokens: Optional[int] = None,
+        timeout_sec: Optional[float] = None,
+    ) -> LLMResult:
+        """Выполнить запрос с веб-поиском через OpenAI Responses API (/responses) и извлечь JSON."""
+        enabled, routes, default_timeout, default_tokens = self._resolve_routes()
+        if not enabled or not routes:
+            return LLMResult(ok=False, error="llm_not_configured")
+
+        openai_route = next(
+            (r for r in routes if (r.provider or "").lower() == "openai" and r.is_ready),
+            None,
+        )
+        if openai_route is None:
+            return LLMResult(ok=False, error="web_search_requires_openai_route")
+
+        url = f"{openai_route.base_url.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {openai_route.api_key}",
+            "Content-Type": "application/json",
+        }
+        body: dict[str, Any] = {
+            "model": openai_route.model,
+            "tools": [{"type": "web_search"}],
+            "instructions": system_prompt,
+            "input": user_prompt,
+            "max_output_tokens": max(250, int(max_tokens or default_tokens or 600)),
+            "store": False,
+        }
+        timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec or max(14.0, default_timeout))))
+        request_options: dict[str, Any] = (
+            {"proxy": openai_route.proxy_url} if openai_route.proxy_url else {}
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=body, **request_options) as resp:
+                    status = resp.status
+                    try:
+                        payload = await resp.json(content_type=None)
+                    except Exception:
+                        payload = None
+                    if status != 200 or not isinstance(payload, dict):
+                        return LLMResult(
+                            ok=False,
+                            provider=openai_route.provider,
+                            model=openai_route.model,
+                            error=f"http_{status}",
+                        )
+        except asyncio.TimeoutError:
+            return LLMResult(
+                ok=False,
+                provider=openai_route.provider,
+                model=openai_route.model,
+                error="timeout",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return LLMResult(
+                ok=False,
+                provider=openai_route.provider,
+                model=openai_route.model,
+                error=exc.__class__.__name__,
+            )
+
+        out_txt = str(payload.get("output_text") or "").strip()
+        citations: list[str] = []
+        for item in payload.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if not out_txt and part.get("text"):
+                    out_txt += str(part.get("text") or "")
+                for ann in part.get("annotations") or []:
+                    if isinstance(ann, dict) and ann.get("type") == "url_citation":
+                        u = str(ann.get("url") or "").strip()
+                        if u and u not in citations and len(citations) < 3:
+                            citations.append(u)
+        out_txt = out_txt.strip()
+        parsed = extract_json_object(out_txt)
+        if parsed is None:
+            return LLMResult(
+                ok=False,
+                text=out_txt,
+                provider=openai_route.provider,
+                model=openai_route.model,
+                error="invalid_json",
+            )
+        if citations and "_citations" not in parsed:
+            parsed["_citations"] = citations
+        return LLMResult(
+            ok=True,
+            text=out_txt,
+            data=parsed,
+            provider=openai_route.provider,
+            model=openai_route.model,
+        )
+
     async def ask(self, prompt: str, user_context: Optional[str] = None) -> str:
         """Backward-compatible helper for short conversational replies."""
         if not self.is_configured():
