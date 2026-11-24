@@ -414,8 +414,11 @@ async def kbju_pending_commit_cb(callback: types.CallbackQuery, state: FSMContex
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✏️ Уточнить", callback_data=f"kbju:refine:{res['meal_id']}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"kbju:del:{res['meal_id']}"),
+            ],
+            [
                 InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
-            ]
+            ],
         ]
     )
     await safe_edit(

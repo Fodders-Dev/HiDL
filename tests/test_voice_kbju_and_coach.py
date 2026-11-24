@@ -544,6 +544,93 @@ class VoiceKbjuAndCoachTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reasoning", recorded_bodies[0])
         self.assertNotIn("reasoning", recorded_bodies[1])
 
+    async def test_8_live_qa_polish_regressions(self) -> None:
+        now = datetime.datetime(2026, 11, 24, 12, 0)
+        # a) "поел суп" misclassified as pulse_log by LLM must be guarded to meal_log; bare "я поел" stays pulse_log
+        item_soup = inbox_parser._apply_guardrails(
+            inbox_parser.ParsedInboxItem(
+                kind="pulse_log", title="Обед", source_quote="поел суп", category="lunch"
+            ),
+            now_utc=now,
+            tz_str="Europe/Moscow",
+        )
+        self.assertEqual(item_soup.kind, "meal_log")
+        self.assertEqual(item_soup.title, "Поел суп")
+
+        item_bare = inbox_parser._apply_guardrails(
+            inbox_parser.ParsedInboxItem(
+                kind="pulse_log", title="Обед", source_quote="я поел", category="lunch"
+            ),
+            now_utc=now,
+            tz_str="Europe/Moscow",
+        )
+        self.assertEqual(item_bare.kind, "pulse_log")
+
+        # b) meal_check has "❌ Не буду" (kbju:pdrop:*) and drops cleanly
+        o_chk = await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=40, text="думаю съесть мороженое, можно?", now_utc=now
+        )
+        chk_cbs = [btn.callback_data for row in o_chk.reply_markup.inline_keyboard for btn in row]
+        drop_cb = next(c for c in chk_cbs if c.startswith("kbju:pdrop:"))
+        cb_drop = SimpleNamespace(
+            data=drop_cb,
+            from_user=SimpleNamespace(id=940001, full_name="Дима"),
+            message=SimpleNamespace(edit_text=AsyncMock(), answer=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await nutrition.kbju_pending_drop_cb(cb_drop, self._fsm(), self.db)
+        self.assertIsNone(await repo.get_active_pending_meal(self.db, self.u_id))
+
+        # c) lazy accept ("похуй"), clarification ("300 мл с курицей"), and pcommit include kbju:del:<id>
+        await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=41, text="поел блины", now_utc=now
+        )
+        o_lazy = await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=42, text="похуй", now_utc=now
+        )
+        lazy_cbs = [btn.callback_data for row in o_lazy.reply_markup.inline_keyboard for btn in row]
+        self.assertTrue(any(c.startswith("kbju:del:") for c in lazy_cbs), lazy_cbs)
+
+        await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=43, text="поел суп", now_utc=now
+        )
+        o_clar = await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=44, text="300 мл с курицей", now_utc=now
+        )
+        clar_cbs = [btn.callback_data for row in o_clar.reply_markup.inline_keyboard for btn in row]
+        self.assertTrue(any(c.startswith("kbju:del:") for c in clar_cbs), clar_cbs)
+
+        o_v = await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=45, text="съел пирог", now_utc=now
+        )
+        v_cbs = [btn.callback_data for row in o_v.reply_markup.inline_keyboard for btn in row]
+        pcommit_cb = next(c for c in v_cbs if c.startswith("kbju:pcommit:") and c.endswith(":1"))
+        cb_pcommit = SimpleNamespace(
+            data=pcommit_cb,
+            from_user=SimpleNamespace(id=940001, full_name="Дима"),
+            message=SimpleNamespace(edit_text=AsyncMock(), answer=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await nutrition.kbju_pending_commit_cb(cb_pcommit, self._fsm(), self.db)
+        rm = cb_pcommit.message.edit_text.call_args.kwargs["reply_markup"]
+        pcommit_cbs = [btn.callback_data for row in rm.inline_keyboard for btn in row]
+        self.assertTrue(any(c.startswith("kbju:del:") for c in pcommit_cbs), pcommit_cbs)
+
+        # d) Undoing workout_log rolls back karma score AND points_total
+        karma_before = int((await repo.get_or_create_karma_state(self.db, self.u_id)).get("score") or 70)
+        u_before = dict(await repo.get_user(self.db, self.u_id))
+        pts_before = int(u_before.get("points_total") or 0)
+        o_w = await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=46, text="сделал 15 минут с гантелями", now_utc=now
+        )
+        karma_mid = int((await repo.get_or_create_karma_state(self.db, self.u_id)).get("score") or 70)
+        self.assertGreater(karma_mid, karma_before)
+        await inbox_service.undo_inbox_message(self.db, self.user, o_w.inbox_id)
+        karma_after = int((await repo.get_or_create_karma_state(self.db, self.u_id)).get("score") or 70)
+        u_after = dict(await repo.get_user(self.db, self.u_id))
+        self.assertEqual(karma_after, karma_before)
+        self.assertEqual(int(u_after.get("points_total") or 0), pts_before)
+
 
 if __name__ == "__main__":
     unittest.main()

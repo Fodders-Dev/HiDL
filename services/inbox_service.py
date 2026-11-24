@@ -952,6 +952,8 @@ async def _persist_parsed_items(
                     "duration_min": w_res["duration_min"],
                     "kcal_burned": w_res["kcal_burned"],
                     "karma_delta": w_res["karma_delta"],
+                    "points_delta": 3 if dur_min <= 6 else 5,
+                    "local_date": local_date,
                 },
                 status="active",
             )
@@ -1862,8 +1864,11 @@ async def _build_query_response(
                     InlineKeyboardButton(text="🍽 Полпорции", callback_data=f"kbju:pcommit:{pid}:0.5"),
                 ],
                 [
-                    InlineKeyboardButton(text="🧊 Что из холодильника?", callback_data="kitchen:quick_pick"),
+                    InlineKeyboardButton(text="❌ Не буду", callback_data=f"kbju:pdrop:{pid}"),
                     InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                ],
+                [
+                    InlineKeyboardButton(text="🧊 Что из холодильника?", callback_data="kitchen:quick_pick"),
                 ],
             ]
         )
@@ -1922,8 +1927,11 @@ async def _analyze_and_persist(
                     inline_keyboard=[
                         [
                             InlineKeyboardButton(text="✏️ Уточнить", callback_data=f"kbju:refine:{committed['meal_id']}"),
+                            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"kbju:del:{committed['meal_id']}"),
+                        ],
+                        [
                             InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
-                        ]
+                        ],
                     ]
                 )
                 return InboxProcessOutcome(
@@ -1974,8 +1982,11 @@ async def _analyze_and_persist(
                     inline_keyboard=[
                         [
                             InlineKeyboardButton(text="✏️ Поправить", callback_data=f"kbju:refine:{committed['meal_id']}"),
+                            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"kbju:del:{committed['meal_id']}"),
+                        ],
+                        [
                             InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
-                        ]
+                        ],
                     ]
                 )
                 return InboxProcessOutcome(
@@ -2407,7 +2418,25 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
     elif table == "weights":
         await repo.delete_weight_entry(db, user_id, tid_int)
     elif table == "workout_logs":
-        await repo.delete_workout_log(db, user_id, tid_int)
+        deleted_w = await repo.delete_workout_log(db, user_id, tid_int)
+        if deleted_w:
+            k_delta = int(payload.get("karma_delta") or 0)
+            p_delta = int(payload.get("points_delta") or 0)
+            if k_delta > 0:
+                k_state = await repo.get_or_create_karma_state(db, user_id)
+                old_score = int(k_state.get("score") if k_state.get("score") is not None else 70)
+                await repo.update_karma_state(
+                    db,
+                    user_id,
+                    score=max(0, old_score - k_delta),
+                )
+            if p_delta > 0:
+                await repo.add_points(
+                    db,
+                    user_id,
+                    -p_delta,
+                    local_date=str(payload.get("local_date") or "") or None,
+                )
     elif table == "pending_meal_clarifications":
         await repo.resolve_pending_meal(db, tid_int, status="cancelled")
 

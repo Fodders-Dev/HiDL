@@ -182,7 +182,7 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "shopping_remove": убрать товар из списка покупок ("гречка нашлась, убери из покупок" -> title="Гречка").
 - "pantry_add": купленный или имеющийся дома продукт в холодильник ("купил тофу" -> title="Тофу"). Не используй для будущих покупок ("надо купить") или трат с суммой.
 - "pantry_remove": явная просьба убрать/вычеркнуть/выкинуть продукт из холодильника ("убери молоко из холодильника" -> title="Молоко"). Для съеденных блюд используй meal_log!
-- "meal_log": пользователь сообщает, что КОНКРЕТНО съел, выпил или поел на приём пищи ("съел овсянку с бананом", "выпил капучино на овсяном в Surf Coffee", "на обед был борщ", "позавтракал сырниками"). В title укажи полное описание еды с граммами/местом.
+- "meal_log": пользователь сообщает, что КОНКРЕТНО съел, выпил или поел на приём пищи ("поел суп", "съел овсянку с бананом", "выпил капучино на овсяном в Surf Coffee", "на обед был борщ", "пообедал борщом", "позавтракал сырниками"). В title укажи полное описание еды с граммами/местом.
 - "weight_log": замеры веса или умных весов ("взвесился 84.8, жир 22.1, мышцы 61").
 - "workout_log": выполненная тренировка/активность ("сделал 15 минут с гантелями", "пробежал 20 мин", "позанимался на турнике").
 - "pulse_log": только голая отметка Пульса БЕЗ конкретного блюда/названия еды (category: "wake"|"lunch"|"dinner"|"water"|"teeth"|"bedtime", например "я поел", "уже пообедал", "выпил воды", "почистил зубы", "ложусь спать"). Если сказано "съел овсянку и выпил воды" -> верни ОДНОВРЕМЕННО meal_log ("овсянка") и pulse_log (category="water").
@@ -996,15 +996,21 @@ def _apply_guardrails(
     elif kind in {"pantry_add", "pantry_remove"}:
         item.title = _capitalize_first(_nominative_shopping_phrase(item.title or quote))
     elif kind == "pulse_log":
-        slot = (item.category or "").strip().lower()
-        if slot not in {"wake", "lunch", "dinner", "water", "teeth", "bedtime"}:
-            slot = "lunch"
-            for pat, slot_key, _ in _PULSE_LOG_RULES:
-                if pat.search(quote):
-                    slot = slot_key
-                    break
-        item.category = slot
-        item.title = _capitalize_first(item.title or quote)
+        is_bare_pulse = any(pat.search(quote) for pat, _, _ in _PULSE_LOG_RULES)
+        if not is_bare_pulse and _MEAL_LOG_EXPLICIT_RE.search(quote):
+            kind = "meal_log"
+            item.category = ""
+            item.title = _capitalize_first(quote)
+        else:
+            slot = (item.category or "").strip().lower()
+            if slot not in {"wake", "lunch", "dinner", "water", "teeth", "bedtime"}:
+                slot = "lunch"
+                for pat, slot_key, _ in _PULSE_LOG_RULES:
+                    if pat.search(quote):
+                        slot = slot_key
+                        break
+            item.category = slot
+            item.title = _capitalize_first(item.title or quote)
     elif kind == "shift_bedtime":
         hhmm = _extract_bedtime_hhmm(time_hint) or _extract_bedtime_hhmm(quote)
         item.schedule = ResolvedSchedule(
