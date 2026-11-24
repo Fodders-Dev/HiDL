@@ -537,6 +537,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             code_challenge_method TEXT NOT NULL,
             resource TEXT DEFAULT '',
             scope TEXT DEFAULT '',
+            user_id INTEGER,
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
@@ -548,15 +549,27 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             client_id TEXT NOT NULL,
             resource TEXT DEFAULT '',
             scope TEXT DEFAULT '',
+            user_id INTEGER,
             expires_at TEXT NOT NULL,
             revoked INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_user_connect_codes (
+            code_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_client_type
             ON mcp_oauth_tokens(client_id, token_type);
         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_expires
             ON mcp_oauth_codes(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_mcp_connect_codes_user
+            ON mcp_user_connect_codes(user_id, used, expires_at);
 
         CREATE TABLE IF NOT EXISTS user_karma_state (
             user_id INTEGER PRIMARY KEY,
@@ -1284,6 +1297,7 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             code_challenge_method TEXT NOT NULL,
             resource TEXT DEFAULT '',
             scope TEXT DEFAULT '',
+            user_id INTEGER,
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
@@ -1295,15 +1309,27 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             client_id TEXT NOT NULL,
             resource TEXT DEFAULT '',
             scope TEXT DEFAULT '',
+            user_id INTEGER,
             expires_at TEXT NOT NULL,
             revoked INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_user_connect_codes (
+            code_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_client_type
             ON mcp_oauth_tokens(client_id, token_type);
         CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_expires
             ON mcp_oauth_codes(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_mcp_connect_codes_user
+            ON mcp_user_connect_codes(user_id, used, expires_at);
 
         CREATE TABLE IF NOT EXISTS user_karma_state (
             user_id INTEGER PRIMARY KEY,
@@ -1507,6 +1533,12 @@ async def ensure_columns(conn: aiosqlite.Connection) -> None:
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );
         """
+    )
+
+    await add_column_if_missing("mcp_oauth_codes", "user_id", "INTEGER")
+    await add_column_if_missing("mcp_oauth_tokens", "user_id", "INTEGER")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_user_type ON mcp_oauth_tokens(user_id, token_type, revoked);"
     )
 
 

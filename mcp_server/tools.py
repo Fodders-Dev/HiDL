@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import html
 import json
 import math
 from pathlib import Path
@@ -12,7 +13,7 @@ import aiosqlite
 
 from config import MCPSettings
 from db import repositories as repo
-from services import calendar_service, context_builder, fitness_nutrition, karma_service, kitchen_ai, pulse_service
+from services import calendar_service, context_builder, fitness_nutrition, household_service, karma_service, kitchen_ai, pulse_service
 from services.inbox_parser import compute_one_time_last_sent
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_time_local, local_date_str, parse_hhmm
@@ -108,6 +109,19 @@ async def _resolve_owner_user(db: aiosqlite.Connection, settings: MCPSettings) -
     if not row:
         raise ToolError(f"Пользователь с telegram_id={settings.owner_telegram_id} не найден в БД.")
     return row_to_dict(row)
+
+
+async def _resolve_acting_user(
+    db: aiosqlite.Connection,
+    settings: MCPSettings,
+    user_id: Optional[int] = None,
+) -> dict[str, Any]:
+    if user_id is not None:
+        row = await repo.get_user(db, int(user_id))
+        if not row:
+            raise ToolError(f"Пользователь id={user_id} не найден в БД.")
+        return row_to_dict(row)
+    return await _resolve_owner_user(db, settings)
 
 
 def _item_url(settings: MCPSettings, kind: str, item_id: Any) -> str:
@@ -1341,6 +1355,254 @@ async def _tool_log_meal(
     }
 
 
+def _recipe_matches_category_mcp(recipe: dict[str, Any], category: str) -> bool:
+    cat = (category or "all").strip().lower()
+    if cat in {"", "all"}:
+        return True
+    if cat == "mine":
+        return bool(recipe.get("is_user_recipe"))
+    tags = {str(t).strip().lower() for t in (recipe.get("tags") or [])}
+    if cat == "fast":
+        return "fast" in tags or int(recipe.get("time_minutes") or 999) <= 15
+    if cat == "snack":
+        return "snack" in tags or "breakfast" in tags
+    return cat in tags
+
+
+async def _tool_get_household(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    _ = (settings, args)
+    now_utc = _now_utc_naive()
+    uid = int(user["id"])
+    tz = str(user.get("timezone") or "UTC")
+    local_today = local_date_str(now_utc, tz)
+    ym = local_today[:7]
+
+    hid = await repo.get_or_create_household(db, uid)
+    house = await repo.get_household(db, hid) or {}
+    members = await repo.list_household_members(db, hid)
+    meal_profile = await kitchen_ai.get_user_meal_profile(db, uid)
+
+    open_requests = await repo.list_household_requests(
+        db, hid, kind="request", statuses=("open", "accepted", "snoozed"), limit=15
+    )
+    active_poll = await repo.get_latest_open_dinner_poll(db, hid, local_today)
+    due_tasks = await repo.list_regular_tasks(db, uid, due_only=True, local_date=local_today)
+    supplies = rows_to_dicts(await repo.list_supplies(db, uid))
+    low_supplies = [
+        {"id": int(s["id"]), "name": s.get("name") or "", "category": s.get("category") or "", "status": s.get("status") or "low"}
+        for s in supplies
+        if (s.get("status") or "full") in {"low", "empty"}
+    ]
+    monthly_exp = await repo.household_monthly_expenses_summary(db, hid, year_month=ym)
+
+    return {
+        "local_date": local_today,
+        "acting_user": {
+            "id": uid,
+            "name": user.get("name") or "",
+            "timezone": tz,
+            "meal_profile": meal_profile,
+        },
+        "household": {
+            "id": hid,
+            "name": house.get("name") or "Наш дом",
+            "settings": house.get("settings") or {},
+            "members": [
+                {
+                    "id": int(m["id"]),
+                    "name": m.get("name") or f"Участник {m['id']}",
+                    "is_self": int(m["id"]) == uid,
+                }
+                for m in members
+            ],
+        },
+        "open_requests": [
+            {
+                "id": int(r["id"]),
+                "from_name": r.get("from_name") or "",
+                "text": r.get("text") or "",
+                "status": r.get("status") or "open",
+                "response_note": r.get("response_note") or "",
+                "created_at": r.get("created_at") or "",
+            }
+            for r in open_requests
+        ],
+        "active_dinner_poll": active_poll,
+        "due_home_tasks": [
+            {
+                "id": int(t["id"]),
+                "title": t.get("title") or "",
+                "zone": t.get("zone") or "",
+                "next_due_date": t.get("next_due_date") or "",
+                "last_done_by_name": t.get("last_done_by_name") or "",
+            }
+            for t in due_tasks[:15]
+        ],
+        "low_supplies": low_supplies,
+        "monthly_household_expenses": monthly_exp,
+    }
+
+
+async def _tool_list_recipes(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    _ = settings
+    now_utc = _now_utc_naive()
+    uid = int(user["id"])
+    query = str(args.get("query") or "").strip().casefold().replace("ё", "е")
+    category = str(args.get("category") or "all").strip().lower() or "all"
+    almost_only = bool(args.get("almost_ready_only", False))
+    include_steps = bool(args.get("include_steps", False))
+    eff_limit = max(1, min(50, int(args.get("limit") or 15)))
+    profile = await kitchen_ai.get_user_meal_profile(db, uid)
+
+    def _matches_query(rec: dict[str, Any]) -> bool:
+        if not query:
+            return True
+        hay = " ".join(
+            [str(rec.get("title") or ""), str(rec.get("desc") or "")]
+            + [str(i.get("name") or "") for i in (rec.get("ingredients") or []) if isinstance(i, dict)]
+        ).casefold().replace("ё", "е")
+        return query in hay
+
+    out_items: list[dict[str, Any]] = []
+    if almost_only:
+        res = await kitchen_ai.suggest_almost_ready_recipes(
+            db, user, max_missing=2, limit=120, now_utc=now_utc
+        )
+        for item in res.get("suggestions") or []:
+            rec = item["recipe"]
+            if not _recipe_matches_category_mcp(rec, category) or not _matches_query(rec):
+                continue
+            entry = {
+                "id": str(rec.get("id") or ""),
+                "title": str(rec.get("title") or ""),
+                "desc": str(rec.get("desc") or ""),
+                "time_minutes": int(rec.get("time_minutes") or 0),
+                "base_servings": int(rec.get("base_servings") or 2),
+                "tags": list(rec.get("tags") or []),
+                "is_user_recipe": bool(rec.get("is_user_recipe")),
+                "coverage": round(float(item.get("coverage") or 0.0), 2),
+                "missing_count": len(item.get("missing") or []),
+                "missing": list(item.get("missing") or []),
+                "uses_expiring": list(item.get("uses_expiring") or []),
+                "nutrition": item.get("nutrition") or {},
+                "ingredients": list(rec.get("ingredients") or []),
+            }
+            if include_steps:
+                entry["steps"] = list(rec.get("steps") or [])
+            out_items.append(entry)
+        total_matched = len(out_items)
+        out_items = out_items[:eff_limit]
+    else:
+        pantry = rows_to_dicts(await repo.list_pantry_items(db, uid))
+        all_recs = await kitchen_ai.load_recipes_for_user(db, uid)
+        scored: list[dict[str, Any]] = []
+        for rec in all_recs:
+            if not kitchen_ai.recipe_allowed_for_profile(rec, profile):
+                continue
+            if not _recipe_matches_category_mcp(rec, category) or not _matches_query(rec):
+                continue
+            match = kitchen_ai.match_recipe_to_pantry(rec, pantry, servings=2)
+            nutr = fitness_nutrition.estimate_recipe_nutrition(rec)
+            entry = {
+                "id": str(rec.get("id") or ""),
+                "title": str(rec.get("title") or ""),
+                "desc": str(rec.get("desc") or ""),
+                "time_minutes": int(rec.get("time_minutes") or 0),
+                "base_servings": int(rec.get("base_servings") or 2),
+                "tags": list(rec.get("tags") or []),
+                "is_user_recipe": bool(rec.get("is_user_recipe")),
+                "coverage": round(float(match.get("coverage") or 0.0), 2),
+                "missing_count": len(match.get("missing") or []),
+                "missing": list(match.get("missing") or []),
+                "nutrition": nutr,
+                "ingredients": list(rec.get("ingredients") or []),
+            }
+            if include_steps:
+                entry["steps"] = list(rec.get("steps") or [])
+            scored.append(entry)
+        scored.sort(key=lambda r: (-float(r["coverage"]), int(r["missing_count"]), int(r["time_minutes"] or 999)))
+        total_matched = len(scored)
+        out_items = scored[:eff_limit]
+
+    return {
+        "meal_profile": profile,
+        "category": category,
+        "almost_ready_only": almost_only,
+        "total_matched": total_matched,
+        "recipes": out_items,
+    }
+
+
+async def _tool_nudge_partner(
+    db: aiosqlite.Connection,
+    user: dict[str, Any],
+    settings: MCPSettings,
+    args: dict[str, Any],
+    *,
+    telegram_bot: Any = None,
+) -> dict[str, Any]:
+    _ = settings
+    now_utc = _now_utc_naive()
+    uid = int(user["id"])
+    action = str(args.get("action") or "request").strip().lower()
+    actor_name = str(user.get("name") or "Партнёр").strip()
+    hid = await repo.get_or_create_household(db, uid)
+
+    if action == "care":
+        nudge_key = str(args.get("nudge_key") or "").strip().lower()
+        if nudge_key not in household_service.CARE_NUDGES:
+            raise ToolError(
+                "nudge_key должен быть одним из: thanks, water, break, hug."
+            )
+        res = await household_service.send_care_nudge(
+            telegram_bot, db, user, nudge_key, now_utc=now_utc
+        )
+        return {"action": "care", "nudge_key": nudge_key, **res}
+
+    if action == "request":
+        text = str(args.get("text") or "").strip()
+        if not text:
+            raise ToolError("Для action='request' обязателен непустой параметр text.")
+        if len(text) > 300:
+            text = text[:300]
+        created = await repo.create_household_request(
+            db,
+            hid,
+            uid,
+            actor_name,
+            text,
+            kind="request",
+            status="open",
+            now_utc=now_utc,
+        )
+        notify = await household_service.notify_household_partners_detailed(
+            telegram_bot,
+            db,
+            user,
+            f"💌 <b>{html.escape(actor_name)}</b> просит: {html.escape(text)}",
+            now_utc=now_utc,
+        )
+        return {
+            "ok": True,
+            "action": "request",
+            "request_id": int(created["id"]),
+            "text": text,
+            **notify,
+        }
+
+    raise ToolError("action должен быть 'request' или 'care'.")
+
+
 ToolHandler = Callable[[aiosqlite.Connection, dict[str, Any], MCPSettings, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 _TOOL_REGISTRY: list[dict[str, Any]] = [
@@ -1780,6 +2042,53 @@ _TOOL_REGISTRY: list[dict[str, Any]] = [
         "requires_write": True,
         "requires_diary": False,
     },
+    {
+        "name": "hidl_get_household",
+        "description": "Получить сводку «Наш дом»: кто подключён, открытые просьбы, текущее голосование за ужин, просроченные дела по дому, заканчивающиеся расходники и траты дома за месяц.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "handler": _tool_get_household,
+        "requires_write": False,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_list_recipes",
+        "description": "Поиск и фильтр рецептов (каталог + «Мои рецепты») по диете пользователя, категории и режиму «не хватает 1–2 продуктов».",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Поиск по названию, описанию или ингредиентам."},
+                "category": {
+                    "type": "string",
+                    "enum": ["all", "mine", "breakfast", "lunch", "dinner", "snack", "salad", "fast", "budget", "comfort_food", "healthy"],
+                },
+                "almost_ready_only": {"type": "boolean", "description": "Только рецепты, к которым не хватает 1–2 продуктов."},
+                "include_steps": {"type": "boolean", "description": "Включать пошаговое приготовление (по умолчанию false)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "handler": _tool_list_recipes,
+        "requires_write": False,
+        "requires_diary": False,
+    },
+    {
+        "name": "hidl_nudge_partner",
+        "description": "Создать семейную просьбу по дому или отправить заботливый пинг партнёру (thanks +5 кармы, water, break, hug) с учётом тихих часов.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["request", "care"]},
+                "text": {"type": "string", "description": "Текст просьбы для action='request' (до 300 символов)."},
+                "nudge_key": {"type": "string", "enum": ["thanks", "water", "break", "hug"], "description": "Тип пинга для action='care'."},
+            },
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "handler": _tool_nudge_partner,
+        "requires_write": True,
+        "requires_diary": False,
+        "accepts_bot": True,
+    },
 ]
 
 
@@ -1807,6 +2116,9 @@ async def call_mcp_tool(
     settings: MCPSettings,
     name: str,
     arguments: Optional[dict[str, Any]],
+    *,
+    user_id: Optional[int] = None,
+    telegram_bot: Any = None,
 ) -> dict[str, Any]:
     """Execute one MCP tool call and format the standard MCP CallToolResult."""
     entry = next((t for t in _TOOL_REGISTRY if t["name"] == name), None)
@@ -1819,9 +2131,12 @@ async def call_mcp_tool(
 
     args = arguments if isinstance(arguments, dict) else {}
     try:
-        user = await _resolve_owner_user(db, settings)
-        handler: ToolHandler = entry["handler"]
-        result_obj = await handler(db, user, settings, args)
+        user = await _resolve_acting_user(db, settings, user_id=user_id)
+        handler: Any = entry["handler"]
+        if entry.get("accepts_bot"):
+            result_obj = await handler(db, user, settings, args, telegram_bot=telegram_bot)
+        else:
+            result_obj = await handler(db, user, settings, args)
         return {
             "content": [{"type": "text", "text": json.dumps(result_obj, ensure_ascii=False, indent=2)}],
             "isError": False,
@@ -1839,6 +2154,12 @@ def list_enabled_resources(settings: MCPSettings) -> list[dict[str, Any]]:
             "uri": "hidl://today",
             "name": "План дня HiDL",
             "description": "Рутины, задачи плана дня, напоминания и домашние дела на сегодня.",
+            "mimeType": "application/json",
+        },
+        {
+            "uri": "hidl://household",
+            "name": "Наш дом HiDL",
+            "description": "Участники дома, открытые просьбы, дела по дому, расходники и голосование за ужин.",
             "mimeType": "application/json",
         },
         {
@@ -1882,11 +2203,15 @@ async def read_mcp_resource(
     db: aiosqlite.Connection,
     settings: MCPSettings,
     uri: str,
+    *,
+    user_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Read a resource by URI."""
-    user = await _resolve_owner_user(db, settings)
+    user = await _resolve_acting_user(db, settings, user_id=user_id)
     if uri == "hidl://today":
         data = await _tool_get_today(db, user, settings, {})
+    elif uri == "hidl://household":
+        data = await _tool_get_household(db, user, settings, {})
     elif uri == "hidl://shopping":
         data = await _tool_list_shopping(db, user, settings, {"scope": "all"})
     elif uri == "hidl://pantry":

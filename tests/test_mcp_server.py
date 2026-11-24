@@ -475,6 +475,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             uris,
             {
                 "hidl://today",
+                "hidl://household",
                 "hidl://shopping",
                 "hidl://pantry",
                 "hidl://karma",
@@ -537,6 +538,7 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             "hidl_add_diary_entry",
             "hidl_add_calendar_event",
             "hidl_set_meal_plan",
+            "hidl_nudge_partner",
         ):
             self.assertNotIn(write_name, ro_names)
 

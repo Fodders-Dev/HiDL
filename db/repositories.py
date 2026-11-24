@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import re
 import secrets
@@ -6705,4 +6706,189 @@ async def count_household_weekly_activity(
         "nudges_count": nudges_count,
         "expenses_7d": round(expenses_7d, 2),
     }
+
+
+# --- Multi-user MCP Auth Helpers ---
+
+_MCP_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _hash_mcp_secret(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _parse_mcp_utc_dt(raw_iso: Any) -> Optional[datetime.datetime]:
+    try:
+        dt = datetime.datetime.fromisoformat(str(raw_iso or "").strip())
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+async def create_mcp_connect_code(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    ttl_minutes: int = 15,
+) -> Dict[str, Any]:
+    """Выпустить одноразовый код подключения OAuth для конкретного пользователя HiDL."""
+    uid = int(user_id)
+    eff_ttl = max(1, min(60, int(ttl_minutes or 15)))
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    expires_dt = now_dt + datetime.timedelta(minutes=eff_ttl)
+    part1 = "".join(secrets.choice(_MCP_CODE_ALPHABET) for _ in range(5))
+    part2 = "".join(secrets.choice(_MCP_CODE_ALPHABET) for _ in range(5))
+    raw_code = f"HIDL-{part1}-{part2}"
+    code_hash = _hash_mcp_secret(raw_code)
+
+    await conn.execute(
+        "UPDATE mcp_user_connect_codes SET used = 1 WHERE user_id = ? AND used = 0",
+        (uid,),
+    )
+    await conn.execute(
+        """
+        INSERT INTO mcp_user_connect_codes (code_hash, user_id, expires_at, used, created_at)
+        VALUES (?, ?, ?, 0, ?)
+        """,
+        (code_hash, uid, expires_dt.isoformat(), now_dt.isoformat()),
+    )
+    await conn.commit()
+    return {
+        "code": raw_code,
+        "expires_at": expires_dt.isoformat(),
+        "ttl_minutes": eff_ttl,
+    }
+
+
+async def consume_mcp_connect_code(
+    conn: aiosqlite.Connection,
+    raw_code: str,
+) -> Optional[int]:
+    """Проверить и однократно погасить код подключения MCP, вернув user_id владельца."""
+    clean = re.sub(r"\s+", "", (raw_code or "").strip()).upper()
+    if not clean:
+        return None
+    if re.fullmatch(r"HIDL[A-Z2-9]{10}", clean):
+        clean = f"HIDL-{clean[4:9]}-{clean[9:14]}"
+
+    code_hash = _hash_mcp_secret(clean)
+    cur = await conn.execute(
+        "SELECT user_id, expires_at, used FROM mcp_user_connect_codes WHERE code_hash = ?",
+        (code_hash,),
+    )
+    row = await cur.fetchone()
+    if not row or int(row["used"] or 0) != 0:
+        return None
+    exp = _parse_mcp_utc_dt(row["expires_at"])
+    if not exp or exp <= datetime.datetime.now(datetime.timezone.utc):
+        return None
+
+    upd = await conn.execute(
+        "UPDATE mcp_user_connect_codes SET used = 1 WHERE code_hash = ? AND used = 0",
+        (code_hash,),
+    )
+    await conn.commit()
+    if int(upd.rowcount or 0) != 1:
+        return None
+    return int(row["user_id"])
+
+
+async def create_mcp_personal_token(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    label: str = "Личный токен",
+    ttl_days: int = 90,
+) -> Dict[str, Any]:
+    """Выпустить долгоживущий персональный Bearer-токен MCP для клиента без OAuth."""
+    uid = int(user_id)
+    eff_days = max(1, min(365, int(ttl_days or 90)))
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    expires_dt = now_dt + datetime.timedelta(days=eff_days)
+    raw_token = f"hidl_pat_{secrets.token_urlsafe(32)}"
+    token_hash = _hash_mcp_secret(raw_token)
+    clean_label = str(label or "Личный токен").strip()[:80]
+
+    await conn.execute(
+        """
+        INSERT INTO mcp_oauth_tokens
+        (token_hash, token_type, client_id, resource, scope, user_id, expires_at, revoked, created_at)
+        VALUES (?, 'access', 'personal_bearer', ?, 'hidl:read hidl:write', ?, ?, 0, ?)
+        """,
+        (token_hash, clean_label, uid, expires_dt.isoformat(), now_dt.isoformat()),
+    )
+    await conn.commit()
+    return {
+        "token": raw_token,
+        "expires_at": expires_dt.isoformat(),
+        "ttl_days": eff_days,
+    }
+
+
+async def list_user_mcp_connections(
+    conn: aiosqlite.Connection,
+    user_id: int,
+) -> List[Dict[str, Any]]:
+    """Вернуть активные (не отозванные и не истекшие) MCP-подключения пользователя."""
+    uid = int(user_id)
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    cur = await conn.execute(
+        """
+        SELECT t.token_type, t.client_id, t.resource, t.expires_at, t.created_at, c.client_name
+        FROM mcp_oauth_tokens t
+        LEFT JOIN mcp_oauth_clients c ON c.client_id = t.client_id
+        WHERE t.user_id = ? AND t.revoked = 0
+        ORDER BY t.created_at DESC
+        """,
+        (uid,),
+    )
+    rows = await cur.fetchall()
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        exp = _parse_mcp_utc_dt(row["expires_at"])
+        if not exp or exp <= now_dt:
+            continue
+        cid = str(row["client_id"] or "")
+        display_name = (
+            "Личный Bearer-токен"
+            if cid == "personal_bearer"
+            else (str(row["client_name"] or "").strip() or cid)
+        )
+        created_at = str(row["created_at"] or "")
+        expires_at = str(row["expires_at"] or "")
+        if cid not in grouped:
+            grouped[cid] = {
+                "client_id": cid,
+                "client_name": display_name,
+                "active_tokens": 1,
+                "created_at": created_at,
+                "expires_at": expires_at,
+            }
+        else:
+            entry = grouped[cid]
+            entry["active_tokens"] += 1
+            if created_at > entry["created_at"]:
+                entry["created_at"] = created_at
+            prev_exp = _parse_mcp_utc_dt(entry["expires_at"])
+            if not prev_exp or exp > prev_exp:
+                entry["expires_at"] = expires_at
+    return list(grouped.values())
+
+
+async def revoke_user_mcp_tokens(conn: aiosqlite.Connection, user_id: int) -> int:
+    """Отозвать все MCP-токены (OAuth и Bearer) и погасить неиспользованные коды пользователя."""
+    uid = int(user_id)
+    cur = await conn.execute(
+        "UPDATE mcp_oauth_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0",
+        (uid,),
+    )
+    revoked_count = int(cur.rowcount or 0)
+    await conn.execute(
+        "UPDATE mcp_user_connect_codes SET used = 1 WHERE user_id = ? AND used = 0",
+        (uid,),
+    )
+    await conn.commit()
+    return revoked_count
 

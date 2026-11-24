@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import datetime
 import hashlib
 import hmac
@@ -16,6 +17,7 @@ from aiohttp import web
 import aiosqlite
 
 from config import MCPSettings
+from db import repositories as repo
 
 
 def _utc_now() -> datetime.datetime:
@@ -136,40 +138,72 @@ def unauthorized_response(settings: MCPSettings) -> web.Response:
     )
 
 
-async def verify_bearer_request(
+@dataclass(frozen=True)
+class MCPAuthContext:
+    authenticated: bool
+    user_id: Optional[int] = None
+    auth_kind: str = ""
+    client_id: str = ""
+
+
+async def authenticate_bearer_request(
     request: web.Request,
     db: aiosqlite.Connection,
     settings: MCPSettings,
-) -> bool:
-    """Validate Authorization Bearer token against static override or OAuth access tokens."""
+) -> MCPAuthContext:
+    """Validate Authorization Bearer token and return acting user binding if known."""
     auth_header = (request.headers.get("Authorization") or "").strip()
     if not auth_header.lower().startswith("bearer "):
-        return False
+        return MCPAuthContext(authenticated=False)
     raw_token = auth_header[7:].strip()
     if not raw_token:
-        return False
+        return MCPAuthContext(authenticated=False)
 
     if settings.bearer_token and hmac.compare_digest(raw_token, settings.bearer_token):
-        return True
+        return MCPAuthContext(
+            authenticated=True,
+            user_id=None,
+            auth_kind="static_bearer",
+            client_id="static_owner",
+        )
 
     token_hash = _hash_secret(raw_token)
     cursor = await db.execute(
         """
-        SELECT expires_at, revoked FROM mcp_oauth_tokens
+        SELECT expires_at, revoked, user_id, client_id FROM mcp_oauth_tokens
         WHERE token_hash = ? AND token_type = 'access'
         """,
         (token_hash,),
     )
     row = await cursor.fetchone()
     if not row or int(row["revoked"] or 0) != 0:
-        return False
+        return MCPAuthContext(authenticated=False)
     try:
         exp = datetime.datetime.fromisoformat(row["expires_at"])
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=datetime.timezone.utc)
     except ValueError:
-        return False
-    return exp > _utc_now()
+        return MCPAuthContext(authenticated=False)
+    if exp <= _utc_now():
+        return MCPAuthContext(authenticated=False)
+
+    uid = int(row["user_id"]) if row["user_id"] is not None else None
+    cid = str(row["client_id"] or "")
+    return MCPAuthContext(
+        authenticated=True,
+        user_id=uid,
+        auth_kind=("personal_bearer" if cid == "personal_bearer" else "oauth_access"),
+        client_id=cid,
+    )
+
+
+async def verify_bearer_request(
+    request: web.Request,
+    db: aiosqlite.Connection,
+    settings: MCPSettings,
+) -> bool:
+    """Validate Authorization Bearer token against static override or OAuth access tokens."""
+    return (await authenticate_bearer_request(request, db, settings)).authenticated
 
 
 async def handle_protected_resource_metadata(request: web.Request) -> web.Response:
@@ -359,6 +393,7 @@ def _render_consent_html(
   .badge.ok {{ background:#14532d; color:#bbf7d0; }}
   .badge.off {{ background:#7c2d12; color:#fed7aa; }}
   label {{ display:block; font-size:13px; margin-bottom:6px; color:#cbd5e1; }}
+  .hint {{ font-size:12px; color:#94a3b8; margin:-6px 0 14px; line-height:1.4; }}
   input[type=password] {{ width:100%; padding:10px 12px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#f8fafc; box-sizing:border-box; font-size:15px; }}
   button {{ margin-top:16px; width:100%; padding:11px; border:0; border-radius:8px; background:#2563eb; color:#fff; font-size:15px; font-weight:600; cursor:pointer; }}
   .err {{ background:#7f1d1d; color:#fecaca; padding:10px 12px; border-radius:8px; font-size:13px; }}
@@ -374,7 +409,8 @@ def _render_consent_html(
       <input type="hidden" name="response_type" value="code">
       {hidden_fields}
       <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
-      <label for="password">Пароль доступа MCP</label>
+      <label for="password">Код подключения из Telegram (/mcp) или пароль доступа</label>
+      <p class="hint">Отправь боту HiDL команду <code>/mcp</code> в Telegram, чтобы получить одноразовый код для своего аккаунта.</p>
       <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
       <button type="submit">Разрешить доступ</button>
     </form>
@@ -392,12 +428,6 @@ async def handle_oauth_authorize_get(request: web.Request) -> web.Response:
     auth_req, err = await _load_and_validate_authorize_params(params, db, settings)
     if err or not auth_req:
         return web.Response(text=f"OAuth error: {err}", status=400)
-
-    if not settings.access_password:
-        return web.Response(
-            text="MCP_ACCESS_PASSWORD is not configured on server.",
-            status=503,
-        )
 
     csrf_token = _sign_csrf(
         csrf_key,
@@ -447,11 +477,21 @@ async def handle_oauth_authorize_post(request: web.Request) -> web.Response:
             content_type="text/html",
         )
 
-    if not settings.access_password:
-        return web.Response(text="MCP_ACCESS_PASSWORD is not configured on server.", status=503)
-
     supplied_password = params.get("password", "")
-    if not hmac.compare_digest(supplied_password, settings.access_password):
+    bound_user_id: Optional[int] = None
+    authorized = False
+
+    code_uid = await repo.consume_mcp_connect_code(db, supplied_password)
+    if code_uid is not None:
+        bound_user_id = code_uid
+        authorized = True
+    elif settings.access_password and hmac.compare_digest(supplied_password, settings.access_password):
+        authorized = True
+        if settings.owner_telegram_id > 0:
+            owner_row = await repo.get_user_by_telegram_id(db, settings.owner_telegram_id)
+            bound_user_id = int(owner_row["id"]) if owner_row else None
+
+    if not authorized:
         fresh_csrf = _sign_csrf(
             csrf_key,
             client_id=auth_req["client_id"],
@@ -464,7 +504,7 @@ async def handle_oauth_authorize_post(request: web.Request) -> web.Response:
                 settings,
                 auth_req,
                 fresh_csrf,
-                error_message="Неверный пароль доступа.",
+                error_message="Неверный код из /mcp или пароль доступа.",
             ),
             status=403,
             content_type="text/html",
@@ -476,8 +516,8 @@ async def handle_oauth_authorize_post(request: web.Request) -> web.Response:
     await db.execute(
         """
         INSERT INTO mcp_oauth_codes
-        (code_hash, client_id, redirect_uri, code_challenge, code_challenge_method, resource, scope, expires_at, used, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        (code_hash, client_id, redirect_uri, code_challenge, code_challenge_method, resource, scope, user_id, expires_at, used, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
         """,
         (
             _hash_secret(raw_code),
@@ -487,6 +527,7 @@ async def handle_oauth_authorize_post(request: web.Request) -> web.Response:
             auth_req["code_challenge_method"],
             auth_req["resource"],
             auth_req["scope"],
+            bound_user_id,
             expires_dt.isoformat(),
             now_dt.isoformat(),
         ),
@@ -530,6 +571,7 @@ async def _issue_token_pair(
     client_id: str,
     resource: str,
     scope: str,
+    user_id: Optional[int] = None,
 ) -> dict[str, Any]:
     now_dt = _utc_now()
     access_raw = f"hidl_at_{secrets.token_urlsafe(32)}"
@@ -544,10 +586,10 @@ async def _issue_token_pair(
         await db.execute(
             """
             INSERT INTO mcp_oauth_tokens
-            (token_hash, token_type, client_id, resource, scope, expires_at, revoked, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+            (token_hash, token_type, client_id, resource, scope, user_id, expires_at, revoked, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
             """,
-            (_hash_secret(raw), ttype, client_id, resource, scope, exp.isoformat(), now_dt.isoformat()),
+            (_hash_secret(raw), ttype, client_id, resource, scope, user_id, exp.isoformat(), now_dt.isoformat()),
         )
     await db.commit()
     return {
@@ -635,6 +677,7 @@ async def handle_oauth_token(request: web.Request) -> web.Response:
             client_id=client_id,
             resource=code_row["resource"] or _resource_url(settings),
             scope=code_row["scope"] or " ".join(_supported_scopes(settings)),
+            user_id=(int(code_row["user_id"]) if code_row["user_id"] is not None else None),
         )
         return web.json_response(pair, status=200, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
@@ -674,6 +717,7 @@ async def handle_oauth_token(request: web.Request) -> web.Response:
             client_id=client_id,
             resource=rt_row["resource"] or _resource_url(settings),
             scope=rt_row["scope"] or " ".join(_supported_scopes(settings)),
+            user_id=(int(rt_row["user_id"]) if rt_row["user_id"] is not None else None),
         )
         return web.json_response(pair, status=200, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 

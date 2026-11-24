@@ -17,6 +17,7 @@ import time
 from typing import Any, Optional
 
 from aiohttp import web
+import aiohttp
 import aiosqlite
 
 from config import MCPSettings, get_mcp_settings, DeskIntegrationSettings, get_desk_settings
@@ -24,6 +25,7 @@ from db.database import connect
 from services import desk_service
 from services import calendar_service
 from mcp_server.oauth import (
+    authenticate_bearer_request,
     handle_authorization_server_metadata,
     handle_oauth_authorize_get,
     handle_oauth_authorize_post,
@@ -148,6 +150,27 @@ async def handle_desk_webhook(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "duplicate": bool(result.get("duplicate"))})
 
 
+class _TelegramPushBot:
+    """Minimal async Telegram sendMessage client used by MCP write tools."""
+
+    def __init__(self, token: str) -> None:
+        self._token = str(token or "").strip()
+
+    async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> bool:
+        if not self._token or not chat_id or not text:
+            return False
+        url = f"https://api.telegram.org/bot{self._token}/sendMessage"
+        payload: dict[str, Any] = {"chat_id": int(chat_id), "text": str(text)}
+        if kwargs.get("parse_mode"):
+            payload["parse_mode"] = str(kwargs["parse_mode"])
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
+                async with session.post(url, json=payload) as resp:
+                    return resp.status == 200
+        except Exception:
+            return False
+
+
 def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
@@ -163,6 +186,9 @@ async def _dispatch_jsonrpc(
     payload: Any,
     db: aiosqlite.Connection,
     settings: MCPSettings,
+    *,
+    user_id: Optional[int] = None,
+    telegram_bot: Any = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Handle one JSON-RPC 2.0 object. Returns (response_obj_or_None, optional_new_session_id)."""
     if not isinstance(payload, dict):
@@ -194,9 +220,9 @@ async def _dispatch_jsonrpc(
                     },
                     "serverInfo": {"name": "hidl-mcp", "version": "2.0.0"},
                     "instructions": (
-                        "Персональный ассистент HiDL 2.0: можно читать и обновлять задачи на день, "
+                        "Персональный и семейный ассистент HiDL 2.1: можно читать и обновлять задачи на день, "
                         "напоминания, расписание и Google Calendar, меню на 3–4 дня, карму и портрет привычек, "
-                        "список покупок, холодильник/рецепты, расходы и (если разрешено) дневник."
+                        "список покупок, холодильник/рецепты, общий хаб дома/просьбы партнёру, расходы и (если разрешено) дневник."
                     ),
                 },
             ),
@@ -214,7 +240,14 @@ async def _dispatch_jsonrpc(
         if not name:
             return _jsonrpc_error(req_id, -32602, "Missing tool name"), None
         arguments = params.get("arguments")
-        result = await call_mcp_tool(db, settings, name, arguments)
+        result = await call_mcp_tool(
+            db,
+            settings,
+            name,
+            arguments,
+            user_id=user_id,
+            telegram_bot=telegram_bot,
+        )
         return _jsonrpc_result(req_id, result), None
 
     if method == "resources/list":
@@ -225,7 +258,7 @@ async def _dispatch_jsonrpc(
         if not uri:
             return _jsonrpc_error(req_id, -32602, "Missing resource uri"), None
         try:
-            res = await read_mcp_resource(db, settings, uri)
+            res = await read_mcp_resource(db, settings, uri, user_id=user_id)
             return _jsonrpc_result(req_id, res), None
         except ToolError as exc:
             return _jsonrpc_error(req_id, -32002, str(exc)), None
@@ -425,7 +458,8 @@ async def handle_gcal_callback(request: web.Request) -> web.Response:
 async def handle_mcp_post(request: web.Request) -> web.Response:
     db: aiosqlite.Connection = request.app["db_conn"]
     settings: MCPSettings = request.app["mcp_settings"]
-    if not await verify_bearer_request(request, db, settings):
+    auth = await authenticate_bearer_request(request, db, settings)
+    if not auth.authenticated:
         return unauthorized_response(settings)
 
     try:
@@ -441,13 +475,20 @@ async def handle_mcp_post(request: web.Request) -> web.Response:
     headers: dict[str, str] = {"Cache-Control": "no-store"}
     if existing_sid:
         headers["Mcp-Session-Id"] = existing_sid
+    tg_bot = request.app.get("mcp_telegram_bot")
 
     if isinstance(payload, list):
         if not payload:
             return web.json_response(_jsonrpc_error(None, -32600, "Invalid Request"), status=400)
         responses: list[dict[str, Any]] = []
         for item in payload:
-            resp_item, new_sid = await _dispatch_jsonrpc(item, db, settings)
+            resp_item, new_sid = await _dispatch_jsonrpc(
+                item,
+                db,
+                settings,
+                user_id=auth.user_id,
+                telegram_bot=tg_bot,
+            )
             if new_sid:
                 headers["Mcp-Session-Id"] = new_sid
             if resp_item is not None:
@@ -456,7 +497,13 @@ async def handle_mcp_post(request: web.Request) -> web.Response:
             return web.Response(status=202, headers=headers)
         return web.json_response(responses, status=200, headers=headers)
 
-    resp_obj, new_sid = await _dispatch_jsonrpc(payload, db, settings)
+    resp_obj, new_sid = await _dispatch_jsonrpc(
+        payload,
+        db,
+        settings,
+        user_id=auth.user_id,
+        telegram_bot=tg_bot,
+    )
     if new_sid:
         headers["Mcp-Session-Id"] = new_sid
     if resp_obj is None:
@@ -508,6 +555,9 @@ async def handle_mcp_delete(request: web.Request) -> web.Response:
 def create_mcp_app(
     db_conn: aiosqlite.Connection,
     settings: Optional[MCPSettings] = None,
+    *,
+    bot_token: str = "",
+    telegram_bot: Any = None,
 ) -> web.Application:
     """Create configured aiohttp Application serving HiDL Streamable HTTP MCP + OAuth 2.1."""
     cfg = settings or get_mcp_settings()
@@ -518,6 +568,11 @@ def create_mcp_app(
     app["mcp_settings"] = cfg
     app["mcp_csrf_key"] = secrets.token_bytes(32)
     app["mcp_shutting_down"] = False
+    app["mcp_telegram_bot"] = (
+        telegram_bot
+        if telegram_bot is not None
+        else (_TelegramPushBot(bot_token) if str(bot_token or "").strip() else None)
+    )
 
     async def _on_shutdown(application: web.Application) -> None:
         application["mcp_shutting_down"] = True

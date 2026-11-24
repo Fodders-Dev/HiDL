@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import datetime
 import html
-from typing import Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+if TYPE_CHECKING:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from services import karma_service, kitchen_ai
@@ -184,6 +185,8 @@ def format_dinner_poll_card(
     poll: Dict[str, Any], members: List[Dict[str, Any]]
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Сформировать текст и клавиатуру голосования «Что сегодня готовим?»."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
     options: List[Dict[str, Any]] = list(poll.get("options") or [])
     votes: Dict[str, int] = dict(poll.get("votes") or {})
     status = str(poll.get("status") or "open")

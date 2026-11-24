@@ -146,6 +146,7 @@ def settings_keyboard(user: dict | None = None) -> InlineKeyboardMarkup:
         rows.extend([
             [InlineKeyboardButton(text="Срок «скоро истечёт»", callback_data="settings:expiry")],
             [InlineKeyboardButton(text="Общий дом", callback_data="settings:household")],
+            [InlineKeyboardButton(text="🤖 Подключить ИИ (MCP)", callback_data="mcp:hub")],
         ])
     rows.extend([
             [InlineKeyboardButton(text="📚 Fodder's Desk", callback_data="desk:main")],

@@ -23,7 +23,7 @@ async def serve() -> None:
 
     db_conn = await connect(app_cfg.database_url)
     await init_db(db_conn)
-    app = create_mcp_app(db_conn, mcp_cfg)
+    app = create_mcp_app(db_conn, mcp_cfg, bot_token=app_cfg.bot_token)
 
     runner = web.AppRunner(app)
     await runner.setup()
