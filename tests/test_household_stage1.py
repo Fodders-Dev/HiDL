@@ -1,7 +1,7 @@
 import datetime
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from db import repositories as repo
 from db.database import connect, init_db
@@ -73,7 +73,8 @@ class HouseholdStage1Tests(unittest.IsolatedAsyncioTestCase):
             bot=fake_bot,
             answer=AsyncMock(),
         )
-        await start.cmd_start(msg, _MemFSM(), self.db)
+        with patch("services.household_service.is_in_time_window", return_value=False):
+            await start.cmd_start(msg, _MemFSM(), self.db)
         u2_after = dict(await repo.get_user(self.db, self.u2_id))
         self.assertEqual(int(u2_after["household_id"]), hid1)
         members = await repo.list_household_members(self.db, hid1)
@@ -175,7 +176,8 @@ class HouseholdStage1Tests(unittest.IsolatedAsyncioTestCase):
             message=cb_msg,
             answer=AsyncMock(),
         )
-        await finance.bill_pay(cb_pay, self.db)
+        with patch("services.household_service.is_in_time_window", return_value=False):
+            await finance.bill_pay(cb_pay, self.db)
         edited_text = cb_msg.edit_text.call_args.args[0]
         self.assertIn("🏠 ЖКХ", edited_text)
         self.assertIn("оплатил(а) Алиса", edited_text)

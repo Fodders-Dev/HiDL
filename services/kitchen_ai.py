@@ -22,6 +22,7 @@ from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
 from services import fitness_nutrition, karma_service, pulse_service
 from utils.pantry import format_quantity
+from utils.profile import is_student_mode
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_time_local, local_date_str
 
@@ -872,6 +873,199 @@ async def commit_cooked_recipe(
     }
 
 
+_SLOT_MACRO_SHARES: Dict[str, float] = {
+    "breakfast": 0.25,
+    "lunch": 0.40,
+    "dinner": 0.35,
+}
+
+# (key, keywords, default_label, kcal, protein_g, fat_g, carbs_g, vegan_ok, sweet_ok, savory_ok)
+_PANTRY_BOOSTER_CATALOG: Tuple[Tuple[str, Tuple[str, ...], str, int, float, float, float, bool, bool, bool], ...] = (
+    ("cutlets", ("котлет", "green meat", "hichicken", "биточ", "шницел"), "растительные котлеты", 250, 22.0, 10.0, 16.0, True, False, True),
+    ("hiballs", ("фрикадел", "hiballs", "тефтел"), "растительные фрикадельки", 240, 20.0, 10.0, 15.0, True, False, True),
+    ("nuggets", ("наггетс",), "растительные наггетсы", 260, 16.0, 12.0, 20.0, True, False, True),
+    ("seitan", ("сейтан",), "сейтан 120 г", 210, 30.0, 2.0, 14.0, True, False, True),
+    ("tofu", ("тофу",), "тофу 150 г", 180, 18.0, 9.0, 4.0, True, True, True),
+    ("protein_powder", ("протеин", "изолят", "protein"), "протеиновый коктейль", 120, 24.0, 1.0, 3.0, True, True, False),
+    ("lentils", ("чечевиц",), "чечевица", 260, 19.0, 1.0, 44.0, True, False, True),
+    ("beans", ("нут", "фасол", "эдамаме"), "фасоль/нут", 185, 11.0, 2.0, 30.0, True, False, True),
+    ("peanut_butter", ("арахисовая паста", "ореховая паста", "миндаль", "грецк"), "арахисовая паста 30 г", 180, 8.0, 15.0, 6.0, True, True, False),
+    ("hummus", ("хумус",), "хумус", 160, 6.0, 10.0, 12.0, True, False, True),
+    ("yogurt", ("йогурт", "nemoloko"), "растительный йогурт", 110, 3.0, 3.0, 17.0, True, True, False),
+    ("seeds", ("чиа", "кунжут", "тыквенные семеч"), "семена", 115, 4.0, 9.0, 4.0, True, True, True),
+    # Невеганские опции (только при profile != 'vegan')
+    ("cottage_cheese", ("творог",), "творог 150 г", 165, 25.0, 4.0, 5.0, False, True, True),
+    ("eggs", ("яйц",), "2 варёных яйца", 155, 13.0, 11.0, 1.0, False, False, True),
+    ("poultry", ("куриц", "индейк", "филе"), "курица/индейка 140 г", 200, 31.0, 6.0, 0.0, False, False, True),
+    ("fish", ("рыб", "тунец", "лосос"), "рыба/тунец 140 г", 190, 29.0, 7.0, 0.0, False, False, True),
+)
+
+
+def _is_sweet_breakfast(recipe: Dict[str, Any]) -> bool:
+    blob = " ".join(
+        [
+            str(recipe.get("title") or ""),
+            " ".join(str(i.get("name") or "") for i in (recipe.get("ingredients") or []) if isinstance(i, dict)),
+        ]
+    ).casefold().replace("ё", "е")
+    return any(k in blob for k in ("оладь", "блин", "овсян", "каша", "смузи", "банан", "ягод", "гранол", "сырник", "тост с арах"))
+
+
+def _short_pantry_label(raw_name: str, fallback: str) -> str:
+    clean = re.sub(r"\s+\d+(?:[.,]\d+)?\s*(?:г|кг|мл|л|шт)\b.*$", "", str(raw_name or "").strip(), flags=re.IGNORECASE).strip()
+    if not clean:
+        return fallback
+    words = clean.split()
+    if len(words) > 4:
+        clean = " ".join(words[:4])
+    return clean[:38]
+
+
+def _match_booster_spec(name: str, *, meal_profile: str) -> Optional[Tuple[str, str, int, float, float, float, bool, bool, bool]]:
+    low = str(name or "").casefold().replace("ё", "е")
+    is_vegan = str(meal_profile or "omnivore").strip().lower() == "vegan"
+    for spec in _PANTRY_BOOSTER_CATALOG:
+        if is_vegan and not spec[7]:
+            continue
+        if any(kw in low for kw in spec[1]):
+            return spec
+    return None
+
+
+def _pick_pantry_protein_booster(
+    pantry: List[Dict[str, Any]],
+    *,
+    meal_slot: str,
+    recipe: Dict[str, Any],
+    meal_profile: str,
+    used_boosters: Set[str],
+    max_kcal: float,
+) -> Optional[Dict[str, Any]]:
+    is_sweet = meal_slot == "breakfast" and _is_sweet_breakfast(recipe)
+    ing_names = [
+        str(i.get("name") or "").casefold().replace("ё", "е")
+        for i in (recipe.get("ingredients") or [])
+        if isinstance(i, dict)
+    ]
+    title_low = str(recipe.get("title") or "").casefold().replace("ё", "е")
+
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+    for item in pantry:
+        p_name = str(item.get("name") or "").strip()
+        if not p_name:
+            continue
+        p_low = p_name.casefold().replace("ё", "е")
+        if p_low in title_low or any(ingredients_match(p_name, ing) for ing in ing_names if ing):
+            continue
+        spec = _match_booster_spec(p_name, meal_profile=meal_profile)
+        if spec is None:
+            continue
+        key, _, fallback_lbl, kcal, p_g, f_g, c_g, _v_ok, sweet_ok, savory_ok = spec
+        if is_sweet and not sweet_ok:
+            continue
+        if not is_sweet and meal_slot in {"lunch", "dinner"} and not savory_ok:
+            continue
+        if max_kcal > 0 and kcal > max_kcal:
+            continue
+        score = float(p_g) * 3.0 - (35.0 if key in used_boosters else 0.0)
+        if meal_slot in {"lunch", "dinner"} and key in {"cutlets", "hiballs", "tofu", "seitan", "lentils", "poultry", "fish"}:
+            score += 12.0
+        candidates.append(
+            (
+                score,
+                {
+                    "key": key,
+                    "label": _short_pantry_label(p_name, fallback_lbl),
+                    "kcal": int(kcal),
+                    "protein_g": float(p_g),
+                    "fat_g": float(f_g),
+                    "carbs_g": float(c_g),
+                },
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: -pair[0])
+    return candidates[0][1]
+
+
+def _enrich_slot_for_targets(
+    recipe: Dict[str, Any],
+    meal_slot: str,
+    *,
+    base_nutrition: Dict[str, Any],
+    pantry: List[Dict[str, Any]],
+    targets: Optional[Dict[str, Any]],
+    meal_profile: str,
+    used_boosters: Set[str],
+) -> Dict[str, Any]:
+    base_title = str(recipe.get("title") or "Блюдо").strip()
+    bk = float(base_nutrition.get("kcal") or 0)
+    bp = float(base_nutrition.get("protein_g") or 0)
+    bf = float(base_nutrition.get("fat_g") or 0)
+    bc = float(base_nutrition.get("carbs_g") or 0)
+
+    if not targets or targets.get("mindful_mode") or bk <= 0:
+        return {
+            "title": base_title,
+            "portion_mult": 1.0,
+            "booster": None,
+            "est_kcal": int(round(bk)),
+            "est_protein_g": round(bp, 1),
+            "est_fat_g": round(bf, 1),
+            "est_carbs_g": round(bc, 1),
+        }
+
+    share = _SLOT_MACRO_SHARES.get(meal_slot, 0.35)
+    slot_kcal = float(targets.get("kcal") or 2000) * share
+    slot_p = float(targets.get("protein_g") or 100) * share
+
+    mult = 1.0
+    if bk < slot_kcal * 0.68:
+        cand_mult = 2.0 if bk < slot_kcal * 0.45 else 1.5
+        if bk * cand_mult <= slot_kcal * 1.15:
+            mult = cand_mult
+        elif bk * 1.5 <= slot_kcal * 1.15:
+            mult = 1.5
+
+    cur_k = bk * mult
+    cur_p = bp * mult
+    cur_f = bf * mult
+    cur_c = bc * mult
+
+    booster: Optional[Dict[str, Any]] = None
+    need_protein = (slot_p - cur_p) >= 9.0
+    need_kcal = cur_k < slot_kcal * 0.75
+    if need_protein or need_kcal:
+        headroom = max(160.0, slot_kcal * 1.25 - cur_k)
+        booster = _pick_pantry_protein_booster(
+            pantry,
+            meal_slot=meal_slot,
+            recipe=recipe,
+            meal_profile=meal_profile,
+            used_boosters=used_boosters,
+            max_kcal=headroom,
+        )
+        if booster:
+            used_boosters.add(booster["key"])
+            cur_k += booster["kcal"]
+            cur_p += booster["protein_g"]
+            cur_f += booster["fat_g"]
+            cur_c += booster["carbs_g"]
+
+    mult_tag = " (×2)" if mult >= 1.9 else (" (×1.5)" if mult >= 1.4 else "")
+    boost_tag = f" + {booster['label']}" if booster else ""
+    return {
+        "title": f"{base_title}{mult_tag}{boost_tag}",
+        "portion_mult": mult,
+        "booster": booster,
+        "est_kcal": int(round(cur_k)),
+        "est_protein_g": round(cur_p, 1),
+        "est_fat_g": round(cur_f, 1),
+        "est_carbs_g": round(cur_c, 1),
+    }
+
+
 def _pick_recipe_for_plan_slot(
     candidates: List[Dict[str, Any]],
     *,
@@ -884,6 +1078,11 @@ def _pick_recipe_for_plan_slot(
     recent_ids: Set[str],
     planned_ingredients: Iterable[str],
     coverage_by_id: Optional[Dict[str, float]] = None,
+    nutrition_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    slot_target_kcal: float = 0.0,
+    slot_target_protein: float = 0.0,
+    slot_target_fat: float = 0.0,
+    goal: str = "loss",
 ) -> Optional[Dict[str, Any]]:
     pool = [r for r in candidates if str(r.get("id") or "") not in used_ids]
     if not pool:
@@ -917,7 +1116,32 @@ def _pick_recipe_for_plan_slot(
             score -= 20.0
 
         # В первый день максимально опираемся на то, что уже лежит в холодильнике
-        score += cov * (50.0 if day_idx == 0 else 22.0)
+        score += cov * (46.0 if day_idx == 0 else 22.0)
+
+        # Баланс КБЖУ и сытности под реальные цели пользователя
+        if nutrition_by_id and rid in nutrition_by_id and slot_target_kcal > 0:
+            nutr = nutrition_by_id[rid]
+            rk = float(nutr.get("kcal") or 0)
+            rp = float(nutr.get("protein_g") or 0)
+            rf = float(nutr.get("fat_g") or 0)
+            if rp >= 22.0:
+                score += 26.0
+            elif rp >= 14.0:
+                score += 15.0
+            elif rp >= 9.0:
+                score += 4.0
+            elif meal_slot in {"lunch", "dinner"}:
+                score -= 28.0
+            elif meal_slot == "breakfast" and rk < 350:
+                score -= 14.0
+
+            if 0.45 * slot_target_kcal <= rk <= 1.25 * slot_target_kcal:
+                score += 10.0
+            elif rk < 220:
+                score -= 12.0
+
+            if goal in {"loss", "recomp"} and slot_target_fat > 0 and rf > slot_target_fat * 1.4 and rp < 12.0:
+                score -= 12.0
 
         # Переиспользуем продукты из уже выбранных блюд меню, чтобы не покупать 30 разных позиций
         if planned_ingredients:
@@ -951,6 +1175,91 @@ def _pick_recipe_for_plan_slot(
     return ranked[0][1] if ranked else None
 
 
+async def _attach_plan_nutrition(
+    db,
+    user: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    profile: str,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Прикрепить КБЖУ к слотам сохранённого меню и собрать дневную сводку."""
+    if is_student_mode(user):
+        return [dict(r) for r in rows], None, {}
+
+    user_id = int(user["id"])
+    latest_w = await repo.get_latest_weight(db, user_id)
+    targets = fitness_nutrition.calculate_daily_targets(user, latest_w)
+    if targets.get("mindful_mode"):
+        return [dict(r) for r in rows], targets, {}
+
+    recipes = await load_recipes_for_user(db, user_id)
+    by_id = {str(r.get("id") or ""): r for r in recipes}
+
+    enriched_rows: List[Dict[str, Any]] = []
+    daily_totals: Dict[str, Dict[str, float]] = {}
+
+    for raw_row in rows:
+        row = dict(raw_row)
+        title_str = str(row.get("title") or "").strip()
+        if "est_kcal" not in row:
+            booster_spec = None
+            base_part = title_str
+            if " + " in title_str:
+                head_t, tail_t = title_str.rsplit(" + ", 1)
+                matched_spec = _match_booster_spec(tail_t, meal_profile=profile)
+                if matched_spec is not None:
+                    booster_spec = matched_spec
+                    base_part = head_t.strip()
+
+            mult = 1.0
+            if base_part.endswith(" (×2)"):
+                mult = 2.0
+            elif base_part.endswith(" (×1.5)"):
+                mult = 1.5
+
+            rid = str(row.get("recipe_id") or "")
+            rec = by_id.get(rid)
+            if rec is None:
+                rec = {"title": base_part, "ingredients": list(row.get("ingredients") or [])}
+            base_n = fitness_nutrition.estimate_recipe_nutrition(rec)
+
+            k_val = float(base_n.get("kcal") or 0) * mult
+            p_val = float(base_n.get("protein_g") or 0) * mult
+            f_val = float(base_n.get("fat_g") or 0) * mult
+            c_val = float(base_n.get("carbs_g") or 0) * mult
+            if booster_spec is not None:
+                k_val += float(booster_spec[3])
+                p_val += float(booster_spec[4])
+                f_val += float(booster_spec[5])
+                c_val += float(booster_spec[6])
+
+            row["est_kcal"] = int(round(k_val))
+            row["est_protein_g"] = round(p_val, 1)
+            row["est_fat_g"] = round(f_val, 1)
+            row["est_carbs_g"] = round(c_val, 1)
+            row["portion_mult"] = mult
+
+        pdate = str(row.get("plan_date") or "")
+        bucket = daily_totals.setdefault(pdate, {"kcal": 0.0, "protein_g": 0.0, "fat_g": 0.0, "carbs_g": 0.0})
+        bucket["kcal"] += float(row.get("est_kcal") or 0)
+        bucket["protein_g"] += float(row.get("est_protein_g") or 0)
+        bucket["fat_g"] += float(row.get("est_fat_g") or 0)
+        bucket["carbs_g"] += float(row.get("est_carbs_g") or 0)
+        enriched_rows.append(row)
+
+    daily_summary: Dict[str, Dict[str, Any]] = {
+        d_str: {
+            "kcal": int(round(vals["kcal"])),
+            "protein_g": int(round(vals["protein_g"])),
+            "fat_g": int(round(vals["fat_g"])),
+            "carbs_g": int(round(vals["carbs_g"])),
+            "target_kcal": int(targets["kcal"]),
+            "target_protein_g": int(targets["protein_g"]),
+        }
+        for d_str, vals in daily_totals.items()
+    }
+    return enriched_rows, targets, daily_summary
+
+
 async def generate_meal_plan(
     db,
     user: Dict[str, Any],
@@ -960,7 +1269,7 @@ async def generate_meal_plan(
     exclude_ids: Optional[Iterable[str]] = None,
     now_utc: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
-    """Сгенерировать и сохранить не повторяющееся меню на 3-4 дня с учётом диеты и холодильника."""
+    """Сгенерировать и сохранить не повторяющееся меню на 3-4 дня с учётом диеты, холодильника и КБЖУ."""
     now = now_utc or datetime.datetime.utcnow()
     user_id = int(user["id"])
     tz = user.get("timezone") or "UTC"
@@ -972,6 +1281,14 @@ async def generate_meal_plan(
     profile = await get_user_meal_profile(db, user_id)
     pantry = rows_to_dicts(await repo.list_pantry_items(db, user_id))
     candidates = [r for r in await load_recipes_for_user(db, user_id) if recipe_allowed_for_profile(r, profile)]
+
+    student = is_student_mode(user)
+    targets: Optional[Dict[str, Any]] = None
+    if not student:
+        latest_w = await repo.get_latest_weight(db, user_id)
+        targets = fitness_nutrition.calculate_daily_targets(user, latest_w)
+    use_kbju = bool(targets and not targets.get("mindful_mode"))
+    goal = str(user.get("weight_goal") or "loss").strip().lower()
 
     recent_since = (base_date - datetime.timedelta(days=4)).isoformat()
     recent_ids = set(await repo.get_recent_meal_recipe_ids(db, user_id, recent_since))
@@ -986,10 +1303,20 @@ async def generate_meal_plan(
         str(r.get("id") or ""): float(match_recipe_to_pantry(r, pantry, servings=2)["coverage"])
         for r in candidates
     }
+    nutrition_by_id: Dict[str, Dict[str, Any]] = {
+        str(r.get("id") or ""): fitness_nutrition.estimate_recipe_nutrition(r)
+        for r in candidates
+    }
 
     for d_idx in range(eff_days):
         plan_date = (base_date + datetime.timedelta(days=d_idx)).isoformat()
+        day_used_boosters: Set[str] = set()
         for meal_slot in ("breakfast", "lunch", "dinner"):
+            share = _SLOT_MACRO_SHARES.get(meal_slot, 0.35)
+            slot_kcal = float(targets["kcal"]) * share if use_kbju else 0.0
+            slot_p = float(targets["protein_g"]) * share if use_kbju else 0.0
+            slot_f = float(targets["fat_g"]) * share if use_kbju else 0.0
+
             picked = _pick_recipe_for_plan_slot(
                 candidates,
                 meal_slot=meal_slot,
@@ -1001,6 +1328,11 @@ async def generate_meal_plan(
                 recent_ids=recent_ids,
                 planned_ingredients=planned_ingredients,
                 coverage_by_id=coverage_by_id,
+                nutrition_by_id=nutrition_by_id if use_kbju else None,
+                slot_target_kcal=slot_kcal,
+                slot_target_protein=slot_p,
+                slot_target_fat=slot_f,
+                goal=goal,
             )
             if not picked:
                 continue
@@ -1011,28 +1343,50 @@ async def generate_meal_plan(
                     cleaned_ing = _clean_ing_text(str(ing["name"]))
                     if cleaned_ing:
                         planned_ingredients.add(cleaned_ing)
+
+            enriched = _enrich_slot_for_targets(
+                picked,
+                meal_slot,
+                base_nutrition=nutrition_by_id.get(rid) or fitness_nutrition.estimate_recipe_nutrition(picked),
+                pantry=pantry,
+                targets=targets if use_kbju else None,
+                meal_profile=profile,
+                used_boosters=day_used_boosters,
+            )
             row = await repo.upsert_meal_plan_slot(
                 db,
                 user_id,
                 plan_date,
                 meal_slot,
-                title=str(picked.get("title") or "Блюдо"),
+                title=enriched["title"],
                 recipe_id=rid,
                 time_minutes=int(picked.get("time_minutes") or 20),
                 ingredients=list(picked.get("ingredients") or []),
                 status="planned",
             )
             if row:
-                saved_rows.append(row)
+                row_dict = dict(row)
+                if use_kbju:
+                    row_dict["est_kcal"] = enriched["est_kcal"]
+                    row_dict["est_protein_g"] = enriched["est_protein_g"]
+                    row_dict["est_fat_g"] = enriched["est_fat_g"]
+                    row_dict["est_carbs_g"] = enriched["est_carbs_g"]
+                    row_dict["portion_mult"] = enriched["portion_mult"]
+                saved_rows.append(row_dict)
 
-    missing = await compute_meal_plan_missing_shopping(db, user, saved_rows)
+    enriched_rows, final_targets, daily_summary = await _attach_plan_nutrition(
+        db, user, saved_rows, profile
+    )
+    missing = await compute_meal_plan_missing_shopping(db, user, enriched_rows)
     export_data = build_shopping_export(missing)
     return {
         "start_date": base_date_str,
         "end_date": end_date_str,
         "days": eff_days,
         "meal_profile": profile,
-        "items": saved_rows,
+        "nutrition_targets": final_targets,
+        "daily_summary": daily_summary,
+        "items": enriched_rows,
         "missing_shopping": missing,
         "missing_shopping_grouped": export_data["groups"],
         "shopping_export_text": export_data["plain_text"],
@@ -1108,14 +1462,19 @@ async def get_meal_plan_view(
         )
 
     profile = await get_user_meal_profile(db, user_id)
-    missing = await compute_meal_plan_missing_shopping(db, user, rows)
+    enriched_rows, final_targets, daily_summary = await _attach_plan_nutrition(
+        db, user, [dict(r) for r in rows], profile
+    )
+    missing = await compute_meal_plan_missing_shopping(db, user, enriched_rows)
     export_data = build_shopping_export(missing)
     return {
         "start_date": base_date_str,
         "end_date": end_date_str,
         "days": eff_days,
         "meal_profile": profile,
-        "items": rows,
+        "nutrition_targets": final_targets,
+        "daily_summary": daily_summary,
+        "items": enriched_rows,
         "missing_shopping": missing,
         "missing_shopping_grouped": export_data["groups"],
         "shopping_export_text": export_data["plain_text"],

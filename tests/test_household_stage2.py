@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from db import repositories as repo
 from db.database import connect, init_db
@@ -69,6 +69,9 @@ class HouseholdStage2Tests(unittest.IsolatedAsyncioTestCase):
         self.u1 = dict(await repo.get_user(self.db, self.u1_id))
         self.u2 = dict(await repo.get_user(self.db, self.u2_id))
         self.stu = dict(await repo.get_user(self.db, self.stu_id))
+        qh_patch = patch("services.household_service.is_in_time_window", return_value=False)
+        qh_patch.start()
+        self.addCleanup(qh_patch.stop)
 
     async def asyncTearDown(self) -> None:
         await self.db.close()

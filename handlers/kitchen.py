@@ -1079,9 +1079,17 @@ def _render_meal_plan_payload(plan_data: dict) -> Tuple[str, InlineKeyboardMarku
     start_date = str(plan_data.get("start_date") or "")
     items = list(plan_data.get("items") or [])
     missing = list(plan_data.get("missing_shopping") or [])
+    targets = plan_data.get("nutrition_targets") or None
+    daily_summary = plan_data.get("daily_summary") or {}
+    show_kbju = bool(targets and not targets.get("mindful_mode"))
 
+    header_goal = (
+        f" · цель ~<b>{int(targets['kcal'])} ккал · Б {int(targets['protein_g'])}г</b>"
+        if show_kbju
+        else ""
+    )
     lines = [
-        f"📅 <b>Меню на {days} дн.</b> · {_diet_label(profile)}",
+        f"📅 <b>Меню на {days} дн.</b> · {_diet_label(profile)}{header_goal}",
     ]
     by_date: dict[str, list[dict]] = {}
     for it in items:
@@ -1097,7 +1105,18 @@ def _render_meal_plan_payload(plan_data: dict) -> Tuple[str, InlineKeyboardMarku
             icon = "✅" if slot.get("status") == "cooked" else slot_icons.get(ms, "🍽")
             s_lbl = slot_names.get(ms, ms)
             t_min = int(slot.get("time_minutes") or 20)
-            lines.append(f"{icon} {s_lbl}: <b>{_h(slot.get('title'))}</b> · {t_min} мин")
+            est_k = int(slot.get("est_kcal") or 0)
+            est_p = int(round(float(slot.get("est_protein_g") or 0)))
+            kbju_note = f" · ~{est_k} ккал, Б {est_p}г" if (show_kbju and est_k > 0) else ""
+            lines.append(f"{icon} {s_lbl}: <b>{_h(slot.get('title'))}</b> · {t_min} мин{kbju_note}")
+        if show_kbju and d_str in daily_summary:
+            ds = daily_summary[d_str]
+            p_gap = int(ds.get("target_protein_g") or 0) - int(ds.get("protein_g") or 0)
+            gap_note = f", +перекус/протеин ~{p_gap} г Б" if p_gap >= 25 else ""
+            lines.append(
+                f"   ↳ <i>Итого за день: ~{int(ds['kcal'])}/{int(ds['target_kcal'])} ккал · "
+                f"Б ~{int(ds['protein_g'])}/{int(ds['target_protein_g'])} г{gap_note}</i>"
+            )
 
     if missing:
         preview = ", ".join(_h(m["name"]) for m in missing[:7])
