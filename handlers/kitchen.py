@@ -893,7 +893,9 @@ async def cook_fast_commit(callback: types.CallbackQuery, db):
     delta = int(res.get("karma_delta") or 0)
     score_after = res.get("score_after")
     if res.get("pulse_closed"):
-        slot_ru = "Обед" if res["pulse_closed"] == "lunch" else "Ужин"
+        slot_ru = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}.get(
+            str(res["pulse_closed"]), "Еда"
+        )
         if delta > 0 and score_after is not None:
             lines.append(f"💓 Чек-ин Пульса «{slot_ru}» закрыт (+{delta} кармы → {score_after}/100).")
         else:

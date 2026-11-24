@@ -185,7 +185,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
     karma_score = int(karma_state.get("score") if karma_state.get("score") is not None else 70)
     karma_mode = karma_service.get_karma_mode(karma_score, user)
     checkins_today = await repo.list_pulse_checkins_for_date(db, user["id"], local_date)
-    std_slots = {"wake", "afternoon", "winddown", "bedtime"} if student else {"wake", "lunch", "afternoon", "dinner", "winddown", "bedtime"}
+    std_slots = {"wake", "afternoon", "winddown", "bedtime"} if student else {"wake", "breakfast", "lunch", "afternoon", "dinner", "winddown", "bedtime"}
     std_checkins = [c for c in checkins_today if c.get("slot_key") in std_slots]
     pulse_done = sum(1 for c in std_checkins if c.get("status") == "done")
     pulse_total = max(6, len(std_checkins))

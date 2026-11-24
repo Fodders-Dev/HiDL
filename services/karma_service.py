@@ -348,6 +348,7 @@ def format_karma_screen(
 
     slot_titles = {
         "wake": "Подъём",
+        "breakfast": "Завтрак",
         "lunch": "Обед",
         "afternoon": "День",
         "dinner": "Ужин",

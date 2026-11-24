@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import fitness_nutrition, inbox_service, kitchen_ai, stt
+from services import fitness_nutrition, inbox_service, kitchen_ai, pulse_service, stt
 from utils.menu_match import match_menu_label
 from utils.sender import safe_edit
 from utils.time import local_date_str
@@ -314,6 +314,9 @@ async def kbju_confirm_cb(callback: types.CallbackQuery, state: FSMContext, db) 
     active_pending = await repo.get_active_pending_meal(db, int(user["id"]), now_utc=now_utc)
     if active_pending:
         await repo.resolve_pending_meal(db, int(active_pending["id"]), status="cancelled")
+    await pulse_service.close_open_food_pulse_slot(
+        db, user, str(preview.get("meal_slot") or ""), now_utc=now_utc
+    )
     await state.clear()
     text, kb = await render_kbju_card(db, user, now_utc=now_utc)
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")

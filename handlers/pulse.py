@@ -16,6 +16,7 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from services import context_builder, karma_service, pulse_service
 from utils.menu_match import match_menu_label
+from utils.profile import is_student_mode
 from utils.sender import safe_delete_or_clear_markup, safe_edit
 from utils.time import local_date_str, parse_hhmm
 from utils.user import ensure_user
@@ -299,11 +300,16 @@ async def cb_pulse_done(callback: types.CallbackQuery, db) -> None:
 
     if res.get("is_wake"):
         meta = pulse_service._load_meta(res["checkin"])  # noqa: SLF001
-        kb = pulse_service.build_wake_checklist_keyboard(cid, meta)
+        kb = pulse_service.build_wake_checklist_keyboard(cid, meta, is_student=is_student_mode(user))
+        bf_note = (
+            f"\n🥣 Про завтрак мягко напомню в <b>{res['breakfast_scheduled_hhmm']}</b> (или запиши сразу кнопкой ниже)."
+            if res.get("breakfast_scheduled_hhmm")
+            else ""
+        )
         text = (
             f"☀️ <b>Добро пожаловать в день!</b>\n"
             f"Карма: <b>{sign}</b> → {mode['emoji']} <b>{score}/100</b> ({html.escape(mode['label'])})\n\n"
-            "Добей быстрый утренний минимум в 1 тап:"
+            f"Добей быстрый утренний минимум в 1 тап:{bf_note}"
         )
         await safe_edit(callback.message, text, reply_markup=kb)
         await _rebind_closed_card_reference(db, callback, res, keep_current=True)
@@ -316,9 +322,11 @@ async def cb_pulse_done(callback: types.CallbackQuery, db) -> None:
         f"✅ <b>Закрыто: {html.escape(title)}</b>\n"
         f"Карма: <b>{sign}</b> → {mode['emoji']} <b>{score}/100</b> ({html.escape(mode['label'])})"
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")]]
-    )
+    kb_rows = []
+    if slot_key in {"breakfast", "lunch", "dinner"}:
+        kb_rows.append([InlineKeyboardButton(text="➕ Записать в КБЖУ (фото / текст)", callback_data="kbju:add")])
+    kb_rows.append([InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await safe_edit(callback.message, text, reply_markup=kb)
     await _rebind_closed_card_reference(db, callback, res, keep_current=False)
     await callback.answer("Отмечено!")
@@ -381,11 +389,16 @@ async def cb_pulse_manual_wake(callback: types.CallbackQuery, db) -> None:
     delta = int(karma.get("delta") or 0)
     sign = f"+{delta}" if delta > 0 else str(delta)
     meta = pulse_service._load_meta(res["checkin"])  # noqa: SLF001
-    kb = pulse_service.build_wake_checklist_keyboard(int(checkin["id"]), meta)
+    kb = pulse_service.build_wake_checklist_keyboard(int(checkin["id"]), meta, is_student=is_student_mode(user))
+    bf_note = (
+        f"\n🥣 Про завтрак мягко напомню в <b>{res['breakfast_scheduled_hhmm']}</b> (или запиши сразу кнопкой ниже)."
+        if res.get("breakfast_scheduled_hhmm")
+        else ""
+    )
     text = (
         f"☀️ <b>Доброе утро! Подъём отмечен.</b>\n"
         f"Карма: <b>{sign}</b> → <b>{score}/100</b>.\n\n"
-        "Отметь воду и зубы:"
+        f"Отметь воду и зубы:{bf_note}"
     )
     await safe_edit(callback.message, text, reply_markup=kb)
     await _rebind_closed_card_reference(db, callback, res, keep_current=True)

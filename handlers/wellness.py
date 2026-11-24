@@ -214,8 +214,11 @@ async def wellness_toggle(callback: types.CallbackQuery, db, state: FSMContext |
         if state:
             await state.set_state(WellnessState.time_edit)
         await callback.message.answer(
-            "Введи часы для еды через запятую в формате HH:MM, например: 13:00,19:00",
+            "Введи часы для еды через запятую в формате HH:MM:\n"
+            "• 2 времени (например <code>13:00,19:00</code>) — обед и ужин (про завтрак напомню мягко после подъёма);\n"
+            "• 3 времени (например <code>08:30,13:00,19:30</code>) — завтрак, обед и ужин по расписанию.",
             reply_markup=None,
+            parse_mode="HTML",
         )
         TIME_EDIT_REQUESTS[callback.from_user.id] = ("meal", callback.message.chat.id)
         await callback.answer()

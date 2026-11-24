@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 SLOT_TITLES: Dict[str, str] = {
     "wake": "Подъём",
+    "breakfast": "Завтрак",
     "lunch": "Обед",
     "afternoon": "День и вода",
     "dinner": "Ужин",
@@ -28,6 +29,7 @@ SLOT_TITLES: Dict[str, str] = {
 
 SLOT_DEFAULT_REWARDS: Dict[str, int] = {
     "wake": 4,
+    "breakfast": 3,
     "lunch": 3,
     "afternoon": 3,
     "dinner": 3,
@@ -175,23 +177,39 @@ def compute_daily_slots(
 
     w = dict(wellness) if wellness else {}
     meal_parts = [p.strip() for p in str(w.get("meal_times") or "").split(",") if p.strip()]
+    valid_meals = [p for p in meal_parts if parse_hhmm(p)]
     water_parts = [p.strip() for p in str(w.get("water_times") or "").split(",") if p.strip()]
 
     lunch_default = 13 * 60
-    if meal_parts and parse_hhmm(meal_parts[0]):
-        lunch_raw = _hhmm_to_min(meal_parts[0])
-        lunch_rel = lunch_raw if lunch_raw > wake_min else lunch_default
-    else:
-        lunch_rel = max(wake_min + 120, lunch_default)
-    lunch_rel = max(wake_min + 90, min(sleep_rel - 240, lunch_rel))
-
     dinner_default = 19 * 60 + 30
-    if len(meal_parts) >= 2 and parse_hhmm(meal_parts[1]):
-        dinner_raw = _hhmm_to_min(meal_parts[1])
+    bf_rel: Optional[int] = None
+
+    if len(valid_meals) >= 3:
+        lunch_raw = _hhmm_to_min(valid_meals[1])
+        lunch_rel = lunch_raw if lunch_raw > wake_min else lunch_default
+        lunch_rel = max(wake_min + 90, min(sleep_rel - 240, lunch_rel))
+
+        dinner_raw = _hhmm_to_min(valid_meals[2])
         dinner_rel = dinner_raw if dinner_raw > wake_min else dinner_raw + 24 * 60
+        dinner_rel = min(sleep_rel - 90, max(lunch_rel + 180, dinner_rel))
+
+        bf_raw = _hhmm_to_min(valid_meals[0])
+        bf_cand = bf_raw if bf_raw > wake_min else wake_min + 30
+        bf_rel = max(wake_min + 20, min(lunch_rel - 60, bf_cand))
     else:
-        dinner_rel = dinner_default
-    dinner_rel = min(sleep_rel - 90, max(lunch_rel + 180, dinner_rel))
+        if valid_meals:
+            lunch_raw = _hhmm_to_min(valid_meals[0])
+            lunch_rel = lunch_raw if lunch_raw > wake_min else lunch_default
+        else:
+            lunch_rel = max(wake_min + 120, lunch_default)
+        lunch_rel = max(wake_min + 90, min(sleep_rel - 240, lunch_rel))
+
+        if len(valid_meals) >= 2:
+            dinner_raw = _hhmm_to_min(valid_meals[1])
+            dinner_rel = dinner_raw if dinner_raw > wake_min else dinner_raw + 24 * 60
+        else:
+            dinner_rel = dinner_default
+        dinner_rel = min(sleep_rel - 90, max(lunch_rel + 180, dinner_rel))
 
     afternoon_default = 16 * 60
     afternoon_rel = afternoon_default
@@ -207,8 +225,12 @@ def compute_daily_slots(
     specs = [("wake", "sleep", wake_min), ("afternoon", "tasks", afternoon_rel),
              ("winddown", "tasks", winddown_rel), ("bedtime", "sleep", bedtime_rel)]
     if not is_student_mode(user):
-        specs.insert(1, ("lunch", "food", lunch_rel))
-        specs.insert(3, ("dinner", "food", dinner_rel))
+        insert_idx = 1
+        if bf_rel is not None:
+            specs.insert(insert_idx, ("breakfast", "food", bf_rel))
+            insert_idx += 1
+        specs.insert(insert_idx, ("lunch", "food", lunch_rel))
+        specs.insert(insert_idx + 2, ("dinner", "food", dinner_rel))
     out: List[Dict[str, Any]] = []
     for slot_key, domain, offset_min in specs:
         sched_utc = _local_minutes_to_utc(local_date, offset_min, tz)
@@ -265,7 +287,7 @@ async def _gather_slot_context(
         shop_rows = await repo.list_shopping_items(db, int(user["id"]), scope="household")
         unbought = [dict(r) for r in shop_rows if not r["is_bought"]]
         ctx["unbought_count"] = len(unbought)
-    if slot_key in {"wake", "lunch", "dinner"}:
+    if slot_key in {"wake", "breakfast", "lunch", "dinner"}:
         meal_rows = await repo.get_meal_plan_for_date(db, int(user["id"]), local_date)
         if slot_key == "wake":
             bfast = next(
@@ -354,6 +376,31 @@ def build_pulse_message(
             text = (
                 f"🚨 <b>ТРЕТИЙ СИГНАЛ: ВСТАВАЙ НЕМЕДЛЕННО!</b> ({header_badge})\n"
                 f"ЕСЛИ ПРОИГНОРИРУЕШЬ И ЭТО — ЗАФИКСИРУЮ ПРОПУСК И СРЕЖУ КАРМУ."
+            )
+    elif slot_key == "breakfast":
+        if level == 1:
+            intro = (
+                "🥣 <b>Время завтрака!</b> Закинь что-нибудь в топку, чтобы день пошёл бодрее."
+                if mode_code in {"proud", "care"}
+                else "🥣 <b>ЗАВТРАК.</b> Поешь нормально с утра, чтобы не провалиться по энергии днём."
+            )
+            lines = [intro, header_badge]
+            planned_bf = ctx.get("planned_meal")
+            if isinstance(planned_bf, dict) and planned_bf.get("title"):
+                t_bf = int(planned_bf.get("time_minutes") or 10)
+                lines.append(f"🥣 По плану на завтрак: <b>{html.escape(str(planned_bf['title']))}</b> ({t_bf} мин)")
+            if debt_note:
+                lines.append(f"💬 {html.escape(debt_note)}")
+            text = "\n".join(lines)
+        elif level == 2:
+            text = (
+                f"🥣 <b>Мягко напоминаю про завтрак</b> ({header_badge})\n"
+                f"Если уже поел(а) — отметь или занеси в КБЖУ в 1 тап."
+            )
+        else:
+            text = (
+                f"🚨 <b>ЗАВТРАК ПРОПУЩЕН!</b> ({header_badge})\n"
+                f"Отметься сейчас или перенеси, чтобы не терять карму."
             )
     elif slot_key == "lunch":
         if level == 1:
@@ -489,14 +536,31 @@ def build_pulse_message(
                 InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pulse:skip:{cid}"),
             ],
         ]
+    elif slot_key == "breakfast":
+        rows = [
+            [
+                InlineKeyboardButton(text="✅ Позавтракал", callback_data=f"pulse:done:{cid}"),
+                InlineKeyboardButton(text="➕ Записать в КБЖУ", callback_data="kbju:add"),
+            ],
+            [
+                InlineKeyboardButton(text="🍳 Что приготовить?", callback_data="kitchen:quick_pick"),
+                InlineKeyboardButton(text="⏰ Через 30 мин", callback_data=f"pulse:snooze:{cid}:30"),
+            ],
+            [
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pulse:skip:{cid}"),
+            ],
+        ]
     elif slot_key == "lunch":
         rows = [
             [
                 InlineKeyboardButton(text="✅ Поел", callback_data=f"pulse:done:{cid}"),
-                InlineKeyboardButton(text="🍳 Что приготовить?", callback_data="kitchen:quick_pick"),
+                InlineKeyboardButton(text="➕ Записать в КБЖУ", callback_data="kbju:add"),
             ],
             [
+                InlineKeyboardButton(text="🍳 Что приготовить?", callback_data="kitchen:quick_pick"),
                 InlineKeyboardButton(text="⏰ Через 30 мин", callback_data=f"pulse:snooze:{cid}:30"),
+            ],
+            [
                 InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pulse:skip:{cid}"),
             ],
         ]
@@ -512,11 +576,15 @@ def build_pulse_message(
         rows = [
             [
                 InlineKeyboardButton(text="✅ Поужинал", callback_data=f"pulse:done:{cid}"),
-                InlineKeyboardButton(text="🍳 Что приготовить?", callback_data="kitchen:quick_pick"),
+                InlineKeyboardButton(text="➕ Записать в КБЖУ", callback_data="kbju:add"),
             ],
             [
+                InlineKeyboardButton(text="🍳 Что приготовить?", callback_data="kitchen:quick_pick"),
                 InlineKeyboardButton(text="🛒 Покупки", callback_data="kitchen:shoplist"),
+            ],
+            [
                 InlineKeyboardButton(text="⏰ Через 30 мин", callback_data=f"pulse:snooze:{cid}:30"),
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pulse:skip:{cid}"),
             ],
         ]
     elif slot_key == "winddown":
@@ -548,27 +616,79 @@ def build_pulse_message(
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_wake_checklist_keyboard(checkin_id: int, meta: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
+def build_wake_checklist_keyboard(
+    checkin_id: int,
+    meta: Optional[Dict[str, Any]] = None,
+    *,
+    is_student: bool = False,
+) -> InlineKeyboardMarkup:
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     m = meta or {}
     water_mark = "✅" if m.get("water_done") else "⬜️"
     teeth_mark = "✅" if m.get("teeth_done") else "⬜️"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{water_mark} 💧 Стакан воды (+2)",
+                callback_data=f"pulse:hygiene:{checkin_id}:water",
+            ),
+            InlineKeyboardButton(
+                text=f"{teeth_mark} 🪥 Почистил зубы (+2)",
+                callback_data=f"pulse:hygiene:{checkin_id}:teeth",
+            ),
+        ],
+    ]
+    if not is_student:
+        rows.append(
             [
-                InlineKeyboardButton(
-                    text=f"{water_mark} 💧 Стакан воды (+2)",
-                    callback_data=f"pulse:hygiene:{checkin_id}:water",
-                ),
-                InlineKeyboardButton(
-                    text=f"{teeth_mark} 🪥 Почистил зубы (+2)",
-                    callback_data=f"pulse:hygiene:{checkin_id}:teeth",
-                ),
-            ],
-            [InlineKeyboardButton(text="📅 План на сегодня", callback_data="today:menu")],
-        ]
+                InlineKeyboardButton(text="🥣 Записать завтрак", callback_data="kbju:add"),
+                InlineKeyboardButton(text="🍳 Что на завтрак?", callback_data="kitchen:quick_pick"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="📅 План на сегодня", callback_data="today:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _maybe_schedule_breakfast_after_wake(
+    db,
+    user: Dict[str, Any],
+    now: datetime.datetime,
+) -> Optional[str]:
+    """Мягко запланировать чек-ин завтрака через 25 мин после подъёма (без штрафа при пропуске)."""
+    if is_student_mode(user):
+        return None
+    uid = int(user["id"])
+    tz = user.get("timezone") or "UTC"
+    local_date = local_date_str(now, tz)
+
+    if await repo.get_pulse_checkin(db, uid, local_date, "breakfast"):
+        return None
+    meals_today = await repo.list_meal_logs(db, uid, local_date)
+    if any(str(m.get("meal_slot") or "") == "breakfast" for m in meals_today):
+        return None
+
+    wellness_row = await repo.get_wellness(db, uid)
+    wellness = dict(wellness_row) if wellness_row else None
+    slots = compute_daily_slots(user, wellness, local_date)
+    lunch_slot = next((s for s in slots if s["slot_key"] == "lunch"), None)
+
+    bf_utc = now + datetime.timedelta(minutes=25)
+    if lunch_slot and bf_utc > lunch_slot["scheduled_at_utc"] - datetime.timedelta(minutes=30):
+        return None
+
+    await repo.upsert_pulse_checkin(
+        db,
+        uid,
+        local_date,
+        "breakfast",
+        "food",
+        bf_utc.isoformat(),
+        bf_utc.isoformat(),
+        status="pending",
+        meta_json=json.dumps({"after_wake": True, "gentle": True}, ensure_ascii=False),
     )
+    return format_time_local(bf_utc, tz)
 
 
 async def complete_checkin(
@@ -616,16 +736,21 @@ async def complete_checkin(
                 meta_json=json.dumps(current_meta, ensure_ascii=False),
             )
             current_chk = await repo.get_pulse_checkin_by_id(db, checkin_id) or current_chk
+            bf_hhmm = await _maybe_schedule_breakfast_after_wake(db, user, now)
             res = await _already_resolved_result(db, user, current_chk, is_wake=True)
             res["late_wake_recorded"] = True
             res["local_time"] = local_hhmm
+            if bf_hhmm:
+                res["breakfast_scheduled_hhmm"] = bf_hhmm
             return res
         return await _already_resolved_result(db, user, current_chk, is_wake=slot_key == "wake")
     winning = updated or checkin
+    bf_hhmm: Optional[str] = None
     if slot_key == "wake":
         await repo.clear_user_sleep_confirmed(db, int(user["id"]))
         tz = user.get("timezone") or "UTC"
         await repo.update_sleep_ping(db, int(user["id"]), "morning", local_date_str(now, tz))
+        bf_hhmm = await _maybe_schedule_breakfast_after_wake(db, user, now)
 
     karma_res = await karma_service.record_karma_event(
         db,
@@ -636,7 +761,7 @@ async def complete_checkin(
         reason=f"Закрыт чек-ин «{title}»",
         now_utc=now,
     )
-    return {
+    out: Dict[str, Any] = {
         "ok": True,
         "already_done": False,
         "checkin": winning,
@@ -644,6 +769,29 @@ async def complete_checkin(
         "is_wake": slot_key == "wake",
         "previous_card": _card_ref(winning),
     }
+    if bf_hhmm:
+        out["breakfast_scheduled_hhmm"] = bf_hhmm
+    return out
+
+
+async def close_open_food_pulse_slot(
+    db,
+    user: Dict[str, Any],
+    meal_slot: str,
+    *,
+    now_utc: Optional[datetime.datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Закрыть открытый пищевой слот Пульса (breakfast/lunch/dinner), если пользователь записал еду."""
+    slot = str(meal_slot or "").strip().lower()
+    if slot not in {"breakfast", "lunch", "dinner"}:
+        return None
+    now = _naive_utc(now_utc)
+    tz = user.get("timezone") or "UTC"
+    local_date = local_date_str(now, tz)
+    chk = await repo.get_pulse_checkin(db, int(user["id"]), local_date, slot)
+    if not chk or chk.get("status") not in {"pending", "snoozed"}:
+        return None
+    return await complete_checkin(db, user, int(chk["id"]), now_utc=now)
 
 
 async def confirm_bedtime(
@@ -1205,7 +1353,7 @@ async def process_pulse_tick(
             continue
 
         slot_key = str(checkin.get("slot_key") or "")
-        if is_student_mode(user) and slot_key in {"lunch", "dinner"}:
+        if is_student_mode(user) and slot_key in {"breakfast", "lunch", "dinner"}:
             changed, transitioned = await repo.transition_pulse_checkin(
                 db, int(checkin["id"]), user_id=uid, allowed_statuses=("pending", "snoozed"),
                 expected_fields=_transition_snapshot(checkin), status="skipped",
@@ -1217,7 +1365,7 @@ async def process_pulse_tick(
         if _confirmed_sleep_active(user, now) and slot_key != "wake":
             continue
 
-        if slot_key in {"lunch", "afternoon", "dinner", "winddown"}:
+        if slot_key in {"breakfast", "lunch", "afternoon", "dinner", "winddown"}:
             busy_ev = await calendar_service.get_active_busy_event(db, user, now)
             if busy_ev and busy_ev.get("end_utc"):
                 end_utc = busy_ev["end_utc"]
@@ -1245,6 +1393,18 @@ async def process_pulse_tick(
 
         # В заморозке «Болею» эскалация мягкая: не дожимаем 2-м и 3-м уровнями и не штрафуем за игнор.
         if status == "pending" and ping_count >= 1 and sick_active:
+            changed, transitioned = await repo.transition_pulse_checkin(
+                db, cid, user_id=uid, allowed_statuses=("pending",),
+                expected_fields=_transition_snapshot(checkin), status="skipped",
+                resolved_at_utc=now.isoformat(), card_chat_id=None, card_message_id=None,
+            )
+            if changed:
+                await _clear_saved_card(bot, _card_ref(checkin))
+            continue
+
+        # Мягкий завтрак после подъёма не дожимаем 3-м сигналом и не штрафуем по карме.
+        meta_chk = _load_meta(checkin)
+        if status == "pending" and slot_key == "breakfast" and meta_chk.get("gentle") and ping_count >= 2:
             changed, transitioned = await repo.transition_pulse_checkin(
                 db, cid, user_id=uid, allowed_statuses=("pending",),
                 expected_fields=_transition_snapshot(checkin), status="skipped",

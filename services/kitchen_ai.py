@@ -829,8 +829,15 @@ async def commit_cooked_recipe(
                 marked_slot = meal_slot
                 break
 
-    # Синергия с Пульсом еды (lunch/dinner): если слот открыт, закрываем его без двойной кармы
-    pulse_food_slot = meal_slot if meal_slot in {"lunch", "dinner"} else ("lunch" if local_hour < 16 else "dinner")
+    # Синергия с Пульсом еды (breakfast/lunch/dinner): если слот открыт, закрываем его без двойной кармы
+    if meal_slot in {"breakfast", "lunch", "dinner"}:
+        pulse_food_slot = meal_slot
+    elif local_hour < 11:
+        pulse_food_slot = "breakfast"
+    elif local_hour < 16:
+        pulse_food_slot = "lunch"
+    else:
+        pulse_food_slot = "dinner"
     chk = await repo.get_pulse_checkin(db, user_id, local_date, pulse_food_slot)
     pulse_closed = ""
     if chk and chk.get("status") in {"pending", "snoozed"}:
