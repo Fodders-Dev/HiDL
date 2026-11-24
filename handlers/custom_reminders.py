@@ -803,6 +803,36 @@ async def reminder_edit(callback: types.CallbackQuery, state: FSMContext, db) ->
     await callback.answer()
 
 
+@router.callback_query(lambda c: c.data == "rem:cancel_edit")
+async def reminder_cancel_edit(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+    await state.clear()
+    row = await repo.get_user_by_telegram_id(db, callback.from_user.id)
+    user = dict(row) if row else None
+    await callback.message.answer("Ок, отменила редактирование.", reply_markup=main_menu_keyboard(user))
+    await callback.answer("Отменено")
+
+
+@router.message(
+    StateFilter(CustomReminderState.edit_choice, CustomReminderState.edit_wd),
+    lambda m: bool(m.text and not m.text.startswith("/")),
+)
+async def reminder_edit_fallback_text(message: types.Message, state: FSMContext, db) -> None:
+    raw = (message.text or "").strip().lower()
+    if raw in {"отмена", "отменить", "назад"}:
+        await state.clear()
+        await message.answer(
+            "Отменила.",
+            reply_markup=main_menu_keyboard(await _existing_menu_user(db, message.from_user.id)),
+        )
+        return
+    await message.answer(
+        "Выбери действие кнопками выше или нажми «Отмена».",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="rem:cancel_edit")]]
+        ),
+    )
+
+
 @router.callback_query(lambda c: c.data in ("rem:edit_time", "rem:edit_freq", "rem:edit_wd"))
 async def reminder_edit_choice(callback: types.CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()

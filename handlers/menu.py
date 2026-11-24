@@ -2,7 +2,7 @@ import datetime
 
 from aiogram import Router, types
 from aiogram.fsm.context import FSMContext
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 
 from db import repositories as repo
 from handlers import guides
@@ -71,8 +71,21 @@ async def food_menu(message: types.Message, state: FSMContext) -> None:
     )
 
 
-@router.message(lambda m: match_menu_label(m.text, {"ещё", "еще"}))
-async def more_menu(message: types.Message, state: FSMContext) -> None:
+@router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"ещё", "еще"}))
+async def more_menu(message: types.Message, state: FSMContext, db) -> None:
+    raw = (message.text or "").strip()
+    if "⚙" not in raw:
+        from services import inbox_service
+        from services.inbox_parser import _latest_assistant_query_type
+
+        row = await repo.get_user_by_telegram_id(db, message.from_user.id)
+        if row:
+            recent_ctx = inbox_service._get_recent_context(int(row["id"]), datetime.datetime.utcnow())  # noqa: SLF001
+            if _latest_assistant_query_type(recent_ctx) in {"food", "advice"}:
+                from handlers.inbox import handle_free_text_inbox
+
+                await handle_free_text_inbox(message, db)
+                return
     await state.clear()
     await message.answer(
         "Дополнительные разделы (дом, деньги, спорт, фокус, настройки и заморозка ЧП):",

@@ -53,8 +53,12 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
     if not student and await repo.get_active_pending_meal(db, int(profile["id"])) is not None:
         await handle_free_text_inbox(message, db)
         return
-    # быстрые намерения: сделал/позже/пропусти
-    intent = match_simple_intent(text)
+    # быстрые намерения (только для legacy-режима; голые "ок"/"ok"/"👍" не перехватываем)
+    legacy_pings_on = (
+        int(profile.get("pulse_enabled") if profile.get("pulse_enabled") is not None else 1) == 0
+        or int(profile.get("legacy_pings_enabled") or 0) == 1
+    )
+    intent = match_simple_intent(text) if legacy_pings_on and text.strip().lower() not in {"ок", "ok", "👍"} else None
     if intent:
         user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
         today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
@@ -104,11 +108,15 @@ async def natural_handler(message: types.Message, db, state: FSMContext) -> None
         "съел", "выпил", "поел", "хочу", "думаю", "планирую",
         "в кафе", "в кофейн", "в теремк", "кофе", "латте", "капучино",
         "шаурм", "шаверм", "пицц", "бургер", "ккал", "на 100", "блин", "сырник",
+        "билет", "выходн", "отпуск", "кроссов", "куртк", "телефон", "ноутбук",
+        "книг", "подарок", "лекарств", "таблет", "подписк", "одежд", "обув",
+        "уже купил", "руб", "₽",
     )
     is_single_sentence = (
         "\n" not in text_original
         and len([p for p in re.split(r"[.!?;]+", text_original) if p.strip()]) <= 1
         and not any(k in text for k in _food_log_exclude)
+        and not re.search(r"\bза\s+\d", text)
     )
     pantry_match = not student and is_single_sentence and any(re.search(p, text) for p in pantry_patterns)
     if pantry_match:

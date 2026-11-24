@@ -4,7 +4,7 @@ import logging
 from typing import List
 
 from aiogram import Router, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -453,7 +453,10 @@ async def vitamins_info(message: types.Message) -> None:
     await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
 
 
-@router.message(lambda m: m.text and m.text.lower().startswith("витамин"))
+@router.message(
+    StateFilter(None),
+    lambda m: bool(m.text and m.text.lower().startswith("витамин") and get_vitamin(m.text.strip())),
+)
 async def vitamins_info_free(message: types.Message) -> None:
     name = (message.text or "").strip()
     info = get_vitamin(name)

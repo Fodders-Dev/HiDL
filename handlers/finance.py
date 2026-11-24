@@ -406,17 +406,28 @@ async def money_free_parse(message: types.Message, db, state: FSMContext) -> Non
     if await state.get_state():
         return
     user_row = await repo.get_user_by_telegram_id(db, message.from_user.id)
-    if user_row and dict(user_row).get("profile_mode", "adult") == "student":
-        from handlers.inbox import handle_free_text_inbox
-        await handle_free_text_inbox(message, db)
-        return
+    if user_row:
+        user_d = dict(user_row)
+        if user_d.get("profile_mode", "adult") == "student" or (
+            await repo.get_active_pending_meal(db, int(user_d["id"])) is not None
+        ):
+            from handlers.inbox import handle_free_text_inbox
+
+            await handle_free_text_inbox(message, db)
+            return
     parsed = parse_command(message.text)
     if not parsed or parsed.type != "expense":
+        from handlers.inbox import handle_free_text_inbox
+
+        await handle_free_text_inbox(message, db)
         return
     user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
     amount = parsed.payload.get("amount")
     category = parsed.payload.get("category", "другое")
     if amount is None:
+        from handlers.inbox import handle_free_text_inbox
+
+        await handle_free_text_inbox(message, db)
         return
     await repo.add_expense(db, user["id"], amount, category)
     await message.answer(

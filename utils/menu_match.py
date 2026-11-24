@@ -55,16 +55,23 @@ def looks_like_expense(text: Optional[str]) -> bool:
     if _MIXED_INTENT_MARKERS_RE.search(lower):
         return False
 
-    if any(k in lower for k in ("потрат", "запиши трату", "стоил")):
-        return True
-    if "запиши" in lower and not re.search(r"\b\d{1,2}:\d{2}\b", lower):
+    if any(k in lower for k in ("потрат", "запиши трату", "запиши расход", "стоил")):
         return True
     if re.match(r"^[+-]\s*\d+(?:[.,]\d+)?(?:\s+|$)", lower):
         return True
 
     words = lower.split()
     if len(words) <= 4 and re.match(
-        r"^\d+(?:[.,]\d+)?\s+(?!час\w*\b|мин\w*\b|дн\w*\b|урок\w*\b|раз\w*\b|л\b|кг\b|г\b|гр\b|мл\b|шт\b)[а-яёa-z]",
+        r"^\d+(?:[.,]\d+)?\s+(?!"
+        r"час\w*\b|мин\w*\b|сек\w*\b|дн\w*\b|недел\w*\b|месяц\w*\b|год\w*\b|лет\b|"
+        r"урок\w*\b|раз\w*\b|подход\w*\b|повтор\w*\b|шаг\w*\b|"
+        r"л\b|кг\b|г\b|гр\b|мл\b|мг\b|шт\b|км\b|метр\w*\b|м\b|"
+        r"ккал\w*\b|kcal\b|калл\w*\b|калор\w*\b|"
+        r"куск\w*\b|кусок\b|яйц\w*\b|яиц\b|пачк\w*\b|порц\w*\b|ложк\w*\b|стакан\w*\b|дольк\w*\b|"
+        r"таблет\w*\b|капсул\w*\b|отжиман\w*\b|приседан\w*\b|подтягиван\w*\b|"
+        r"январ\w*\b|феврал\w*\b|март\w*\b|апрел\w*\b|ма[йя]\b|июн\w*\b|июл\w*\b|август\w*\b|"
+        r"сентябр\w*\b|октябр\w*\b|ноябр\w*\b|декабр\w*\b"
+        r")[а-яёa-z]",
         lower,
     ):
         return True
@@ -81,7 +88,14 @@ def is_single_clause_reminder(text: Optional[str]) -> bool:
     lower = raw.lower()
     if "напом" not in lower:
         return False
+    if raw.endswith("?"):
+        return False
     if "\n" in raw:
+        return False
+    if re.search(
+        r"(?iu)\b(?:удал\w*|отмен\w*|убер\w*|выключ\w*|перенес\w*|измен\w*|поменя\w*|какие|сколько|список|покажи)\b",
+        lower,
+    ):
         return False
     sentences = [p.strip() for p in re.split(r"[.!?;]+", raw) if p.strip()]
     if len(sentences) > 1:

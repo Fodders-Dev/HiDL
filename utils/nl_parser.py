@@ -81,14 +81,17 @@ def parse_reminder(text: str) -> Optional[ParsedCommand]:
         m = re.search(r"\b(\d{1,2})[:.](\d{2})\b", src)
         if m:
             return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}", None, None
-        # "в 10", "в 10 часов"
-        m = re.search(r"\bв\s*(\d{1,2})(?:\s*час\w*)?(?!\d)", src)
+        # "в 10", "в 10 часов", "в 8 вечера", "в 3 дня"
+        m = re.search(r"\b(?:в|на)\s*(\d{1,2})(?:\s*час\w*)?(?:\s*(утра|дня|вечера|ночи))?(?!\d)", src)
         if m:
-            return f"{int(m.group(1)):02d}:00", None, None
-        # "на 10" (часто пишут так же, как "в 10")
-        m = re.search(r"\bна\s*(\d{1,2})(?:\s*час\w*)?(?!\d)", src)
-        if m:
-            return f"{int(m.group(1)):02d}:00", None, None
+            hh = int(m.group(1))
+            part = (m.group(2) or "").strip()
+            if part in {"дня", "вечера"} and 1 <= hh <= 11:
+                hh += 12
+            elif part == "ночи" and hh == 12:
+                hh = 0
+            if 0 <= hh <= 23:
+                return f"{hh:02d}:00", None, None
         m = re.search(r"через\s+(\d+)\s*(час|ч)", src)
         if m:
             return None, int(m.group(1)), None

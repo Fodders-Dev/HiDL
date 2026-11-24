@@ -223,6 +223,13 @@ async def build_user_day_snapshot(
         for j in idea_rows
         if str(j.get("title") or j.get("user_text") or "").strip()
     ]
+    diary_rows = rows_to_dicts(await repo.list_journal_entries(db, user_id, entry_type="diary", limit=5))
+    today_diary = [
+        str(j.get("title") or j.get("user_text") or "").strip()
+        for j in diary_rows
+        if str(j.get("entry_date") or "") == local_date
+        and str(j.get("title") or j.get("user_text") or "").strip()
+    ]
 
     reminders = rows_to_dicts(await repo.list_custom_reminders(db, user_id))
     events_today = await calendar_service.get_unified_events_for_date(db, user_id, local_date)
@@ -236,6 +243,14 @@ async def build_user_day_snapshot(
     meal_plan_today = await repo.get_meal_plan_for_date(db, user_id, local_date)
     wellness = await repo.get_wellness(db, user_id)
     meal_profile = str((dict(wellness) if wellness else {}).get("meal_profile") or "omnivore")
+
+    month_spent = 0.0
+    monthly_limit = user.get("monthly_limit")
+    if not student:
+        local_d_obj = datetime.date.fromisoformat(local_date)
+        month_start = local_d_obj.replace(day=1).isoformat()
+        next_day_excl = (local_d_obj + datetime.timedelta(days=1)).isoformat()
+        month_spent = float(await repo.expenses_between(db, user_id, month_start, next_day_excl) or 0.0)
 
     memory = await refresh_user_portrait_if_needed(db, user, now_utc=now)
     try:
@@ -293,6 +308,9 @@ async def build_user_day_snapshot(
         "portrait_text": memory.get("portrait_text") or "",
         "patterns": patterns,
         "active_ideas": active_ideas,
+        "today_diary": today_diary[:3],
+        "month_spent": month_spent,
+        "monthly_limit": monthly_limit,
     }
 
 
@@ -377,6 +395,15 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
                     f"У {eat.get('carbs_g', 0):g}/{tgt.get('carbs_g', 0)}г). "
                     f"{n_adv.get('summary_line', '')}"
                 )
+            eaten_meals = n_adv.get("meals") or []
+            if eaten_meals:
+                meal_items_str = ", ".join(
+                    f"{m.get('title')} (~{int(round(float(m.get('kcal') or 0)))} ккал)"
+                    for m in eaten_meals[:6]
+                    if m.get("title")
+                )
+                if meal_items_str:
+                    lines.append(f"Съедено сегодня: {meal_items_str}.")
         trend = snapshot.get("body_trend") or {}
         latest_w = trend.get("latest") if isinstance(trend, dict) else None
         if isinstance(latest_w, dict) and latest_w.get("weight"):
@@ -429,14 +456,39 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
             for e in events_today[:5]
         ]
         lines.append("Календарь сегодня: " + "; ".join(ev_parts) + ".")
-    early_tom = [
-        e
-        for e in (snapshot.get("events_tomorrow") or [])
-        if not e.get("is_all_day") and str(e.get("start_time") or "99:99") < "10:00"
-    ]
-    if early_tom:
-        e0 = early_tom[0]
-        lines.append(f"Раннее событие завтра: {e0.get('start_time')} {e0.get('title')}.")
+    events_tomorrow = snapshot.get("events_tomorrow") or []
+    if events_tomorrow:
+        tom_parts = [
+            ("весь день" if e.get("is_all_day") else f"{e.get('start_time')}–{e.get('end_time')}")
+            + f" {e.get('title')}"
+            for e in events_tomorrow[:5]
+        ]
+        lines.append("Календарь завтра: " + "; ".join(tom_parts) + ".")
+        early_tom = [
+            e
+            for e in events_tomorrow
+            if not e.get("is_all_day") and str(e.get("start_time") or "99:99") < "10:00"
+        ]
+        if early_tom:
+            e0 = early_tom[0]
+            lines.append(f"Раннее событие завтра: {e0.get('start_time')} {e0.get('title')}.")
+    reminders = snapshot.get("reminders") or []
+    if reminders:
+        rem_parts = [
+            f"{r.get('reminder_time') or '--:--'} {r.get('title')}"
+            for r in reminders[:5]
+            if r.get("title")
+        ]
+        if rem_parts:
+            lines.append("Напоминания: " + "; ".join(rem_parts) + ".")
+    if not student:
+        m_spent = float(snapshot.get("month_spent") or 0.0)
+        m_lim = snapshot.get("monthly_limit")
+        if m_spent > 0 or m_lim:
+            lim_txt = f" / лимит {float(m_lim):.0f} ₽" if m_lim else ""
+            lines.append(f"Финансы за месяц: потрачено {m_spent:.0f} ₽{lim_txt}.")
+    if snapshot.get("today_diary"):
+        lines.append("Заметки дня: " + "; ".join(snapshot["today_diary"][:3]) + ".")
     last_ev = str(state.get("last_event_summary") or "").strip()
     if last_ev:
         lines.append(f"Последнее событие кармы: {last_ev}.")

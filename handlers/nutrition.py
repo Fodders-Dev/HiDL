@@ -323,6 +323,69 @@ async def kbju_confirm_cb(callback: types.CallbackQuery, state: FSMContext, db) 
     await callback.answer("Записала в КБЖУ ✅")
 
 
+@router.message(MealAddState.confirm, lambda m: bool(m.text and not m.text.startswith("/")))
+async def kbju_confirm_text(message: types.Message, state: FSMContext, db) -> None:
+    raw = (message.text or "").strip()
+    low = re.sub(r"[?!.,;:\"'«»()]+", " ", raw.lower()).strip()
+    if low in {"нет", "отмена", "отменить", "не надо", "не записывай"}:
+        await state.clear()
+        await message.answer("Ок, не записываю.")
+        return
+
+    if low in {"да", "ок", "ok", "записывай", "запиши", "подтвердить", "сохранить", "+"}:
+        data = await state.get_data()
+        preview = data.get("meal_preview") or {}
+        if not preview or not preview.get("ok"):
+            await state.clear()
+            await message.answer("Запись устарела, введи заново.")
+            return
+        user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+        now_utc = datetime.datetime.utcnow()
+        local_date = local_date_str(now_utc, user.get("timezone") or "UTC")
+        await repo.add_meal_log(
+            db,
+            int(user["id"]),
+            local_date,
+            str(preview.get("title") or "Приём пищи"),
+            meal_slot=str(preview.get("meal_slot") or "snack"),
+            kcal=float(preview.get("kcal") or 0),
+            protein_g=float(preview.get("protein_g") or 0),
+            fat_g=float(preview.get("fat_g") or 0),
+            carbs_g=float(preview.get("carbs_g") or 0),
+            source="vision" if preview.get("used_llm") else "manual",
+        )
+        active_pending = await repo.get_active_pending_meal(db, int(user["id"]), now_utc=now_utc)
+        if active_pending:
+            await repo.resolve_pending_meal(db, int(active_pending["id"]), status="cancelled")
+        await pulse_service.close_open_food_pulse_slot(
+            db, user, str(preview.get("meal_slot") or ""), now_utc=now_utc
+        )
+        await state.clear()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today")]]
+        )
+        await message.answer(
+            f"✅ Записала в КБЖУ: <b>{_h(preview.get('title') or 'Приём пищи')}</b> "
+            f"(🔥 {int(round(float(preview.get('kcal') or 0)))} ккал)",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+
+    await state.clear()
+    from handlers.inbox import handle_free_text_inbox
+
+    await handle_free_text_inbox(message, db)
+
+
+@router.message(MealAddState.confirm, F.photo)
+async def kbju_confirm_photo(message: types.Message, state: FSMContext, db) -> None:
+    await state.clear()
+    from handlers.inbox import handle_unsolicited_photo
+
+    await handle_unsolicited_photo(message, state, db)
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("kbju:log_recipe:"))
 async def kbju_log_recipe_cb(callback: types.CallbackQuery, db) -> None:
     parts = (callback.data or "").split(":")

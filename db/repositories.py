@@ -803,6 +803,22 @@ async def update_pantry_item(
     await conn.commit()
 
 
+async def update_pantry_item_name(
+    conn: aiosqlite.Connection, user_id: int, item_id: int, name: str
+) -> None:
+    """Переименовать продукт в холодильнике."""
+    clean = str(name or "").strip()
+    if not clean:
+        return
+    now = utc_now_str()
+    household_id = await get_or_create_household(conn, user_id)
+    await conn.execute(
+        "UPDATE pantry_items SET name = ?, updated_at = ? WHERE household_id = ? AND id = ?",
+        (clean, now, household_id, int(item_id)),
+    )
+    await conn.commit()
+
+
 async def delete_pantry_item(
     conn: aiosqlite.Connection, user_id: int, item_id: int
 ) -> None:
@@ -1794,6 +1810,34 @@ async def delete_custom_reminder(conn: aiosqlite.Connection, user_id: int, remin
     await conn.commit()
 
 
+async def find_custom_reminder_by_title(
+    conn: aiosqlite.Connection, user_id: int, query: str
+) -> Optional[Dict[str, Any]]:
+    """Найти активное напоминание по точному/нечёткому совпадению названия."""
+    q_clean, q_stems = _normalize_task_tokens(query)
+    if not q_clean and not q_stems:
+        return None
+    rows = rows_to_dicts(await list_custom_reminders(conn, user_id))
+    for row in rows:
+        t_clean, _ = _normalize_task_tokens(str(row.get("title") or ""))
+        if t_clean and t_clean == q_clean:
+            return row
+    for row in rows:
+        raw_t = str(row.get("title") or "")
+        t_clean, _ = _normalize_task_tokens(raw_t)
+        if q_clean and t_clean and (q_clean in t_clean or t_clean in q_clean):
+            return row
+        if q_clean and _haystack_matches_query(raw_t, q_clean):
+            return row
+    if q_stems:
+        q_set = set(q_stems)
+        for row in rows:
+            _, t_stems = _normalize_task_tokens(str(row.get("title") or ""))
+            if q_set & set(t_stems):
+                return row
+    return None
+
+
 async def update_custom_reminder_time(
     conn: aiosqlite.Connection, user_id: int, reminder_id: int, reminder_time: str
 ) -> None:
@@ -2607,6 +2651,20 @@ async def delete_expense(conn: aiosqlite.Connection, user_id: int, expense_id: i
     await conn.execute(
         "DELETE FROM expenses WHERE id = ? AND user_id = ?",
         (expense_id, user_id),
+    )
+    await conn.commit()
+
+
+async def update_expense_category(
+    conn: aiosqlite.Connection, user_id: int, expense_id: int, category: str
+) -> None:
+    """Обновить категорию/название траты."""
+    clean = str(category or "").strip()
+    if not clean:
+        return
+    await conn.execute(
+        "UPDATE expenses SET category = ? WHERE id = ? AND user_id = ?",
+        (clean, int(expense_id), int(user_id)),
     )
     await conn.commit()
 
@@ -6094,6 +6152,20 @@ async def workout_stats_week(
         "recent_focus_areas": recent_areas,
         "latest": logs[0] if logs else None,
     }
+
+
+async def update_workout_log_title(
+    conn: aiosqlite.Connection, user_id: int, log_id: int, title: str
+) -> None:
+    """Обновить название тренировки в логе."""
+    clean = str(title or "").strip()
+    if not clean:
+        return
+    await conn.execute(
+        "UPDATE workout_logs SET title = ? WHERE id = ? AND user_id = ?",
+        (clean, int(log_id), int(user_id)),
+    )
+    await conn.commit()
 
 
 async def get_meal_log(

@@ -15,6 +15,7 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.nl_parser import parse_command
 from utils.sender import safe_edit
+from utils.texts import register_text
 from utils.time import local_date_str
 from utils.tone import tone_message, tone_ack
 from services.knowledge import get_knowledge_service
@@ -521,7 +522,9 @@ async def ask_back(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("ask:more:"))
 async def ask_more(callback: types.CallbackQuery) -> None:
-    _, _, category = callback.data.split(":")
+    val = callback.data.split(":")[2]
+    tip = get_tip(val)
+    category = str(tip.get("category") or val) if tip else val
     await send_tip(callback.message, category)
     await callback.answer()
 
@@ -619,3 +622,14 @@ async def ask_laundry_dirt(callback: types.CallbackQuery, state: FSMContext) -> 
     )
     await callback.message.answer(text, reply_markup=main_menu_keyboard())
     await callback.answer()
+
+
+@router.message(
+    StateFilter(AskMomCook.profile, AskMomLaundry.item, AskMomLaundry.dirt),
+    lambda m: bool(m.text and not m.text.startswith("/")),
+)
+async def ask_mom_inline_fallback_text(message: types.Message, state: FSMContext, db) -> None:
+    await state.clear()
+    from handlers.inbox import handle_free_text_inbox
+
+    await handle_free_text_inbox(message, db)

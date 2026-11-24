@@ -127,13 +127,13 @@ async def create_app(test_mode: bool = False) -> AppContext:
         donate.router,
         stats.router,
         inbox.router,
-        natural.router,
         wellness.router,
         sleep_mode.router,
         help_now.router,
         zones.router,
         routine_items.router,
         routine_steps.router,
+        natural.router,
         talk.router,
     )
     try:

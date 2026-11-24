@@ -47,6 +47,9 @@ KIND_LABELS = {
     "pulse_log": ("💓", "Режим и карма"),
     "rollover_tasks": ("➡️", "Перенос хвостов"),
     "shift_bedtime": ("🌙", "Сдвиг отбоя"),
+    "shift_wake": ("⏰", "Подъём"),
+    "task_delete": ("🗑", "Удалена задача"),
+    "reminder_delete": ("🗑", "Удалено напоминание"),
     "meal_log": ("🔥", "КБЖУ"),
     "weight_log": ("⚖", "Весы"),
     "workout_log": ("🏋️", "Тренировка"),
@@ -201,6 +204,14 @@ def _format_action_line(action: dict[str, Any]) -> str:
         if action.get("status") == "awaiting_confirm":
             return f"⏳ Подтвердить: {title}"
         return f"{icon} Выполнено: {title}"
+    if kind == "shift_wake":
+        if action.get("status") == "skipped":
+            return f"ℹ️ {title}"
+        return f"⏰ {title}"
+    if kind in {"task_delete", "reminder_delete"}:
+        if action.get("status") == "skipped" or payload.get("not_found"):
+            return f"ℹ️ Не нашла «{title}»"
+        return f"🗑 {label}: {title}"
     if kind == "done" and payload.get("completed_task_id"):
         delta = int(payload.get("karma_delta") or 0)
         score_after = payload.get("score_after")
@@ -1134,6 +1145,102 @@ async def _persist_parsed_items(
                     payload={"not_found": True},
                     status="skipped",
                 )
+        elif kind == "shift_wake":
+            target_hhmm = item.schedule.resolved_time if item.schedule else None
+            if target_hhmm:
+                prev_wake = str(user.get("wake_up_time") or "08:00")
+                await repo.update_user_wake(db, user["id"], target_hhmm)
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="shift_wake",
+                    target_table="user_wake_updated",
+                    target_id=user["id"],
+                    title=f"Подъём обновлён на {target_hhmm}",
+                    source_quote=item.source_quote,
+                    payload={"previous_wake": prev_wake, "new_wake": target_hhmm, "model_note": item.model_note},
+                    status="active",
+                )
+            else:
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="shift_wake",
+                    target_table="confirm_pending",
+                    target_id=None,
+                    title="Режим без будильника на завтра (уточни время подъёма HH:MM, чтобы изменить расписание)",
+                    source_quote=item.source_quote,
+                    payload={"no_alarm": item.category == "no_alarm", "model_note": item.model_note},
+                    status="skipped",
+                )
+        elif kind == "task_delete":
+            q_title = item.title or item.source_quote
+            matched = await repo.find_open_day_plan_item_by_title(db, user["id"], q_title, local_date)
+            if matched is None:
+                tom_date = (datetime.date.fromisoformat(local_date) + datetime.timedelta(days=1)).isoformat()
+                matched = await repo.find_open_day_plan_item_by_title(db, user["id"], q_title, tom_date)
+                matched_date = tom_date if matched else local_date
+            else:
+                matched_date = str(matched.get("plan_date") or local_date)
+            if matched:
+                await repo.delete_day_plan_item(db, user["id"], int(matched["id"]))
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="task_delete",
+                    target_table="day_plan_removed",
+                    target_id=int(matched["id"]),
+                    title=str(matched.get("title") or item.title),
+                    source_quote=item.source_quote,
+                    payload={"removed_item": dict(matched), "plan_date": matched_date, "model_note": item.model_note},
+                    status="active",
+                )
+            else:
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="task_delete",
+                    target_table="day_plan_removed",
+                    target_id=None,
+                    title=q_title,
+                    source_quote=item.source_quote,
+                    payload={"not_found": True, "model_note": item.model_note},
+                    status="skipped",
+                )
+        elif kind == "reminder_delete":
+            q_title = item.title or item.source_quote
+            matched_rem = await repo.find_custom_reminder_by_title(db, user["id"], q_title)
+            if matched_rem:
+                await repo.delete_custom_reminder(db, user["id"], int(matched_rem["id"]))
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="reminder_delete",
+                    target_table="custom_reminder_removed",
+                    target_id=int(matched_rem["id"]),
+                    title=str(matched_rem.get("title") or item.title),
+                    source_quote=item.source_quote,
+                    payload={"removed_item": dict(matched_rem), "model_note": item.model_note},
+                    status="active",
+                )
+            else:
+                action_id = await repo.create_inbox_action(
+                    db,
+                    user_id=user["id"],
+                    inbox_message_id=inbox_id,
+                    item_kind="reminder_delete",
+                    target_table="custom_reminder_removed",
+                    target_id=None,
+                    title=q_title,
+                    source_quote=item.source_quote,
+                    payload={"not_found": True, "model_note": item.model_note},
+                    status="skipped",
+                )
         elif kind == "reminder":
             sched = item.schedule
             if sched and not sched.is_ambiguous and sched.resolved_date and sched.resolved_time:
@@ -1831,6 +1938,7 @@ async def _build_query_response(
             user,
             user_text="" if is_more else raw_text,
             reply_context="" if is_more else reply_context,
+            recent_context=None if is_more else recent_context,
             llm_client_instance=llm_client_instance,
             exclude_ids=prev_ids,
             now_utc=now_utc,
@@ -1919,6 +2027,7 @@ async def _build_query_response(
                 user,
                 user_text=raw_text,
                 reply_context=reply_context,
+                recent_context=recent_context,
                 llm_client_instance=llm_client_instance,
                 now_utc=now_utc,
             )
@@ -2023,10 +2132,30 @@ async def _analyze_and_persist(
     inbox_id = int(inbox_row["id"])
     preface_note = ""
 
-    # 0. Ленивое доуточнение еды: не мешаем обычной беседе!
+    # 0. Ленивое доуточнение еды: не мешаем обычной беседе и уважаем отмену!
     if not is_student_mode(user):
         pending = await repo.get_active_pending_meal(db, uid, now_utc=now_utc)
         if pending is not None:
+            if fitness_nutrition.is_meal_cancel_reply(raw_text):
+                await repo.resolve_pending_meal(db, int(pending["id"]), status="cancelled")
+                await repo.update_inbox_message(db, inbox_id, status="processed")
+                updated_row = await repo.get_inbox_message(db, uid, inbox_id) or inbox_row
+                v_line = _voice_prefix_line(updated_row)
+                body = "👌 Ок, не записываю этот приём."
+                reply_text = f"{v_line}\n\n{body}" if v_line else body
+                return InboxProcessOutcome(
+                    inbox_id=inbox_id,
+                    status="processed",
+                    is_duplicate=False,
+                    source=updated_row.get("source") or "text",
+                    raw_text=raw_text,
+                    actions=[],
+                    clarifications=[],
+                    used_llm=False,
+                    reply_text=reply_text,
+                    reply_markup=None,
+                )
+
             if fitness_nutrition.is_lazy_accept_reply(raw_text):
                 committed = await commit_pending_meal(
                     db, user, pending, mult=1.0, status="committed", now_utc=now_utc
@@ -2133,7 +2262,9 @@ async def _analyze_and_persist(
     recent_ctx = _get_recent_context(uid, now_utc)
     ctx_for_parser = list(recent_ctx)
     if str(reply_context or "").strip():
-        ctx_for_parser.append({"role": "assistant", "text": str(reply_context).strip()[:400]})
+        ctx_for_parser.append(
+            {"role": "assistant", "text": str(reply_context).strip()[:400], "is_reply_context": True}
+        )
     snapshot = await context_builder.build_user_day_snapshot(db, user, now_utc=now_utc)
     ctx_for_llm = context_builder.format_context_for_llm(snapshot)
     parsed = await analyze_inbox_text(
@@ -2327,6 +2458,7 @@ async def capture_and_process_voice(
     chat_id: int,
     message_id: Optional[int],
     voice,
+    reply_context: str = "",
     now_utc: Optional[datetime.datetime] = None,
     stt_fn: Optional[Callable[..., Any]] = None,
     llm_client_instance: Optional[LLMClient] = None,
@@ -2471,6 +2603,7 @@ async def capture_and_process_voice(
         transcript,
         now,
         llm_client_instance=llm_client_instance,
+        reply_context=reply_context,
     )
 
 
@@ -2498,6 +2631,46 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
         removed = payload.get("removed_item")
         if isinstance(removed, dict) and removed.get("name"):
             await repo.restore_pantry_item(db, user_id, removed)
+        return
+    if table == "day_plan_removed":
+        if action.get("status") == "skipped":
+            return
+        removed = payload.get("removed_item")
+        if isinstance(removed, dict) and removed.get("title"):
+            plan_date = str(payload.get("plan_date") or removed.get("plan_date") or "")
+            if not plan_date:
+                plan_date = local_date_str(datetime.datetime.utcnow(), "UTC")
+            await repo.add_day_plan_item(
+                db,
+                user_id,
+                plan_date,
+                str(removed["title"]),
+                category=str(removed.get("category") or "inbox"),
+                is_important=bool(removed.get("is_important")),
+            )
+        return
+    if table == "custom_reminder_removed":
+        if action.get("status") == "skipped":
+            return
+        removed = payload.get("removed_item")
+        if isinstance(removed, dict) and removed.get("title"):
+            new_rem_id = await repo.create_custom_reminder(
+                db,
+                user_id=user_id,
+                title=str(removed["title"]),
+                reminder_time=str(removed.get("reminder_time") or "12:00"),
+                frequency_days=int(removed.get("frequency_days") or 1),
+                target_weekday=removed.get("target_weekday"),
+            )
+            if removed.get("last_sent_date"):
+                await repo.set_custom_reminder_sent(db, new_rem_id, str(removed["last_sent_date"]))
+        return
+    if table == "user_wake_updated":
+        if action.get("status") == "skipped":
+            return
+        prev_wake = str(payload.get("previous_wake") or "").strip()
+        if prev_wake:
+            await repo.update_user_wake(db, user_id, prev_wake)
         return
     tid = action.get("target_id")
     if table == "pantry_items":
@@ -2542,6 +2715,29 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
         completed_task_id = payload.get("completed_task_id")
         if completed_task_id:
             await repo.mark_day_plan_item_done(db, int(completed_task_id), done=False)
+            k_delta = int(payload.get("karma_delta") or 2)
+            if k_delta > 0:
+                k_state = await repo.get_or_create_karma_state(db, user_id)
+                old_score = int(k_state.get("score") if k_state.get("score") is not None else 70)
+                await repo.update_karma_state(
+                    db,
+                    user_id,
+                    score=max(0, old_score - k_delta),
+                )
+    elif table == "pulse_checkins":
+        if not payload.get("already_resolved"):
+            await repo.update_pulse_checkin(
+                db, tid_int, status="pending", resolved_at_utc=None
+            )
+            k_delta = int(payload.get("delta") or 0)
+            if k_delta > 0:
+                k_state = await repo.get_or_create_karma_state(db, user_id)
+                old_score = int(k_state.get("score") if k_state.get("score") is not None else 70)
+                await repo.update_karma_state(
+                    db,
+                    user_id,
+                    score=max(0, old_score - k_delta),
+                )
     elif table == "expenses":
         await repo.delete_expense(db, user_id, tid_int)
     elif table == "meal_logs":
@@ -2716,6 +2912,14 @@ async def rename_inbox_action(
             await repo.update_custom_reminder_title(db, user["id"], tid_int, clean_title)
         elif table == "journal_entries":
             await repo.update_journal_entry(db, user["id"], tid_int, title=clean_title)
+        elif table == "pantry_items":
+            await repo.update_pantry_item_name(db, user["id"], tid_int, clean_title)
+        elif table == "meal_logs":
+            await repo.update_meal_log(db, user["id"], tid_int, title=clean_title)
+        elif table == "workout_logs":
+            await repo.update_workout_log_title(db, user["id"], tid_int, clean_title)
+        elif table == "expenses":
+            await repo.update_expense_category(db, user["id"], tid_int, clean_title.lower())
 
     payload = _load_payload(action)
     if "title" in payload:
@@ -2955,6 +3159,11 @@ async def retry_inbox_stt(
             reply_text="У записи нет аудиофайла — пришли текстом.",
         )
 
+    retry_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Повторить расшифровку", callback_data=f"inbox:retry_stt:{inbox_id}")]
+        ]
+    )
     voice_stub = SimpleNamespace(
         file_id=file_id,
         file_unique_id=row.get("telegram_file_unique_id"),
@@ -2970,6 +3179,7 @@ async def retry_inbox_stt(
             source="voice",
             stt_error=dl_err or "download_failed",
             reply_text="Не смогла скачать аудио. Попробуй ещё раз или напиши текстом.",
+            reply_markup=retry_kb,
         )
 
     if stt_fn is not None:
@@ -2993,6 +3203,7 @@ async def retry_inbox_stt(
             source="voice",
             stt_error=stt_res.error or "stt_failed",
             reply_text="Пока всё ещё не удалось расшифровать аудио. Пришли текстом — я сразу запишу.",
+            reply_markup=retry_kb,
         )
 
     transcript = stt_res.text.strip()

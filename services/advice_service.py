@@ -195,6 +195,7 @@ async def build_situational_advice_reply(
     user_text: str = "",
     *,
     reply_context: str = "",
+    recent_context: Optional[list[dict[str, Any]]] = None,
     llm_client_instance: Optional[LLMClient] = None,
     exclude_ids: Optional[Set[str]] = None,
     now_utc: Optional[datetime.datetime] = None,
@@ -204,9 +205,11 @@ async def build_situational_advice_reply(
     card = pick_situational_advice(snapshot, user_text, exclude_ids=exclude_ids)
 
     clean_req = (user_text or "").strip()
+    has_followup_ctx = bool(str(reply_context or "").strip() or (recent_context and len(recent_context) > 0))
+    min_len = 2 if has_followup_ctx else 8
     is_rich_user_question = bool(
         clean_req
-        and len(clean_req) >= 8
+        and len(clean_req) >= min_len
         and clean_req.lower() not in {"/advice", "совет", "дай совет", "ещё совет", "more"}
     )
     client = llm_client_instance or default_llm_client
@@ -221,9 +224,20 @@ async def build_situational_advice_reply(
             "Опирайся ТОЛЬКО на факты из снимка дня и научно-практические принципы тренера ниже; строго держи тон режима кармы и коуча. Не выдумывай несуществующие события или рецепты."
         )
         reply_ctx_clean = str(reply_context or "").strip()[:400]
+        hist_lines: List[str] = []
+        if recent_context:
+            for turn in recent_context[-3:]:
+                if turn.get("is_reply_context"):
+                    continue
+                role_lbl = "Пользователь" if turn.get("role") == "user" else "HiDL"
+                t_txt = re.sub(r"\s+", " ", str(turn.get("text") or "").strip())
+                if t_txt:
+                    hist_lines.append(f"- {role_lbl}: {t_txt[:220]}")
+        hist_block = ("Недавний диалог:\n" + "\n".join(hist_lines) + "\n\n") if hist_lines else ""
         usr_prompt = (
             f"{ctx_block}\n\n"
             + (f"{coach_block}\n\n" if coach_block else "")
+            + hist_block
             + (f"Сообщение, на которое отвечает пользователь:\n{reply_ctx_clean}\n\n" if reply_ctx_clean else "")
             + f"Ориентир-карточка: {card.get('title')} — {card.get('micro_step')}\n\n"
             f"Запрос пользователя:\n{clean_req}"

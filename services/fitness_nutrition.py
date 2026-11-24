@@ -780,8 +780,6 @@ _LAZY_ACCEPT_EXACT: set[str] = {
     "да ок",
     "ладно",
     "лень",
-    "пропусти",
-    "отстань",
     "так запиши",
     "давай так",
     "давай примерно",
@@ -791,10 +789,29 @@ _LAZY_ACCEPT_EXACT: set[str] = {
     "да пофиг",
 }
 
+_MEAL_CANCEL_EXACT = {
+    "нет",
+    "не надо",
+    "не записывай",
+    "отмена",
+    "отменить",
+    "пропусти",
+    "пропустить",
+    "не ел",
+    "не ела",
+    "передумал",
+    "передумала",
+    "отстань",
+    "не сохраняй",
+}
+
 _NON_CLARIFICATION_RE = re.compile(
     r"(?iu)(?:^\s*/|\bнапомн|\bзадач|\bв\s+план|\bкупи\b|\bкупить\b|\bзакончил(?:ся|ась|ось|ись)\b|"
     r"\bпотратил|\bв\s+календар|\bперенеси|\bвзвесил|\bустал|\bтрево|\bне\s+могу\s+уснуть|"
-    r"\bчто\s+на\s+сегодня|\bкакая\s+карма|\bчто\s+в\s+холодильник|\bдай\s+совет)"
+    r"\bчто\s+на\s+сегодня|\bкакая\s+карма|\bчто\s+в\s+холодильник|\bдай\s+совет|"
+    r"\bпривет\b|\bку\b|\bхай\b|\bздравствуй\w*\b|\bспасибо\b|\bпока\b|"
+    r"\bпроснул\w*\b|\bвстал\w*\b|\bложусь\b|\bсплю\b|\bпочистил\w*\b|\bвыпил\s+вод\w*\b|"
+    r"\bболею\b|\bвыходной\b|\bудал\w*\b|\bотмен\w*\b|\bподъ[её]м\w*\b)"
 )
 
 _VAGUE_MEAL_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
@@ -842,10 +859,22 @@ def is_lazy_accept_reply(text: str) -> bool:
     return False
 
 
+def is_meal_cancel_reply(text: str) -> bool:
+    """Проверить, просит ли пользователь НЕ записывать ожидающий приём пищи."""
+    raw = str(text or "").strip().casefold().replace("ё", "е")
+    if not raw or len(raw) > 70:
+        return False
+    norm = re.sub(r"[?!.,;:\"'«»()]+", " ", raw)
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return norm in _MEAL_CANCEL_EXACT
+
+
 def looks_like_meal_clarification(text: str) -> bool:
     """Отличить уточнение по прошлой еде (граммы, начинка, этикетка) от новой отдельной команды."""
     raw = str(text or "").strip()
     if not raw or len(raw) > 180:
+        return False
+    if is_meal_cancel_reply(raw):
         return False
     if _NON_CLARIFICATION_RE.search(raw):
         return False
@@ -1399,9 +1428,9 @@ async def evaluate_meal_check(
         cards = coach_knowledge.select_coach_principles(
             {
                 "latest": latest_w or {},
-                "nutrition_advice": {"targets": targets, "eaten": eaten},
+                "nutrition_advice": {"targets": targets, "eaten": advice.get("eaten") or {}},
                 "meal_profile": meal_prof,
-                "weight_goal": goal,
+                "weight_goal": str(user.get("weight_goal") or targets.get("goal") or "loss"),
             },
             f"{dish.get('title', '')} {'перебор' if verdict == 'over' else ''}",
             limit=1,

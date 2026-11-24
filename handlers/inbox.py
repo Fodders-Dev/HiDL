@@ -88,10 +88,14 @@ async def inbox_free_text(message: types.Message, state: FSMContext, db) -> None
 async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> None:
     """Принять голосовое сообщение, сохранить сырое, расшифровать и разобрать."""
     current = await state.get_state()
-    if current and current.startswith("InboxEditState:"):
+    if current and (current.startswith("InboxEditState:") or current.startswith("MealAddState:")):
         await state.clear()
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     night_notice = await pulse_service.check_night_violation(db, user)
+    reply_msg = getattr(message, "reply_to_message", None)
+    reply_context = str(
+        getattr(reply_msg, "text", None) or getattr(reply_msg, "caption", None) or ""
+    ).strip()[:400]
     outcome = await inbox_service.capture_and_process_voice(
         db,
         message.bot,
@@ -99,6 +103,7 @@ async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> N
         chat_id=message.chat.id,
         message_id=message.message_id,
         voice=message.voice,
+        reply_context=reply_context,
     )
     reply_text = f"{night_notice}\n\n{outcome.reply_text}" if night_notice else outcome.reply_text
     await message.answer(
@@ -286,7 +291,39 @@ async def _process_unsolicited_image(
     low_cap = caption.lower()
     now_utc = datetime.datetime.utcnow()
 
-    # 1. Если ждём уточнение по недавней еде -> фото этикетки или тарелки сразу уточняет и сохраняет!
+    # 1. Если в подписи явно про весы/замер тела -> распознаём умные весы (раньше pending meal!)
+    if any(w in low_cap for w in _SCALE_CAPTION_KEYWORDS):
+        scale_res = await fitness_nutrition.parse_smart_scale_input(
+            raw_text=caption,
+            image_bytes=img_bytes,
+            image_mime=image_mime,
+            allow_partial=True,
+        )
+        if scale_res.get("ok"):
+            if await _save_and_reply_scale(message, db, user, scale_res, now_utc, explicit_scale=True):
+                return
+        await message.answer(
+            "⚖ Не смогла разобрать цифры с весов. Отправь отчёт Xiaomi <b>как файл (без сжатия)</b> или впиши вес текстом (например <code>99.2</code>).",
+            parse_mode="HTML",
+        )
+        return
+
+    # 2. Быстрый путь для длинного вертикального экспорта Xiaomi без подписи -> сразу проверяем весы
+    checked_scale_first = False
+    if not caption and fitness_nutrition.is_tall_scale_like_image(img_bytes):
+        checked_scale_first = True
+        scale_res = await fitness_nutrition.parse_smart_scale_input(
+            raw_text="",
+            image_bytes=img_bytes,
+            image_mime=image_mime,
+            require_scale_screen=True,
+            allow_partial=True,
+        )
+        if scale_res.get("ok"):
+            if await _save_and_reply_scale(message, db, user, scale_res, now_utc, explicit_scale=True):
+                return
+
+    # 3. Если ждём уточнение по недавней еде -> фото этикетки или тарелки сразу уточняет и сохраняет!
     pending = await repo.get_active_pending_meal(db, uid, now_utc=now_utc)
     if pending is not None:
         combined_cap = f"{pending['raw_text']} {caption}".strip()
@@ -324,38 +361,6 @@ async def _process_unsolicited_image(
             )
             return
 
-    # 2. Если в подписи явно про весы/замер тела -> распознаём умные весы (включая 2-й скрин)
-    if any(w in low_cap for w in _SCALE_CAPTION_KEYWORDS):
-        scale_res = await fitness_nutrition.parse_smart_scale_input(
-            raw_text=caption,
-            image_bytes=img_bytes,
-            image_mime=image_mime,
-            allow_partial=True,
-        )
-        if scale_res.get("ok"):
-            if await _save_and_reply_scale(message, db, user, scale_res, now_utc, explicit_scale=True):
-                return
-        await message.answer(
-            "⚖ Не смогла разобрать цифры с весов. Отправь отчёт Xiaomi <b>как файл (без сжатия)</b> или впиши вес текстом (например <code>99.2</code>).",
-            parse_mode="HTML",
-        )
-        return
-
-    # 3. Быстрый путь для длинного вертикального экспорта Xiaomi без подписи -> сразу проверяем весы
-    checked_scale_first = False
-    if not caption and fitness_nutrition.is_tall_scale_like_image(img_bytes):
-        checked_scale_first = True
-        scale_res = await fitness_nutrition.parse_smart_scale_input(
-            raw_text="",
-            image_bytes=img_bytes,
-            image_mime=image_mime,
-            require_scale_screen=True,
-            allow_partial=True,
-        )
-        if scale_res.get("ok"):
-            if await _save_and_reply_scale(message, db, user, scale_res, now_utc, explicit_scale=True):
-                return
-
     # 4. Обычное фото еды или этикетки из чата -> показываем 1-тап превью КБЖУ
     from handlers import nutrition
 
@@ -389,7 +394,16 @@ async def _process_unsolicited_image(
             )
             return
 
-    await nutrition._show_meal_preview(message, state, parsed_meal)
+    if parsed_meal.get("error") == "llm_not_configured":
+        await nutrition._show_meal_preview(message, state, parsed_meal)
+        return
+
+    await message.answer(
+        "Не смогла разобрать по фото ни еду, ни замеры весов. "
+        "Если это блюдо — подпиши коротко (например <code>Гречка 150 г</code>), если весы Xiaomi — пришли как файл без сжатия.",
+        reply_markup=main_menu_keyboard(user),
+        parse_mode="HTML",
+    )
 
 
 @router.message(StateFilter(None), F.photo)
@@ -507,7 +521,21 @@ async def _refresh_summary_message(message: types.Message, db, user: dict[str, A
         await safe_edit(message, "Запись не найдена.")
         return
     actions = await repo.list_inbox_actions(db, user["id"], inbox_id, include_undone=False)
-    text, kb = inbox_service.render_inbox_summary(row, actions, llm_error=row.get("llm_error") or None)
+    row_intent = "capture"
+    raw_llm = str(row.get("llm_raw_json") or "").strip()
+    if raw_llm.startswith("{"):
+        try:
+            parsed_raw = json.loads(raw_llm)
+            if isinstance(parsed_raw, dict) and parsed_raw.get("intent") in {"support", "capture", "query", "chat"}:
+                row_intent = str(parsed_raw["intent"])
+        except Exception:
+            pass
+    text, kb = inbox_service.render_inbox_summary(
+        row,
+        actions,
+        llm_error=row.get("llm_error") or None,
+        intent=row_intent,
+    )
     await safe_edit(message, text, reply_markup=kb)
 
 
@@ -520,6 +548,12 @@ async def inbox_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         if current and current.startswith("InboxEditState:"):
             await state.clear()
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+
+    if action == "edit_cancel":
+        await state.clear()
+        await safe_edit(callback.message, "Отменила уточнение.")
+        await callback.answer("Отменено")
+        return
 
     if action == "summary" and len(parts) > 2:
         inbox_id = int(parts[2])
@@ -816,7 +850,10 @@ async def inbox_clarify_when_input(message: types.Message, state: FSMContext, db
     )
     if sched.is_ambiguous or not sched.resolved_date or not sched.resolved_time:
         await message.answer(
-            sched.question or "Не поняла дату и время. Напиши, например: «завтра в 14:00»."
+            sched.question or "Не поняла дату и время. Напиши, например: «завтра в 14:00».",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="inbox:edit_cancel")]]
+            ),
         )
         return
 

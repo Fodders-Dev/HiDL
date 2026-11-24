@@ -30,6 +30,9 @@ VALID_KINDS = {
     "pulse_log",
     "rollover_tasks",
     "shift_bedtime",
+    "shift_wake",
+    "task_delete",
+    "reminder_delete",
     "meal_log",
     "weight_log",
     "workout_log",
@@ -188,10 +191,13 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "pulse_log": только голая отметка Пульса БЕЗ конкретного блюда/названия еды (category: "wake"|"lunch"|"dinner"|"water"|"teeth"|"bedtime", например "я поел", "уже пообедал", "выпил воды", "почистил зубы", "ложусь спать"). Если сказано "съел овсянку и выпил воды" -> верни ОДНОВРЕМЕННО meal_log ("овсянка") и pulse_log (category="water").
 - "rollover_tasks": перенести незавершённые дела/хвосты дня на завтра ("перенеси хвосты на завтра").
 - "shift_bedtime": перенести время отбоя сегодня на час HH:MM (time_hint="HH:MM", например "ложусь в 00:30").
+- "shift_wake": изменить время подъёма/будильника ("завтра подъёмы будут в 6:30", "подъём в 7:00", time_hint="HH:MM") или отметить день без будильника ("завтра без будильника").
+- "task_delete": удалить/убрать конкретную задачу из плана дня ("удали задачу ...", "убери задачу ...").
+- "reminder_delete": удалить/отменить существующее напоминание ("удали напоминание про ...", "отмени напоминание ...").
 - "expense": денежная трата ("потратил 450 на кофе" -> amount=450, category="кофе", title="Кофе").
 - "diary": мысли, переживания, усталость, самочувствие, события дня без поручения.
 - "idea": задумки, мечты, "хочу когда-нибудь...", проекты на будущее.
-- "done": то, что пользователь уже сделал (кроме тренировок workout_log и еды meal_log).
+- "done": то, что пользователь уже сделал или просит отметить/закрыть выполненную задачу ("закрой задачу ...", "отметь задачу ...", "я уже купил билеты").
 
 Строгие правила:
 1. Приветствия / "спасибо" / "ок" -> intent="chat", items=[], query_type="none", тёплый короткий reply (1-2 предложения по-русски в женском роде).
@@ -200,8 +206,8 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 4. Если передан «Снимок дня пользователя» (время, карма, отбой, задачи, холодильник, диета, цель и остаток КБЖУ), строго соблюдай директиву тона и стиля коуча и не выдумывай отсутствующие факты.
 5. Чистые мечты и задумки ("хочу когда-нибудь...") -> только kind="idea", НИКОГДА "task" или "reminder".
 6. Сохраняй "source_quote" дословным фрагментом исходного текста. В "model_note" пиши только пометку-гипотезу, не выдумывай факты.
-7. Для "shopping", "shopping_remove", "pantry_add", "pantry_remove" в "title" пиши чистое название товара (например "Гречка", "Овсяное молоко", "Тофу").
-8. Для "task", "reminder", "calendar_event" и "shift_bedtime" передай "date_hint" ("сегодня", "завтра", "послезавтра", "19.11.2026") и "time_hint" ("12:00", "00:30", "в 8", "утром") без вычисления дат.
+7. Для "shopping", "shopping_remove", "pantry_add", "pantry_remove", "task_delete", "reminder_delete" в "title" пиши чистое название объекта.
+8. Для "task", "reminder", "calendar_event", "shift_bedtime" и "shift_wake" передай "date_hint" ("сегодня", "завтра", "послезавтра", "19.11.2026") и "time_hint" ("12:00", "00:30", "в 8", "утром") без вычисления дат.
 9. Если дан "Недавний контекст диалога", используй его для коротких продолжений вроде "а ещё?", "другое", "без картошки", "побыстрее". Если в предыдущем ответе обсуждалась еда/рецепты, а пользователь просит "а ещё?" или уточняет пожелание — возвращай intent="query", query_type="food", query_term="more" (или текст фильтра, например "без картошки"), НЕ "diary"!
 10. Отвечай строго валидным JSON объектом формата:
 {
@@ -211,7 +217,7 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
   "query_term": "",
   "items": [
     {
-      "kind": "task|reminder|calendar_event|shopping|shopping_remove|pantry_add|pantry_remove|meal_log|weight_log|workout_log|pulse_log|rollover_tasks|shift_bedtime|expense|diary|idea|done",
+      "kind": "task|reminder|calendar_event|shopping|shopping_remove|pantry_add|pantry_remove|meal_log|weight_log|workout_log|pulse_log|rollover_tasks|shift_bedtime|shift_wake|task_delete|reminder_delete|expense|diary|idea|done",
       "title": "...",
       "source_quote": "...",
       "model_note": "",
@@ -663,6 +669,20 @@ _SHIFT_BEDTIME_RE = re.compile(
     r"\b(?:подвин[иь]|сдвин[иь]|перенес[ит]\w*)\s+отбой\s+(?:на|в|к)\s*(\d{1,2}\s*[:.]\s*\d{2}))"
 )
 
+_SHIFT_WAKE_RE = re.compile(
+    r"(?iu)(?:\b(?:завтра|сегодня|обычно)?\s*(?:подъ[её]м\w*|будильник\w*|встаю|вставать|проснуться)\s*(?:буд(?:ет|ут))?\s*(?:в|на|к)\s*(\d{1,2}\s*[:.]\s*\d{2})|"
+    r"\b(?:перенес[ит]\w*|постав[иь]|сдвин[иь]|поменяй|измени)\s+(?:подъ[её]м\w*|будильник\w*)\s+(?:на|в|к)\s*(\d{1,2}\s*[:.]\s*\d{2})|"
+    r"\b(?:завтра|сегодня)\s+без\s+будильник\w*\b|\bсплю\s+без\s+будильник\w*\b)"
+)
+
+_TASK_DELETE_RE = re.compile(
+    r"(?iu)\b(?:удал[иь]|удалить|убер[иь]|убрать|вычеркн[иь]|отмен[иь])\s+задач[уи]\s+(.+)"
+)
+
+_REMINDER_DELETE_RE = re.compile(
+    r"(?iu)\b(?:удал[иь]|удалить|убер[иь]|убрать|отмен[иь]|выключ[иь])\s+напоминан\w*(?:\s+(?:про|о|об))?\s+(.+)"
+)
+
 _PANTRY_REMOVE_RE = re.compile(
     r"(?iu)(?:^(?:я\s+|мы\s+|уже\s+)?(?:съел[аи]?|доел[аи]?)\s+([а-яёa-z-]+)$|"
     r"(?:убер[иь]|удал[иь]|убрать|удалить|вычеркн[иь]|выкинул[аи]?)\s+(.+?)\s+из\s+(?:холодильник\w*|кладовк\w*))"
@@ -711,7 +731,7 @@ _PULSE_LOG_RULES = (
         "lunch",
         "Приём пищи",
     ),
-    (re.compile(r"(?iu)^(?:я\s+)?(?:встал[аи]?|проснул(?:ся|ась))\b"), "wake", "Подъём"),
+    (re.compile(r"(?iu)^(?:(?:я|вот|только|сейчас|уже)\s+)*(?:встал[аи]?|проснул(?:ся|ась))\b"), "wake", "Подъём"),
 )
 
 
@@ -1011,14 +1031,27 @@ def _apply_guardrails(
                         break
             item.category = slot
             item.title = _capitalize_first(item.title or quote)
-    elif kind == "shift_bedtime":
+    elif kind in {"shift_bedtime", "shift_wake"}:
         hhmm = _extract_bedtime_hhmm(time_hint) or _extract_bedtime_hhmm(quote)
         item.schedule = ResolvedSchedule(
             resolved_date=None,
             resolved_time=hhmm,
             is_ambiguous=(hhmm is None),
         )
-        item.title = f"Сдвинуть отбой на {hhmm}" if hhmm else _capitalize_first(item.title or quote)
+        if kind == "shift_bedtime":
+            item.title = f"Сдвинуть отбой на {hhmm}" if hhmm else _capitalize_first(item.title or quote)
+        else:
+            if "без будильник" in quote.lower():
+                item.category = "no_alarm"
+            item.title = f"Подъём в {hhmm}" if hhmm else _capitalize_first(item.title or quote)
+    elif kind == "task_delete":
+        m_td = _TASK_DELETE_RE.search(quote)
+        raw_td = (m_td.group(1) if m_td else item.title or quote).strip(" ,.?!\"'«»")
+        item.title = _capitalize_first(raw_td) or _capitalize_first(quote)
+    elif kind == "reminder_delete":
+        m_rd = _REMINDER_DELETE_RE.search(quote)
+        raw_rd = (m_rd.group(1) if m_rd else item.title or quote).strip(" ,.?!\"'«»")
+        item.title = _capitalize_first(raw_rd) or _capitalize_first(quote)
     else:
         item.title = _capitalize_first(item.title or quote)
 
@@ -1078,6 +1111,54 @@ def parse_inbox_fallback(
                     now_utc=now_utc,
                     tz_str=tz_str,
                     time_hint=hhmm or "",
+                )
+            )
+            continue
+
+        m_wake_shift = _SHIFT_WAKE_RE.search(clause)
+        if m_wake_shift:
+            t_raw = next((g for g in (m_wake_shift.groups() or ()) if g), "")
+            hhmm = _extract_bedtime_hhmm(t_raw) if t_raw else None
+            items.append(
+                _apply_guardrails(
+                    ParsedInboxItem(
+                        kind="shift_wake",
+                        title=f"Подъём в {hhmm}" if hhmm else clause,
+                        source_quote=clause,
+                    ),
+                    now_utc=now_utc,
+                    tz_str=tz_str,
+                    time_hint=hhmm or "",
+                )
+            )
+            continue
+
+        m_tdel = _TASK_DELETE_RE.search(clause)
+        if m_tdel:
+            items.append(
+                _apply_guardrails(
+                    ParsedInboxItem(
+                        kind="task_delete",
+                        title=m_tdel.group(1).strip(),
+                        source_quote=clause,
+                    ),
+                    now_utc=now_utc,
+                    tz_str=tz_str,
+                )
+            )
+            continue
+
+        m_rdel = _REMINDER_DELETE_RE.search(clause)
+        if m_rdel:
+            items.append(
+                _apply_guardrails(
+                    ParsedInboxItem(
+                        kind="reminder_delete",
+                        title=m_rdel.group(1).strip(),
+                        source_quote=clause,
+                    ),
+                    now_utc=now_utc,
+                    tz_str=tz_str,
                 )
             )
             continue
@@ -1399,6 +1480,8 @@ def _latest_assistant_query_type(recent_context: Optional[list[dict[str, Any]]])
     if not recent_context:
         return None
     for turn in reversed(recent_context):
+        if turn.get("is_reply_context"):
+            continue
         if turn.get("role") == "assistant":
             meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
             qt = str(meta.get("query_type") or "").strip().lower()
@@ -1413,12 +1496,17 @@ def _format_recent_context(recent_context: Optional[list[dict[str, Any]]]) -> st
         return ""
     lines = ["Недавний контекст диалога:"]
     for turn in recent_context[-4:]:
-        role = "Пользователь" if turn.get("role") == "user" else "HiDL"
+        if turn.get("is_reply_context"):
+            role = "Сообщение HiDL, на которое отвечает пользователь"
+            max_len = 400
+        else:
+            role = "Пользователь" if turn.get("role") == "user" else "HiDL"
+            max_len = 180
         txt = re.sub(r"\s+", " ", str(turn.get("text") or "").strip())
         if not txt:
             continue
-        if len(txt) > 180:
-            txt = txt[:177] + "..."
+        if len(txt) > max_len:
+            txt = txt[: max_len - 3] + "..."
         lines.append(f"- {role}: {txt}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
