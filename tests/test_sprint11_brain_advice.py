@@ -21,7 +21,7 @@ from aiogram.types import CallbackQuery, Chat, Message, Update, User
 from db import repositories as repo
 from hidl.app import create_app
 from llm_client import LLMClient, LLMResult
-from services import advice_service, context_builder, inbox_service, karma_service, pulse_service
+from services import advice_service, context_builder, fitness_nutrition, inbox_service, karma_service, pulse_service
 from services.inbox_parser import analyze_inbox_text
 from services.knowledge import KnowledgeService
 from utils.time import local_date_str
@@ -201,16 +201,25 @@ class Sprint11BrainAdviceTests(unittest.IsolatedAsyncioTestCase):
     def test_1_expanded_knowledge_base_schemas_and_counts(self) -> None:
         root = Path(__file__).resolve().parents[1]
         recipes = json.loads((root / "data" / "knowledge" / "recipes_core.json").read_text(encoding="utf-8"))
-        self.assertGreaterEqual(len(recipes), 50)
+        self.assertGreaterEqual(len(recipes), 85)
         ids = [r["id"] for r in recipes]
         self.assertEqual(len(ids), len(set(ids)))
         for orig_id in ("omelet", "tofu_scramble", "chickpea_curry", "lentil_soup", "hummus_wrap", "eggs_toast"):
             self.assertIn(orig_id, ids)
         vegan_cnt = sum(1 for r in recipes if "vegan" in (r.get("tags") or []))
-        self.assertGreaterEqual(vegan_cnt, 25)
+        self.assertGreaterEqual(vegan_cnt, 65)
         for r in recipes:
             self.assertTrue(r.get("title") and r.get("ingredients") and r.get("steps"))
             self.assertGreater(int(r.get("time_minutes") or 0), 0)
+            est = fitness_nutrition.estimate_recipe_nutrition(r)
+            self.assertGreater(est["kcal"], 0, r.get("id"))
+            if "nutrition" in r:
+                nutr = r["nutrition"]
+                self.assertIsInstance(nutr, dict, r.get("id"))
+                self.assertGreater(nutr.get("kcal") or 0, 0, r.get("id"))
+                for macro in ("protein_g", "fat_g", "carbs_g"):
+                    self.assertIn(macro, nutr, r.get("id"))
+                    self.assertGreaterEqual(float(nutr[macro]), 0.0, f"{r.get('id')}.{macro}")
 
         aff_full = json.loads((root / "data" / "knowledge" / "affirmations_full.json").read_text(encoding="utf-8"))
         for cat in ("motivation", "calm", "confidence", "quotes"):

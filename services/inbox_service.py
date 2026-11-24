@@ -511,12 +511,21 @@ async def _persist_meal_item(
     now_utc: datetime.datetime,
     llm_client_instance: Optional[LLMClient] = None,
     allow_clarification: bool = True,
+    is_single_item: bool = False,
 ) -> int:
     uid = int(user["id"])
     inbox_id = int(inbox_row["id"])
     source = str(inbox_row.get("source") or "text")
     chat_id = int(inbox_row.get("chat_id") or 0)
-    raw_for_parse = (source_quote or title_hint or "").strip()
+    sq = (source_quote or "").strip()
+    th = (title_hint or "").strip()
+    full_raw = str(inbox_row.get("raw_text") or "").strip()
+    if is_single_item and full_raw and len(full_raw) > len(sq):
+        raw_for_parse = full_raw
+    elif sq and th and th.casefold() not in sq.casefold() and sq.casefold() not in th.casefold():
+        raw_for_parse = f"{th}. {sq}"
+    else:
+        raw_for_parse = (sq or th or full_raw).strip()
 
     parsed_meal = await fitness_nutrition.parse_meal_input(
         raw_text=raw_for_parse,
@@ -525,6 +534,7 @@ async def _persist_meal_item(
         user_id=uid,
         allow_clarification=allow_clarification,
         allow_web_lookup=True,
+        title_hint=th,
     )
     if not parsed_meal.get("ok"):
         parsed_meal = {
@@ -632,6 +642,7 @@ async def _persist_parsed_items(
     source = inbox_row.get("source") or "text"
     inbox_id = int(inbox_row["id"])
     now = now_utc or datetime.datetime.utcnow()
+    is_single_item = len(parsed.items) == 1
 
     for item in parsed.items:
         kind = item.kind
@@ -827,6 +838,7 @@ async def _persist_parsed_items(
                     local_date=local_date,
                     now_utc=now,
                     llm_client_instance=llm_client_instance,
+                    is_single_item=is_single_item,
                 )
             else:
                 action_id = await repo.create_inbox_action(
@@ -851,6 +863,7 @@ async def _persist_parsed_items(
                 local_date=local_date,
                 now_utc=now,
                 llm_client_instance=llm_client_instance,
+                is_single_item=is_single_item,
             )
         elif kind == "weight_log":
             scale_res = await fitness_nutrition.parse_smart_scale_input(

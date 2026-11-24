@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+from functools import lru_cache
 import json
 import math
 import re
@@ -94,6 +95,7 @@ _CANONICAL_ALIASES: List[Tuple[str, Tuple[str, ...]]] = [
     ("onion", ("лук",)),
     ("garlic", ("чеснок",)),
     ("carrot", ("морковь", "морковка")),
+    ("cauliflower", ("цветная капуста",)),
     ("cabbage", ("капуста",)),
     ("mushrooms", ("шампиньоны", "грибы")),
     ("herbs", ("зелень", "укроп", "петрушка", "кинза")),
@@ -104,6 +106,13 @@ _CANONICAL_ALIASES: List[Tuple[str, Tuple[str, ...]]] = [
     ("egg", ("яйцо", "яйца")),
     ("pepper_bell", ("болгарский перец", "перец сладкий")),
     ("soy_sauce", ("соевый соус",)),
+    ("soy_meat", ("соевое мясо", "соевый фарш", "соевый гуляш", "соевый текстурат")),
+    ("spinach", ("шпинат",)),
+    ("sweet_chili", ("сладкий чили",)),
+    ("sweet_sour", ("кисло-сладкий соус", "кисло сладкий соус")),
+    ("teriyaki", ("соус терияки", "терияки")),
+    ("ketchup", ("кетчуп",)),
+    ("vegan_patty", ("веганские котлеты", "веган котлеты", "растительные котлеты")),
     ("broccoli", ("брокколи",)),
     ("banana", ("банан",)),
     ("berries", ("ягоды",)),
@@ -111,6 +120,21 @@ _CANONICAL_ALIASES: List[Tuple[str, Tuple[str, ...]]] = [
     ("hummus", ("хумус",)),
     ("cheese", ("сыр",)),
 ]
+
+_CANONICAL_ALIAS_RULES: Tuple[Tuple[str, Tuple[Tuple[str, Tuple[str, ...], str], ...]], ...] = tuple(
+    (
+        key,
+        tuple(
+            (
+                pat.replace("ё", "е"),
+                tuple(pat.replace("ё", "е").split()),
+                repo._ru_stem(pat.replace("ё", "е")) if " " not in pat.replace("ё", "е") else "",
+            )
+            for pat in patterns
+        ),
+    )
+    for key, patterns in _CANONICAL_ALIASES
+)
 
 _MODIFIER_WORDS = {
     "варёный",
@@ -257,6 +281,7 @@ def from_base(amount_base: float, unit: str) -> float:
     return val
 
 
+@lru_cache(maxsize=4096)
 def _clean_ing_text(text: str) -> str:
     s = (text or "").strip().casefold().replace("ё", "е")
     s = re.sub(r"[()]", " ", s)
@@ -264,31 +289,31 @@ def _clean_ing_text(text: str) -> str:
     return s
 
 
-def _split_alternatives(name: str) -> List[str]:
+@lru_cache(maxsize=4096)
+def _split_alternatives(name: str) -> Tuple[str, ...]:
     cleaned = _clean_ing_text(name)
     if not cleaned:
-        return []
+        return ()
     parts = re.split(r"\s*/\s*|\s+или\s+", cleaned)
-    return [p.strip() for p in parts if p.strip()]
+    return tuple(p.strip() for p in parts if p.strip())
 
 
+@lru_cache(maxsize=4096)
 def _canonical_key(single_name: str) -> Optional[str]:
     norm = _clean_ing_text(single_name)
     if not norm:
         return None
-    for key, patterns in _CANONICAL_ALIASES:
-        for pat in patterns:
-            pat_norm = pat.replace("ё", "е")
+    norm_tokens = norm.split()
+    norm_token_set = set(norm_tokens)
+    norm_stems = {repo._ru_stem(nt) for nt in norm_tokens}
+    for key, rules in _CANONICAL_ALIAS_RULES:
+        for pat_norm, pat_tokens, pat_stem in rules:
             if pat_norm == norm:
                 return key
-            pat_tokens = pat_norm.split()
-            norm_tokens = norm.split()
-            if len(pat_tokens) > 1 and all(pt in norm for pt in pat_tokens):
-                return key
-            if len(pat_tokens) == 1 and any(
-                nt == pat_norm or repo._ru_stem(nt) == repo._ru_stem(pat_norm)
-                for nt in norm_tokens
-            ):
+            if len(pat_tokens) > 1:
+                if all(pt in norm for pt in pat_tokens):
+                    return key
+            elif pat_norm in norm_token_set or pat_stem in norm_stems:
                 # Не даём одиночному «молоко» перехватить растительное/кокосовое молоко,
                 # а «паста» — арахисовую или томатную пасту.
                 if key == "milk_dairy" and any(q in norm for q in ("кокос", "овсян", "растительн", "соев", "миндал")):
@@ -301,14 +326,16 @@ def _canonical_key(single_name: str) -> Optional[str]:
     return None
 
 
-def _meaningful_stems(single_name: str) -> List[str]:
+@lru_cache(maxsize=4096)
+def _meaningful_stems(single_name: str) -> Tuple[str, ...]:
     norm = _clean_ing_text(single_name)
     words = [w for w in re.findall(r"[a-zа-я0-9]+", norm) if w not in _MODIFIER_WORDS]
     if not words:
         words = re.findall(r"[a-zа-я0-9]+", norm)
-    return [repo._ru_stem(w) or w for w in words if len(w) >= 2]
+    return tuple(repo._ru_stem(w) or w for w in words if len(w) >= 2)
 
 
+@lru_cache(maxsize=4096)
 def is_staple_ingredient(name: str) -> bool:
     """Проверить, относится ли ингредиент к базовым специям/воде, которые не нужно докупать."""
     alts = _split_alternatives(name)
@@ -325,6 +352,7 @@ def is_staple_ingredient(name: str) -> bool:
     return False
 
 
+@lru_cache(maxsize=16384)
 def ingredients_match(name_a: str, name_b: str) -> bool:
     """Сопоставить два названия ингредиентов по синонимам и русским основам."""
     alts_a = _split_alternatives(name_a)
@@ -730,7 +758,8 @@ def _pick_recipe_for_plan_slot(
     used_ids: Set[str],
     exclude_ids: Set[str],
     recent_ids: Set[str],
-    planned_ingredients: List[str],
+    planned_ingredients: Iterable[str],
+    coverage_by_id: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, Any]]:
     pool = [r for r in candidates if str(r.get("id") or "") not in used_ids]
     if not pool:
@@ -750,8 +779,10 @@ def _pick_recipe_for_plan_slot(
         rid = str(recipe.get("id") or "")
         tags = set(recipe.get("tags") or [])
         t_min = int(recipe.get("time_minutes") or 25)
-        match = match_recipe_to_pantry(recipe, pantry, servings=2)
-        cov = float(match["coverage"])
+        if coverage_by_id is not None and rid in coverage_by_id:
+            cov = coverage_by_id[rid]
+        else:
+            cov = float(match_recipe_to_pantry(recipe, pantry, servings=2)["coverage"])
 
         score = 0.0
         if meal_slot in tags:
@@ -825,8 +856,12 @@ async def generate_meal_plan(
     await repo.clear_meal_plans_range(db, user_id, base_date_str, end_date_str)
 
     used_ids: Set[str] = set()
-    planned_ingredients: List[str] = []
+    planned_ingredients: Set[str] = set()
     saved_rows: List[Dict[str, Any]] = []
+    coverage_by_id: Dict[str, float] = {
+        str(r.get("id") or ""): float(match_recipe_to_pantry(r, pantry, servings=2)["coverage"])
+        for r in candidates
+    }
 
     for d_idx in range(eff_days):
         plan_date = (base_date + datetime.timedelta(days=d_idx)).isoformat()
@@ -841,6 +876,7 @@ async def generate_meal_plan(
                 exclude_ids=excl_set,
                 recent_ids=recent_ids,
                 planned_ingredients=planned_ingredients,
+                coverage_by_id=coverage_by_id,
             )
             if not picked:
                 continue
@@ -848,7 +884,9 @@ async def generate_meal_plan(
             used_ids.add(rid)
             for ing in picked.get("ingredients") or []:
                 if isinstance(ing, dict) and ing.get("name") and not is_staple_ingredient(str(ing["name"])):
-                    planned_ingredients.append(str(ing["name"]))
+                    cleaned_ing = _clean_ing_text(str(ing["name"]))
+                    if cleaned_ing:
+                        planned_ingredients.add(cleaned_ing)
             row = await repo.upsert_meal_plan_slot(
                 db,
                 user_id,

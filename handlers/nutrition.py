@@ -311,6 +311,9 @@ async def kbju_confirm_cb(callback: types.CallbackQuery, state: FSMContext, db) 
         carbs_g=float(preview.get("carbs_g") or 0),
         source="vision" if preview.get("used_llm") else "manual",
     )
+    active_pending = await repo.get_active_pending_meal(db, int(user["id"]), now_utc=now_utc)
+    if active_pending:
+        await repo.resolve_pending_meal(db, int(active_pending["id"]), status="cancelled")
     await state.clear()
     text, kb = await render_kbju_card(db, user, now_utc=now_utc)
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")

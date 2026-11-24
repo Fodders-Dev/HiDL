@@ -631,6 +631,91 @@ class VoiceKbjuAndCoachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(karma_after, karma_before)
         self.assertEqual(int(u_after.get("points_total") or 0), pts_before)
 
+    async def test_9_spoken_label_dictation_and_dessert_isolation(self) -> None:
+        now = datetime.datetime.utcnow()
+        ld = local_date_str(now, "Europe/Moscow")
+
+        # 1. Exact real voice transcript with truncated LLM source_quote & portion suffix in title_hint
+        aktibio_text = (
+            "Пью Актибио, примерно грамм 200 пью, пищевая ценность на 100 грамм, "
+            "жира 1,6 грамм, белка 3,0 грамм, углеводов 10,5 грамм, 68 килокалорий, "
+            "бутылка на 870 грамм, я из них где-то грамм 200 сейчас выпил с блинами этими"
+        )
+        fake_inbox_llm = _FakeLLM(
+            json_payload={
+                "intent": "action",
+                "items": [
+                    {
+                        "kind": "meal_log",
+                        "title": "Био-йогурт «Актибио» со злаками, около 200 г",
+                        "source_quote": "грамм 200 сейчас выпил с блинами этими",
+                        "category": "snack",
+                    }
+                ],
+            }
+        )
+        o_akt = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=940001,
+            message_id=50,
+            text=aktibio_text,
+            now_utc=now,
+            llm_client_instance=fake_inbox_llm,
+        )
+        self.assertEqual(o_akt.status, "processed")
+        self.assertIsNone(await repo.get_active_pending_meal(self.db, self.u_id, now_utc=now))
+        meals = await repo.list_meal_logs(self.db, self.u_id, ld)
+        self.assertEqual(len(meals), 1)
+        self.assertEqual(meals[0]["title"], "Био-йогурт «Актибио» со злаками")
+        self.assertEqual(meals[0]["kcal"], 136)
+        self.assertAlmostEqual(meals[0]["protein_g"], 6.0, places=1)
+        self.assertAlmostEqual(meals[0]["fat_g"], 3.2, places=1)
+        self.assertAlmostEqual(meals[0]["carbs_g"], 21.0, places=1)
+        saved = await repo.find_user_food_product(self.db, self.u_id, "Био-йогурт Актибио со злаками")
+        self.assertIsNotNone(saved)
+        self.assertAlmostEqual(float(saved["per_100g"]["kcal"]), 68.0, places=1)
+        self.assertAlmostEqual(float(saved["serving_g"]), 200.0, places=1)
+
+        # 2. Direct offline label math without title_hint handles spoken calories, units, and 200g vs 870g bottle
+        offline_akt = fitness_nutrition._parse_label_math_offline(aktibio_text)
+        self.assertIsNotNone(offline_akt)
+        self.assertEqual(offline_akt["kcal"], 136)
+        self.assertEqual(offline_akt["title"], "Актибио")
+
+        # 3. Dessert / new-meal openers must NOT be misread as clarifications for an older pending meal
+        self.assertFalse(fitness_nutrition.looks_like_meal_clarification("На десерт закусил тремя дольками помэлло."))
+        self.assertFalse(fitness_nutrition.looks_like_meal_clarification("На ужин поел 200 г гречки"))
+        self.assertTrue(fitness_nutrition.looks_like_meal_clarification("на овсяном молоке"))
+        self.assertTrue(fitness_nutrition.looks_like_meal_clarification("300 мл с курицей"))
+
+        # 4. Confirming via /eat card (kbju_confirm_cb) cancels any stale active pending meal
+        await inbox_service.capture_and_process_text(
+            self.db, self.user, chat_id=940001, message_id=51, text="поел блины", now_utc=now
+        )
+        self.assertIsNotNone(await repo.get_active_pending_meal(self.db, self.u_id, now_utc=now))
+        fsm = self._fsm()
+        await fsm.update_data(
+            meal_preview={
+                "ok": True,
+                "title": "Активиа злаки 200 г",
+                "meal_slot": "snack",
+                "kcal": 136,
+                "protein_g": 6.0,
+                "fat_g": 3.2,
+                "carbs_g": 21.0,
+                "used_llm": False,
+            }
+        )
+        cb_confirm = SimpleNamespace(
+            data="kbju:confirm",
+            from_user=SimpleNamespace(id=940001, full_name="Дима"),
+            message=SimpleNamespace(edit_text=AsyncMock(), answer=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await nutrition.kbju_confirm_cb(cb_confirm, fsm, self.db)
+        self.assertIsNone(await repo.get_active_pending_meal(self.db, self.u_id, now_utc=now))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -122,6 +122,11 @@ _NUTRITION_DB: Dict[str, Tuple[float, float, float, float]] = {
     "тахини": (595, 17.0, 54.0, 21.0),
     "майонез": (620, 1.5, 67.0, 3.0),
     "соевый соус": (53, 8.0, 0.1, 4.9),
+    "кисло-сладкий соус": (140, 0.5, 0.2, 34.0),
+    "сладкий чили соус": (175, 0.5, 0.3, 42.0),
+    "соус терияки": (110, 3.0, 0.2, 24.0),
+    "кетчуп": (105, 1.5, 0.2, 24.0),
+    "горчица": (140, 6.0, 6.0, 11.0),
     "томатная паста": (82, 4.3, 0.5, 18.0),
     "пассата": (32, 1.5, 0.2, 6.0),
     "песто": (420, 4.5, 42.0, 4.0),
@@ -141,6 +146,9 @@ _NUTRITION_DB: Dict[str, Tuple[float, float, float, float]] = {
     "темпе": (193, 20.0, 11.0, 8.0),
     "сейтан": (145, 25.0, 2.0, 6.0),
     "соевое мясо": (310, 50.0, 1.5, 22.0),
+    "соевый фарш": (315, 50.0, 1.5, 22.0),
+    "соевый гуляш": (315, 50.0, 1.5, 22.0),
+    "веганские котлеты": (195, 14.0, 9.0, 14.0),
     "чечевица": (310, 24.0, 1.2, 52.0),
     "нут": (335, 19.5, 6.0, 52.0),
     "фасоль стручковая": (31, 1.8, 0.2, 5.0),
@@ -175,6 +183,7 @@ _NUTRITION_DB: Dict[str, Tuple[float, float, float, float]] = {
     "фунчоза": (320, 0.5, 0.2, 79.0),
     "лапша": (345, 10.5, 1.5, 70.0),
     "мука": (342, 10.5, 1.3, 70.0),
+    "нутовая мука": (356, 20.0, 6.0, 55.0),
     "лаваш": (260, 8.0, 1.2, 53.0),
     "тортилья": (285, 7.5, 6.0, 49.0),
     "хлеб": (245, 8.2, 1.5, 48.0),
@@ -197,6 +206,7 @@ _NUTRITION_DB: Dict[str, Tuple[float, float, float, float]] = {
     "кабачок": (20, 1.2, 0.3, 3.5),
     "баклажан": (24, 1.2, 0.1, 4.5),
     "шпинат": (23, 2.9, 0.4, 2.0),
+    "руккола": (25, 2.6, 0.7, 3.7),
     "зелень": (35, 2.5, 0.4, 5.0),
     "укроп": (38, 2.5, 0.5, 6.0),
     "петрушка": (45, 3.7, 0.4, 7.6),
@@ -209,6 +219,7 @@ _NUTRITION_DB: Dict[str, Tuple[float, float, float, float]] = {
     "овощная смесь": (42, 2.2, 0.3, 7.5),
     "кукуруза": (96, 3.3, 1.2, 18.0),
     "горошек": (73, 5.0, 0.2, 12.5),
+    "оливки": (145, 1.0, 15.0, 3.5),
     # Фрукты, ягоды, орехи, сладкое
     "банан": (89, 1.1, 0.3, 21.8),
     "яблоко": (52, 0.4, 0.2, 12.0),
@@ -697,8 +708,10 @@ _MEAL_PARSE_PROMPT = (
     "но при этом всё равно заполни лучшую примерную оценку kcal/БЖУ."
 )
 
+_UNIT_WEIGHT_VOL = r"(?:грамм[а-я]*|гр|г|g|миллилитр[а-я]*|мл|ml)"
+
 _PER_100_MARKER_RE = re.compile(
-    r"(?iu)(?:на\s*100\s*(?:г|гр|g|мл|ml)|/\s*100\s*(?:г|гр|g|мл|ml)|100\s*(?:г|гр|g|мл|ml)\s*[-:])"
+    rf"(?iu)(?:на\s*100\s*{_UNIT_WEIGHT_VOL}\b\.?|/\s*100\s*{_UNIT_WEIGHT_VOL}\b\.?|100\s*{_UNIT_WEIGHT_VOL}\b\.?\s*[-:])"
 )
 
 _LAZY_ACCEPT_EXACT: set[str] = {
@@ -802,13 +815,25 @@ def looks_like_meal_clarification(text: str) -> bool:
     low = raw.casefold().replace("ё", "е")
     if is_lazy_accept_reply(low):
         return True
+    if re.search(
+        r"(?iu)^на\s+(?:десерт|завтрак|обед|ужин|перекус|полдник)\b",
+        low,
+    ):
+        return False
+    if re.search(
+        r"(?iu)\b(?:закусил[аи]?|перекусил[аи]?|позавтракал[аи]?|пообедал[аи]?|поужинал[аи]?)\b",
+        low,
+    ):
+        return False
     if _PER_100_MARKER_RE.search(low) or re.search(
-        r"\b\d+(?:[.,]\d+)?\s*(?:г|гр|g|мл|ml|ккал|kcal|шт|куск|порц|половник|ложк)\b",
+        rf"\b\d+(?:[.,]\d+)?\s*(?:{_UNIT_WEIGHT_VOL}|ккал|kcal|калл|килокалор[а-я]*|шт|куск|порц|половник|ложк)\b",
         low,
     ):
         return True
     if re.search(
-        r"(?iu)^(?:с\s+|на\s+|без\s+|два|две|три|пол|полов|маленьк|средн|больш|обычн|двойн|порц|кусок|куск)",
+        r"(?iu)^(?:с\s+|без\s+|"
+        r"на\s+(?:вод[еу]|молок[ео]|овсян\w*|кокосов\w*|миндальн\w*|соев\w*|масл[ео]|пар[уе]|грил[ея]|сковород\w*|100\b|глаз\b)|"
+        r"два|две|три|пол|полов|маленьк|средн|больш|обычн|двойн|порц|кусок|куск)",
         low,
     ):
         return True
@@ -847,51 +872,105 @@ def _detect_vague_meal(clean_text: str) -> Optional[str]:
     return None
 
 
-def _parse_label_math_offline(raw_text: str) -> Optional[Dict[str, Any]]:
+def _clean_label_title(raw_title: str) -> str:
+    cleaned = re.sub(
+        r"(?iu)^(?:этикетка|упаковка|съел[аи]?|доел[аи]?|выпил[аи]?|пью|ем)\s*[:,-]?\s*",
+        "",
+        str(raw_title or "").strip(),
+    )
+    for _ in range(2):
+        cleaned = re.sub(
+            r"(?iu),?\s*(?:пищевая\s+ценность|энергетическая\s+ценность|кбжу|калорийность)\s*$",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"(?iu),?\s*(?:примерно|около|где-то)?\s*(?:{_UNIT_WEIGHT_VOL}\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*{_UNIT_WEIGHT_VOL})\s*(?:пью|ем|выпил[аи]?|съел[аи]?)?\s*$",
+            "",
+            cleaned,
+        )
+        cleaned = cleaned.strip(" -:,.")
+    return cleaned
+
+
+def _parse_label_math_offline(raw_text: str, title_hint: str = "") -> Optional[Dict[str, Any]]:
     """Распознать текст формата 'на 100 г 240 ккал б12 ж8 у30, съел 150 г' и посчитать порцию."""
     text = re.sub(r"\s+", " ", str(raw_text or "").strip())
     low = text.casefold().replace("ё", "е")
     m_100 = _PER_100_MARKER_RE.search(low)
     if not m_100:
         return None
-    kcal_m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:ккал|kcal|калл)\b", low)
+    kcal_m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:ккал|kcal|калл|килокалор[а-я]*|калор[а-я]*)\b", low)
     if not kcal_m:
         return None
     k100 = float(kcal_m.group(1).replace(",", "."))
     if not (5.0 <= k100 <= 950.0):
         return None
-    p_m = re.search(r"(?:б|белк[а-я]*|p)\s*[:=]?\s*(\d+(?:[.,]\d+)?)", low)
-    f_m = re.search(r"(?:ж|жир[а-я]*|f)\s*[:=]?\s*(\d+(?:[.,]\d+)?)", low)
-    c_m = re.search(r"(?:у|углев[а-я]*|c)\s*[:=]?\s*(\d+(?:[.,]\d+)?)", low)
+    p_m = re.search(r"\b(?:бел(?:ок|к[а-я]*)|б|p)\s*[:=\-]?\s*(\d+(?:[.,]\d+)?)", low)
+    f_m = re.search(r"\b(?:жир[а-я]*|ж|f)\s*[:=\-]?\s*(\d+(?:[.,]\d+)?)", low)
+    c_m = re.search(r"\b(?:углев[а-я]*|у|c)\s*[:=\-]?\s*(\d+(?:[.,]\d+)?)", low)
     p100 = float(p_m.group(1).replace(",", ".")) if p_m else round(k100 * 0.20 / 4.0, 1)
     f100 = float(f_m.group(1).replace(",", ".")) if f_m else round(k100 * 0.28 / 9.0, 1)
     c100 = float(c_m.group(1).replace(",", ".")) if c_m else round(k100 * 0.52 / 4.0, 1)
 
     without_100 = low[: m_100.start()] + " " + low[m_100.end() :]
-    m_portion = re.search(
-        r"(?:съел[аи]?|выпил[аи]?|порц[а-я]*|взял[аи]?|вышло|упаковк[аиу]?|батончик)\s*(\d+(?:[.,]\d+)?)\s*(г|гр|g|мл|ml)\b",
-        without_100,
+    macro_tail_re = re.compile(r"\b(?:б|ж|у|бел(?:ок|к[а-я]*)|жир[а-я]*|углев[а-я]*)\s*[:=\-]?\s*$")
+
+    consumed_matches: list[tuple[int, float]] = []
+    verb_before_qty_re = re.compile(
+        rf"(?iu)\b(?:съел[аи]?|доел[аи]?|выпил[аи]?|пью|порц[а-я]*|взял[аи]?|вышло)\s+"
+        rf"(?:(?:примерно|около|где-то|на)\s+)?"
+        rf"(?:{_UNIT_WEIGHT_VOL}\s*(\d+(?:[.,]\d+)?)\b|(\d+(?:[.,]\d+)?)\s*{_UNIT_WEIGHT_VOL}\b)"
     )
-    if m_portion:
-        grams = float(m_portion.group(1).replace(",", "."))
+    qty_before_verb_re = re.compile(
+        rf"(?iu)(?:{_UNIT_WEIGHT_VOL}\s*(\d+(?:[.,]\d+)?)\b|(\d+(?:[.,]\d+)?)\s*{_UNIT_WEIGHT_VOL}\b)\s+"
+        rf"(?:(?:сейчас|уже|тут|сегодня|только\s+что)\s+)*"
+        rf"(?:съел[аи]?|доел[аи]?|выпил[аи]?|пью|поел[аи]?|взял[аи]?)\b"
+    )
+    for m in verb_before_qty_re.finditer(without_100):
+        val = (m.group(1) or m.group(2) or "").replace(",", ".")
+        if val:
+            consumed_matches.append((m.start(), float(val)))
+    for m in qty_before_verb_re.finditer(without_100):
+        if macro_tail_re.search(without_100[: m.start()]):
+            continue
+        val = (m.group(1) or m.group(2) or "").replace(",", ".")
+        if val:
+            consumed_matches.append((m.start(), float(val)))
+
+    if consumed_matches:
+        consumed_matches.sort(key=lambda pair: pair[0])
+        grams = consumed_matches[-1][1]
     else:
-        candidates = [
-            float(m.group(1).replace(",", "."))
-            for m in re.finditer(r"(?<![бжуpfc\s])\b(\d+(?:[.,]\d+)?)\s*(г|гр|g|мл|ml)\b", without_100)
-        ]
-        if not candidates:
+        container_re = re.compile(
+            rf"(?iu)\b(?:упаковк[аиу]?|пачк[аиу]?|батончик[а]?|бутылк[аиу]?|банк[аиу]?|стакан[а]?)\s+"
+            rf"(?:на\s+)?(?:{_UNIT_WEIGHT_VOL}\s*(\d+(?:[.,]\d+)?)\b|(\d+(?:[.,]\d+)?)\s*{_UNIT_WEIGHT_VOL}\b)"
+        )
+        m_pack = container_re.search(without_100)
+        if m_pack:
+            val = (m_pack.group(1) or m_pack.group(2) or "").replace(",", ".")
+            grams = float(val) if val else 100.0
+        else:
             candidates = [
-                float(m.group(1).replace(",", "."))
-                for m in re.finditer(r"\b(\d+(?:[.,]\d+)?)\s*(г|гр|g|мл|ml)\b", without_100)
-                if not re.search(r"(?:б|ж|у|белк[а-я]*|жир[а-я]*|углев[а-я]*)\s*$", without_100[: m.start()])
+                float((m.group(1) or m.group(2)).replace(",", "."))
+                for m in re.finditer(
+                    rf"(?iu)(?:(\d+(?:[.,]\d+)?)\s*{_UNIT_WEIGHT_VOL}\b|{_UNIT_WEIGHT_VOL}\s*(\d+(?:[.,]\d+)?)\b)",
+                    without_100,
+                )
+                if not macro_tail_re.search(without_100[: m.start()])
             ]
-        grams = candidates[-1] if candidates else 100.0
+            grams = candidates[-1] if candidates else 100.0
     grams = max(5.0, min(2000.0, grams))
     factor = grams / 100.0
 
-    prefix = text[: m_100.start()].strip(" -:,.")
-    prefix = re.sub(r"(?iu)^(?:этикетка|упаковка|съел[аи]?|выпил[аи]?)\s*[:,-]?\s*", "", prefix).strip()
-    title = prefix[:65] if len(prefix) >= 3 else f"Продукт ({int(round(grams))} г)"
+    cleaned_hint = _clean_label_title(title_hint)
+    cleaned_prefix = _clean_label_title(text[: m_100.start()])
+    if len(cleaned_hint) >= 3:
+        title = cleaned_hint[:65]
+    elif len(cleaned_prefix) >= 3:
+        title = cleaned_prefix[:65]
+    else:
+        title = f"Продукт ({int(round(grams))} г)"
     return {
         "title": title,
         "brand": "",
@@ -914,18 +993,18 @@ def _parse_label_math_offline(raw_text: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _parse_meal_offline(raw_text: str) -> Optional[Dict[str, Any]]:
+def _parse_meal_offline(raw_text: str, title_hint: str = "") -> Optional[Dict[str, Any]]:
     text = re.sub(r"\s+", " ", str(raw_text or "").strip())
     if not text:
         return None
-    label_res = _parse_label_math_offline(text)
+    label_res = _parse_label_math_offline(text, title_hint=title_hint)
     if label_res is not None:
         return label_res
 
     low = text.casefold().replace("ё", "е")
 
     # Явно указанные калории: "овсянка 350 ккал б12 ж8 у55"
-    kcal_m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:ккал|kcal|калл)\b", low)
+    kcal_m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:ккал|kcal|калл|килокалор[а-я]*|калор[а-я]*)\b", low)
     if kcal_m:
         kcal = float(kcal_m.group(1).replace(",", "."))
         p_m = re.search(r"(?:б|белк[а-я]*|p)\s*[:=]?\s*(\d+(?:[.,]\d+)?)", low)
@@ -1028,6 +1107,7 @@ async def parse_meal_input(
     allow_clarification: bool = True,
     allow_web_lookup: bool = True,
     web_lookup_fn: Optional[nutrition_web.SearchFn] = None,
+    title_hint: str = "",
 ) -> Dict[str, Any]:
     """Распознать приём пищи (КБЖУ) по фото тарелки/этикетки, тексту, этикетке или меню в сети."""
     client = llm_client_instance or default_llm_client
@@ -1099,7 +1179,7 @@ async def parse_meal_input(
         return {"ok": False, "error": "empty_input"}
 
     # 1. Прямая математика этикетки на 100 г в тексте ("на 100г 240 ккал ..., съел 150 г")
-    label_hit = _parse_label_math_offline(clean_text)
+    label_hit = _parse_label_math_offline(clean_text, title_hint=title_hint)
     if label_hit is not None:
         await _maybe_save_label_product(
             db,
@@ -1166,7 +1246,7 @@ async def parse_meal_input(
                 }
 
     # 4. Надёжный офлайн-fallback + мягкая проверка на расплывчатость
-    offline = _parse_meal_offline(clean_text)
+    offline = _parse_meal_offline(clean_text, title_hint=title_hint)
     if not offline:
         return {"ok": False, "error": "no_meal_found"}
     return {
