@@ -54,13 +54,23 @@ def food_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
-            [InlineKeyboardButton(text="✨ Придумать из холодильника", callback_data="kitchen:ai_chef")],
-            [InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today")],
-            [InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan")],
-            [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
-            [InlineKeyboardButton(text="📥 Импорт корзины / чека", callback_data="kitchen:cart_import")],
+            [
+                InlineKeyboardButton(text="🛒 Не хватает 1–2 прод.", callback_data="kitchen:almost_ready:0"),
+                InlineKeyboardButton(text="✨ ИИ-шеф", callback_data="kitchen:ai_chef"),
+            ],
+            [
+                InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+            ],
+            [
+                InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
+                InlineKeyboardButton(text="🛒 Покупки", callback_data="kitchen:shoplist"),
+            ],
+            [
+                InlineKeyboardButton(text="📥 Импорт корзины", callback_data="kitchen:cart_import"),
+                InlineKeyboardButton(text="📥 Импорт рецепта", callback_data="kitchen:recipe_import"),
+            ],
             [InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes")],
-            [InlineKeyboardButton(text="🛒 Список покупок", callback_data="kitchen:shoplist")],
             [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
         ]
     )

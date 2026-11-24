@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime
 from functools import lru_cache
+import html as html_lib
+import ipaddress
 import json
 import math
 import re
+import socket
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+import aiohttp
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
 from services import fitness_nutrition, karma_service, pulse_service
+from utils.pantry import format_quantity
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_time_local, local_date_str
 
@@ -576,12 +584,121 @@ async def suggest_meals_now(
     }
 
 
-def _merge_missing_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def suggest_almost_ready_recipes(
+    db,
+    user: Dict[str, Any],
+    *,
+    max_missing: int = 2,
+    meal_slot: Optional[str] = None,
+    exclude_ids: Optional[Iterable[str]] = None,
+    limit: int = 30,
+    now_utc: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    """Подобрать рецепты, к которым не хватает строго от 1 до `max_missing` продуктов."""
+    now = now_utc or datetime.datetime.utcnow()
+    user_id = int(user["id"])
+    tz = user.get("timezone") or "UTC"
+    local_hhmm = format_time_local(now, tz)
+    try:
+        local_hour = int(local_hhmm.split(":")[0])
+    except Exception:
+        local_hour = 13
+
+    eff_slot = meal_slot if meal_slot in {"breakfast", "lunch", "dinner"} else infer_meal_slot(local_hour)
+    eff_max = max(1, min(3, int(max_missing or 2)))
+    profile = await get_user_meal_profile(db, user_id)
+    pantry = rows_to_dicts(await repo.list_pantry_items(db, user_id))
+
+    local_today = local_date_str(now, tz)
+    soon_rows, _ = await repo.pantry_expiring(db, user_id, local_today, window_days=3)
+    expiring_names = [str(r.get("name") or "") for r in rows_to_dicts(soon_rows) if r.get("name")]
+
+    recent_since = (datetime.date.fromisoformat(local_today) - datetime.timedelta(days=4)).isoformat()
+    recent_ids = set(await repo.get_recent_meal_recipe_ids(db, user_id, recent_since))
+    advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now)
+    excl_id_set = {str(x) for x in (exclude_ids or []) if x}
+
+    all_user_recipes = await load_recipes_for_user(db, user_id)
+    allowed = [
+        r for r in all_user_recipes
+        if recipe_allowed_for_profile(r, profile) and str(r.get("id") or "") not in excl_id_set
+    ]
+
+    with_have: List[Dict[str, Any]] = []
+    any_missing: List[Dict[str, Any]] = []
+    for recipe in allowed:
+        rid = str(recipe.get("id") or "")
+        tags = set(recipe.get("tags") or [])
+        t_min = int(recipe.get("time_minutes") or 25)
+        match = match_recipe_to_pantry(recipe, pantry, servings=2)
+        miss_cnt = len(match["missing"])
+        if not (1 <= miss_cnt <= eff_max):
+            continue
+
+        cov = float(match["coverage"])
+        used_expiring: List[str] = []
+        if expiring_names and match["have"]:
+            for exp_name in expiring_names:
+                if any(ingredients_match(exp_name, str(h.get("name") or "")) for h in match["have"]):
+                    used_expiring.append(exp_name)
+
+        score = cov * 50.0 + (14.0 if miss_cnt == 1 else 6.0)
+        if used_expiring:
+            score += 12.0
+        if eff_slot in tags:
+            score += 10.0
+        if t_min <= 25:
+            score += 6.0
+        if rid in recent_ids:
+            score -= 16.0
+
+        nutrition = fitness_nutrition.estimate_recipe_nutrition(recipe)
+        score += fitness_nutrition.score_recipe_for_macros(nutrition, advice)
+
+        entry = {
+            "recipe": recipe,
+            "have": match["have"],
+            "missing": match["missing"],
+            "coverage": cov,
+            "nutrition": nutrition,
+            "uses_expiring": used_expiring,
+            "score": round(score, 2),
+        }
+        any_missing.append(entry)
+        if match["have"]:
+            with_have.append(entry)
+
+    candidates = with_have if (pantry and with_have) else any_missing
+    candidates.sort(
+        key=lambda item: (
+            -item["score"],
+            len(item["missing"]),
+            int(item["recipe"].get("time_minutes") or 999),
+        )
+    )
+    eff_limit = max(1, int(limit or 30))
+    return {
+        "meal_slot": eff_slot,
+        "meal_slot_label": MEAL_SLOT_LABELS.get(eff_slot, "приём пищи"),
+        "meal_profile": profile,
+        "pantry_count": len(pantry),
+        "max_missing": eff_max,
+        "total_matches": len(candidates),
+        "daily_advice": advice,
+        "suggestions": candidates[:eff_limit],
+    }
+
+
+def _merge_missing_items(
+    items: Iterable[Dict[str, Any]],
+    *,
+    preserve_staples: bool = False,
+) -> List[Dict[str, Any]]:
     """Объединить повторяющиеся недостающие ингредиенты."""
     merged: List[Dict[str, Any]] = []
     for raw in items:
         name = str(raw.get("name") or "").strip()
-        if not name or is_staple_ingredient(name):
+        if not name or (not preserve_staples and is_staple_ingredient(name)):
             continue
         qty = float(raw.get("qty") or 1.0)
         unit = str(raw.get("unit") or "шт").strip() or "шт"
@@ -902,6 +1019,7 @@ async def generate_meal_plan(
                 saved_rows.append(row)
 
     missing = await compute_meal_plan_missing_shopping(db, user, saved_rows)
+    export_data = build_shopping_export(missing)
     return {
         "start_date": base_date_str,
         "end_date": end_date_str,
@@ -909,6 +1027,8 @@ async def generate_meal_plan(
         "meal_profile": profile,
         "items": saved_rows,
         "missing_shopping": missing,
+        "missing_shopping_grouped": export_data["groups"],
+        "shopping_export_text": export_data["plain_text"],
     }
 
 
@@ -982,6 +1102,7 @@ async def get_meal_plan_view(
 
     profile = await get_user_meal_profile(db, user_id)
     missing = await compute_meal_plan_missing_shopping(db, user, rows)
+    export_data = build_shopping_export(missing)
     return {
         "start_date": base_date_str,
         "end_date": end_date_str,
@@ -989,6 +1110,8 @@ async def get_meal_plan_view(
         "meal_profile": profile,
         "items": rows,
         "missing_shopping": missing,
+        "missing_shopping_grouped": export_data["groups"],
+        "shopping_export_text": export_data["plain_text"],
     }
 
 
@@ -1009,6 +1132,105 @@ def _guess_pantry_category(name: str) -> str:
     return "продукты"
 
 
+SHOPPING_EXPORT_CATEGORIES: List[Tuple[str, str]] = [
+    ("овощи", "🥬 Овощи и зелень"),
+    ("фрукты", "🍎 Фрукты и ягоды"),
+    ("белок", "🫘 Белок и бобовые"),
+    ("крупы", "🌾 Крупы, паста и хлеб"),
+    ("молочка", "🥛 Молочка / растительное"),
+    ("соусы/масла", "🫙 Соусы и масла"),
+    ("продукты", "🧺 Прочее"),
+]
+
+
+def build_shopping_export(
+    items: Iterable[Dict[str, Any]],
+    *,
+    header: str = "",
+    preserve_explicit: bool = False,
+) -> Dict[str, Any]:
+    """Сгруппировать продукты по отделам и сформировать текст для копирования/доставки."""
+    merged = _merge_missing_items(items, preserve_staples=preserve_explicit)
+    buckets: Dict[str, List[Dict[str, Any]]] = {key: [] for key, _ in SHOPPING_EXPORT_CATEGORIES}
+    for item in merged:
+        cat = _guess_pantry_category(item["name"])
+        buckets.setdefault(cat, []).append(
+            {
+                "name": item["name"],
+                "qty": item["qty"],
+                "unit": item["unit"],
+                "quantity_text": format_quantity(item["qty"], item["unit"]),
+            }
+        )
+
+    groups: List[Dict[str, Any]] = []
+    text_blocks: List[str] = []
+    clean_header = (header or "").strip()
+    if clean_header:
+        text_blocks.append(clean_header)
+
+    for cat_key, label in SHOPPING_EXPORT_CATEGORIES:
+        cat_items = buckets.get(cat_key) or []
+        if not cat_items:
+            continue
+        cat_items.sort(key=lambda it: it["name"].casefold())
+        groups.append({"category": cat_key, "label": label, "items": cat_items})
+        section_lines = [label]
+        for it in cat_items:
+            section_lines.append(f"- {it['name']} — {it['quantity_text']}")
+        text_blocks.append("\n".join(section_lines))
+
+    return {
+        "total_items": len(merged),
+        "groups": groups,
+        "plain_text": "\n\n".join(text_blocks).strip(),
+    }
+
+
+async def build_meal_plan_shopping_export(
+    db,
+    user: Dict[str, Any],
+    plan_rows: List[Dict[str, Any]],
+    *,
+    include_active_shopping: bool = False,
+) -> Dict[str, Any]:
+    """Сформировать категоризированный список продуктов для меню на 3–4 дня."""
+    user_id = int(user["id"])
+    missing = await compute_meal_plan_missing_shopping(db, user, plan_rows)
+    combined: List[Dict[str, Any]] = list(missing)
+    if include_active_shopping:
+        shop_rows = [
+            r for r in rows_to_dicts(await repo.list_shopping_items(db, user_id, scope="household"))
+            if not r.get("is_bought")
+        ]
+        for row in shop_rows:
+            name = str(row.get("item_name") or "").strip()
+            if not name:
+                continue
+            combined.append(
+                {
+                    "name": name,
+                    "qty": float(row.get("quantity") or 1.0),
+                    "unit": str(row.get("unit") or "шт"),
+                }
+            )
+    header = (
+        "Список покупок (меню + общий список)"
+        if include_active_shopping
+        else "Список покупок под меню на 3–4 дня"
+    )
+    export = build_shopping_export(
+        combined,
+        header=header,
+        preserve_explicit=include_active_shopping,
+    )
+    return {
+        **export,
+        "missing_count": len(missing),
+        "include_active_shopping": include_active_shopping,
+    }
+
+
 def _normalize_unit(raw_unit: str) -> str:
     """Нормализовать единицу измерения продукта."""
     u = (raw_unit or "").strip().lower().rstrip(".")
@@ -1018,7 +1240,7 @@ def _normalize_unit(raw_unit: str) -> str:
         return "g"
     if u in {"мл", "ml"}:
         return "ml"
-    if u.startswith("л") or u in {"l", "liter", "liters"}:
+    if u in {"л", "l", "liter", "liters"} or re.fullmatch(r"литр\w*", u):
         return "l"
     if not u or u.startswith(("шт", "уп", "пач", "бан", "бутыл", "piece")):
         return "шт"
@@ -1400,7 +1622,13 @@ _AI_CHEF_SYSTEM_PROMPT = (
 )
 
 
-def _normalize_ai_recipe(raw: Any, *, profile: str, eff_slot: str) -> Optional[Dict[str, Any]]:
+def _normalize_ai_recipe(
+    raw: Any,
+    *,
+    profile: str,
+    eff_slot: str,
+    source: str = "ai_chef",
+) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
     title = re.sub(r"\s+", " ", str(raw.get("title") or "").strip())
@@ -1460,7 +1688,7 @@ def _normalize_ai_recipe(raw: Any, *, profile: str, eff_slot: str) -> Optional[D
         "nutrition": raw.get("nutrition") if isinstance(raw.get("nutrition"), dict) else None,
         "ingredients": ingredients,
         "steps": steps,
-        "source": "ai_chef",
+        "source": str(source or "ai_chef"),
     }
     recipe_obj["nutrition"] = fitness_nutrition.estimate_recipe_nutrition(recipe_obj)
     return recipe_obj
@@ -1560,4 +1788,656 @@ async def generate_ai_recipes_from_pantry(
         "meal_slot": eff_slot,
         "meal_slot_label": slot_label,
         "daily_advice": advice,
+    }
+
+
+_RECIPE_IMPORT_SYSTEM_PROMPT = (
+    "Ты извлекаешь один структурированный кулинарный рецепт из фото страницы книги/экрана, веб-страницы или текста. "
+    "Ответь строго JSON-объектом вида: "
+    "{\"title\": str, \"desc\": str, \"time_minutes\": int, \"base_servings\": int, "
+    "\"tags\": [str], \"nutrition\": {\"kcal\": int, \"protein_g\": float, \"fat_g\": float, \"carbs_g\": float}|null, "
+    "\"ingredients\": [{\"name\": str, \"qty\": float, \"unit\": str}], \"steps\": [str]}. "
+    "Пиши на русском языке; теги выбирай из breakfast, lunch, dinner, snack, salad, fast, healthy, budget, "
+    "и при отсутствии животных продуктов добавляй vegetarian и/или vegan."
+)
+
+_CGNAT_NET = ipaddress.IPv4Network("100.64.0.0/10")
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    clean = str(ip_str or "").strip().split("%", 1)[0]
+    if not clean:
+        return False
+    try:
+        ip = ipaddress.ip_address(clean)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NET:
+        return False
+    return bool(
+        ip.is_global
+        and not (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    )
+
+
+async def _validate_public_url(url: str, *, resolve_fn=None) -> str:
+    """Проверить URL на безопасность (разрешены только http/https на публичные IP)."""
+    clean = (url or "").strip()
+    if not clean:
+        raise ValueError("unsafe_url")
+    parsed = urllib.parse.urlparse(clean)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("unsafe_url")
+    if not parsed.netloc or parsed.username is not None or parsed.password is not None:
+        raise ValueError("unsafe_url")
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".arpa")):
+        raise ValueError("unsafe_url")
+
+    try:
+        ipaddress.ip_address(host)
+        is_literal_ip = True
+    except ValueError:
+        is_literal_ip = False
+
+    if is_literal_ip:
+        if not _is_public_ip(host):
+            raise ValueError("unsafe_url")
+        return parsed._replace(fragment="").geturl()
+
+    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        if resolve_fn is not None:
+            resolved = resolve_fn(host)
+            if asyncio.iscoroutine(resolved):
+                resolved = await resolved
+        else:
+            resolved = await asyncio.to_thread(socket.getaddrinfo, host, port, 0, socket.SOCK_STREAM)
+    except Exception as exc:
+        raise ValueError("unsafe_url") from exc
+
+    ips: List[str] = []
+    for entry in resolved or []:
+        if isinstance(entry, str):
+            ips.append(entry)
+        elif isinstance(entry, (tuple, list)) and len(entry) >= 5 and isinstance(entry[4], (tuple, list)):
+            ips.append(str(entry[4][0]))
+    if not ips or not all(_is_public_ip(ip_s) for ip_s in ips):
+        raise ValueError("unsafe_url")
+    return parsed._replace(fragment="").geturl()
+
+
+async def _fetch_recipe_url_safe(
+    url: str,
+    *,
+    timeout_sec: float = 10.0,
+    max_bytes: int = 512 * 1024,
+    resolve_fn=None,
+) -> Tuple[str, str]:
+    """Безопасно скачать текстовую/HTML-страницу с проверкой каждого редиректа от SSRF."""
+    cur_url = await _validate_public_url(url, resolve_fn=resolve_fn)
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    headers = {
+        "User-Agent": "HiDL-RecipeBot/1.0 (+https://hidl.fodders.ru)",
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,text/plain;q=0.8",
+        "Accept-Language": "ru,en;q=0.8",
+    }
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for _ in range(4):
+            cur_url = await _validate_public_url(cur_url, resolve_fn=resolve_fn)
+            async with session.get(cur_url, allow_redirects=False) as resp:
+                if resp.status in {301, 302, 303, 307, 308}:
+                    loc = resp.headers.get("Location") or ""
+                    if not loc:
+                        raise RuntimeError("redirect_missing_location")
+                    cur_url = urllib.parse.urljoin(cur_url, loc)
+                    continue
+                if resp.status != 200:
+                    raise RuntimeError(f"http_{resp.status}")
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if ctype and not any(tok in ctype for tok in ("text/", "html", "json", "xml")):
+                    raise RuntimeError("unsupported_content_type")
+                raw_bytes = await resp.content.read(max_bytes)
+                return raw_bytes.decode("utf-8", errors="replace"), cur_url
+    raise RuntimeError("too_many_redirects")
+
+
+def _parse_iso_duration_minutes(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        v = int(round(float(val)))
+        return v if v > 0 else None
+    s = str(val).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        v = int(s)
+        return v if v > 0 else None
+    m = re.match(r"^P(?:\d+D)?T?(?:(\d+)H)?(?:(\d+)M)?", s, flags=re.IGNORECASE)
+    if not m:
+        return None
+    hours = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    total = hours * 60 + mins
+    return total if total > 0 else None
+
+
+def _parse_fraction_number(raw_num: str) -> Optional[float]:
+    s = (raw_num or "").strip().replace(",", ".")
+    if not s:
+        return None
+    if "-" in s and not s.startswith("-"):
+        parts = [p for p in s.split("-") if p.strip()]
+        if len(parts) == 2:
+            s = parts[0]
+    if "/" in s:
+        parts = s.split("/", 1)
+        try:
+            den = float(parts[1])
+            return round(float(parts[0]) / den, 2) if den > 0 else None
+        except ValueError:
+            return None
+    try:
+        val = float(s)
+        return round(val, 2) if val > 0 else None
+    except ValueError:
+        return None
+
+
+_KITCHEN_UNIT_PAT = (
+    r"ст\.?\s*л\.?|столов(?:ая|ые|ых)\s+ложк(?:а|и|ек)|tbsp|"
+    r"ч\.?\s*л\.?|чайн(?:ая|ые|ых)\s+ложк(?:а|и|ек)|tsp|"
+    r"стакан(?:а|ов)?|cup(?:s)?|"
+    r"зубчик(?:а|ов)?|зуб\.?|"
+    r"пучок|пучка|пучков|пуч\.?|"
+    r"щепот(?:ка|ки|ок)|"
+    r"кг|kg|г|гр|g|мл|ml|литр(?:а|ов)?|л|шт|штук(?:а|и)?|уп|пач(?:ка|ки|ек)?|бан(?:ка|ки|ок)?"
+)
+
+
+def _canonical_kitchen_unit(raw_unit: str) -> str:
+    u = re.sub(r"\s+", " ", (raw_unit or "").strip().lower()).rstrip(".")
+    if not u:
+        return "шт"
+    if u in {"ст. л", "ст.л", "ст л", "tbsp"} or u.startswith("столов"):
+        return "ст. л."
+    if u in {"ч. л", "ч.л", "ч л", "tsp"} or u.startswith("чайн"):
+        return "ч. л."
+    if u.startswith("стакан") or u.startswith("cup"):
+        return "стакан"
+    if u.startswith("зуб"):
+        return "зубч."
+    if u.startswith("пуч"):
+        return "пучок"
+    if u.startswith("щепот"):
+        return "щепотка"
+    return _normalize_unit(u)
+
+
+def _parse_recipe_ingredient_line(line: str) -> Optional[Dict[str, Any]]:
+    raw = html_lib.unescape(str(line or ""))
+    for ch, rep in (("½", "0.5"), ("¼", "0.25"), ("¾", "0.75"), ("⅓", "0.33"), ("⅔", "0.67")):
+        raw = raw.replace(ch, rep)
+    raw = re.sub(r"^\s*(?:[•\-\*—]+|\d+[.)])\s*", "", raw.strip())
+    raw = re.sub(r"\s+", " ", raw).strip(" \t,;")
+    if not raw:
+        return None
+
+    m_taste = re.match(r"^(.+?)\s*(?:[—–:-]|\s)\s*по\s+вкусу\.?$", raw, flags=re.IGNORECASE)
+    if m_taste:
+        name = m_taste.group(1).strip(" :-—")
+        if name:
+            return {"name": name[:1].upper() + name[1:], "qty": 1.0, "unit": "по вкусу"}
+
+    num_re = r"\d+(?:[.,]\d+|/\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?"
+    m_sep = re.match(
+        rf"^(.+?)\s*(?:[—–:-]|\s)\s*({num_re})\s*({_KITCHEN_UNIT_PAT})\.?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if m_sep:
+        name = m_sep.group(1).strip(" :-—")
+        qty = _parse_fraction_number(m_sep.group(2)) or 1.0
+        unit = _canonical_kitchen_unit(m_sep.group(3))
+        if name:
+            return {"name": name[:1].upper() + name[1:], "qty": qty, "unit": unit}
+
+    m_head = re.match(
+        rf"^({num_re})\s*({_KITCHEN_UNIT_PAT})\.?\s+(.+)$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if m_head:
+        qty = _parse_fraction_number(m_head.group(1)) or 1.0
+        unit = _canonical_kitchen_unit(m_head.group(2))
+        name = m_head.group(3).strip(" :-—")
+        if name:
+            return {"name": name[:1].upper() + name[1:], "qty": qty, "unit": unit}
+
+    norm_for_pantry = re.sub(r"\s+[—–:]\s+", " ", raw)
+    pantry_parsed = _parse_single_pantry_token(norm_for_pantry)
+    if pantry_parsed:
+        return {
+            "name": pantry_parsed["name"],
+            "qty": round(float(pantry_parsed["amount"]), 2),
+            "unit": pantry_parsed["unit"],
+        }
+
+    return {"name": raw[:1].upper() + raw[1:], "qty": 1.0, "unit": "шт"}
+
+
+def _iter_jsonld_nodes(obj: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(obj, dict):
+        yield obj
+        graph = obj.get("@graph")
+        if isinstance(graph, list):
+            for node in graph:
+                yield from _iter_jsonld_nodes(node)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_jsonld_nodes(item)
+
+
+def _extract_jsonld_steps(raw_instructions: Any) -> List[str]:
+    steps: List[str] = []
+    if isinstance(raw_instructions, str):
+        for part in re.split(r"[\r\n]+", html_lib.unescape(raw_instructions)):
+            clean = re.sub(r"^\s*\d+[.)]\s*", "", part.strip())
+            if clean:
+                steps.append(clean)
+        return steps
+    if isinstance(raw_instructions, dict):
+        if raw_instructions.get("itemListElement"):
+            return _extract_jsonld_steps(raw_instructions["itemListElement"])
+        txt = html_lib.unescape(str(raw_instructions.get("text") or raw_instructions.get("name") or "").strip())
+        if txt:
+            steps.append(re.sub(r"\s+", " ", txt))
+        return steps
+    if isinstance(raw_instructions, list):
+        for item in raw_instructions:
+            steps.extend(_extract_jsonld_steps(item))
+    return steps
+
+
+def _extract_float_prefix(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    m = re.search(r"(\d+(?:[.,]\d+)?)", str(val))
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _extract_jsonld_recipe(html_text: str) -> Optional[Dict[str, Any]]:
+    """Извлечь Schema.org JSON-LD Recipe из HTML страницы."""
+    scripts = re.findall(
+        r"<script[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+        html_text or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    for raw_json in scripts:
+        raw_clean = raw_json.strip()
+        if not raw_clean:
+            continue
+        try:
+            payload = json.loads(raw_clean)
+        except Exception:
+            continue
+        for node in _iter_jsonld_nodes(payload):
+            raw_type = node.get("@type")
+            types = [raw_type] if isinstance(raw_type, str) else (raw_type if isinstance(raw_type, list) else [])
+            if not any(str(t).split("/")[-1].lower() == "recipe" for t in types):
+                continue
+
+            title = html_lib.unescape(str(node.get("name") or "").strip())
+            desc = html_lib.unescape(str(node.get("description") or "").strip())
+            raw_ings = node.get("recipeIngredient") or node.get("ingredients") or []
+            if isinstance(raw_ings, str):
+                raw_ings = [ln.strip() for ln in raw_ings.splitlines() if ln.strip()]
+            ingredients = [
+                parsed
+                for parsed in (_parse_recipe_ingredient_line(str(i)) for i in raw_ings)
+                if parsed is not None
+            ]
+            steps = _extract_jsonld_steps(node.get("recipeInstructions"))
+            if not title or not ingredients or not steps:
+                continue
+
+            t_min = _parse_iso_duration_minutes(node.get("totalTime"))
+            if t_min is None:
+                prep_m = _parse_iso_duration_minutes(node.get("prepTime")) or 0
+                cook_m = _parse_iso_duration_minutes(node.get("cookTime")) or 0
+                t_min = (prep_m + cook_m) or 25
+
+            yield_val = node.get("recipeYield")
+            if isinstance(yield_val, list) and yield_val:
+                yield_val = yield_val[0]
+            serv_num = _extract_float_prefix(yield_val)
+            servings = max(1, min(8, int(round(serv_num)))) if serv_num else 2
+
+            nutr_raw = node.get("nutrition") if isinstance(node.get("nutrition"), dict) else None
+            nutrition: Optional[Dict[str, Any]] = None
+            if nutr_raw:
+                kcal = _extract_float_prefix(nutr_raw.get("calories"))
+                prot = _extract_float_prefix(nutr_raw.get("proteinContent"))
+                fat = _extract_float_prefix(nutr_raw.get("fatContent"))
+                carbs = _extract_float_prefix(nutr_raw.get("carbohydrateContent"))
+                if kcal is not None and kcal > 0:
+                    nutrition = {
+                        "kcal": int(round(kcal)),
+                        "protein_g": round(prot or 0.0, 1),
+                        "fat_g": round(fat or 0.0, 1),
+                        "carbs_g": round(carbs or 0.0, 1),
+                    }
+
+            tags: List[str] = []
+            for key in ("recipeCategory", "keywords", "suitableForDiet"):
+                val = node.get(key)
+                if isinstance(val, str):
+                    tags.extend(p.strip().lower() for p in re.split(r"[,;]+", val) if p.strip())
+                elif isinstance(val, list):
+                    tags.extend(str(p).strip().lower() for p in val if str(p).strip())
+
+            return {
+                "title": title,
+                "desc": desc[:240],
+                "time_minutes": t_min,
+                "base_servings": servings,
+                "tags": tags[:10],
+                "nutrition": nutrition,
+                "ingredients": ingredients,
+                "steps": steps,
+            }
+    return None
+
+
+def _html_to_plain_text(html_text: str, max_chars: int = 8000) -> str:
+    cleaned = re.sub(
+        r"<(?:script|style|noscript|svg)[^>]*>.*?</(?:script|style|noscript|svg)>",
+        " ",
+        html_text or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = re.sub(r"<(?:br|p|div|li|tr|h[1-6]|section|article)[^>]*>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = html_lib.unescape(cleaned)
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in cleaned.splitlines()]
+    text = "\n".join(ln for ln in lines if ln)
+    return text[:max_chars]
+
+
+def _parse_recipe_text_offline(raw_text: str) -> Optional[Dict[str, Any]]:
+    """Разобрать структурированный или полуструктурированный текст рецепта без LLM."""
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return None
+
+    title = ""
+    time_minutes = 20
+    servings = 2
+    ingredients_raw: List[str] = []
+    steps_raw: List[str] = []
+
+    section = "head"
+    for ln in lines:
+        low = ln.casefold().rstrip(":").strip()
+        if re.match(r"^(?:ингредиент\w*|понадобится|состав|продукты|ingredients?)\b", low):
+            section = "ingredients"
+            tail = ln.split(":", 1)[1].strip() if ":" in ln else ""
+            if tail:
+                ingredients_raw.extend(p.strip() for p in re.split(r"[,;]+", tail) if p.strip())
+            continue
+        if re.match(r"^(?:приготовлен\w*|шаг[иа]?|инструкц\w*|способ(?:\s+приготовления)?|steps?|directions?)\b", low):
+            section = "steps"
+            tail = ln.split(":", 1)[1].strip() if ":" in ln else ""
+            if tail:
+                steps_raw.append(tail)
+            continue
+
+        if section == "head":
+            if not title and not re.match(r"^(?:время|порц|кбжу|калор)", low):
+                title = re.sub(r"^(?:рецепт|название)\s*:\s*", "", ln, flags=re.IGNORECASE).strip(" «»\"")
+                continue
+            m_time = re.search(r"(\d+)\s*(?:мин|мин\.|м\b|minutes?|min\b)", low)
+            if m_time:
+                time_minutes = max(5, min(180, int(m_time.group(1))))
+            m_serv = re.search(r"(\d+)\s*(?:порц|servings?)", low)
+            if m_serv:
+                servings = max(1, min(8, int(m_serv.group(1))))
+            if re.match(r"^[•\-\*]", ln):
+                section = "ingredients"
+                ingredients_raw.append(ln)
+            elif re.match(r"^\d+[.)]\s+", ln):
+                section = "steps"
+                steps_raw.append(ln)
+        elif section == "ingredients":
+            if re.match(r"^\d+[.)]\s+", ln) and len(ln) > 25:
+                section = "steps"
+                steps_raw.append(re.sub(r"^\d+[.)]\s+", "", ln).strip())
+            else:
+                ingredients_raw.append(ln)
+        elif section == "steps":
+            clean_step = re.sub(r"^(?:\d+[.)]|[•\-\*])\s*", "", ln).strip()
+            if clean_step:
+                steps_raw.append(clean_step)
+
+    if not title or not ingredients_raw or not steps_raw:
+        return None
+
+    ingredients = [
+        ing for ing in (_parse_recipe_ingredient_line(item) for item in ingredients_raw) if ing is not None
+    ]
+    if not ingredients:
+        return None
+    return {
+        "title": title,
+        "desc": "",
+        "time_minutes": time_minutes,
+        "base_servings": servings,
+        "tags": [],
+        "ingredients": ingredients,
+        "steps": steps_raw,
+    }
+
+
+async def parse_recipe_from_input(
+    raw_text: str = "",
+    *,
+    image_bytes: Optional[bytes] = None,
+    image_mime: str = "image/jpeg",
+    url: str = "",
+    profile: str = "omnivore",
+    llm_client_instance: Optional[LLMClient] = None,
+    fetch_url_fn=None,
+) -> Dict[str, Any]:
+    """Импортировать рецепт из фото (Vision LLM), ссылки (JSON-LD/HTML) или текста."""
+    clean_text = (raw_text or "").strip()
+    client = llm_client_instance or default_llm_client
+
+    if image_bytes:
+        if not client.is_configured():
+            return {
+                "ok": False,
+                "recipe": None,
+                "source": "photo_import",
+                "source_label": "Импорт с фото",
+                "used_llm": False,
+                "error": "llm_not_configured",
+            }
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{image_mime};base64,{b64}"
+        prompt = "Извлеки рецепт с этого фото (ингредиенты с граммовками и пошаговое приготовление)."
+        if clean_text:
+            prompt += f"\nПодпись пользователя: {clean_text}"
+        res = await client.complete_json(
+            _RECIPE_IMPORT_SYSTEM_PROMPT,
+            prompt,
+            temperature=0.1,
+            max_tokens=1800,
+            image_data_urls=[data_url],
+        )
+        recipe = (
+            _normalize_ai_recipe(res.data, profile=profile, eff_slot="lunch", source="photo_import")
+            if res.ok and isinstance(res.data, dict)
+            else None
+        )
+        return {
+            "ok": recipe is not None,
+            "recipe": recipe,
+            "source": "photo_import",
+            "source_label": "Импорт с фото",
+            "used_llm": True,
+            "error": None if recipe else (res.error or "vision_parse_failed"),
+        }
+
+    target_url = (url or "").strip()
+    if not target_url and clean_text:
+        m_url = re.search(r"(?:https?|ftp|file)://[^\s<>\"']+", clean_text, flags=re.IGNORECASE)
+        if m_url:
+            target_url = m_url.group(0).rstrip(".,);")
+
+    if target_url:
+        parsed_u = urllib.parse.urlparse(target_url)
+        host_lbl = (parsed_u.hostname or "").strip()
+        source_label = f"Сайт: {host_lbl}" if host_lbl else "Импорт по ссылке"
+        try:
+            if fetch_url_fn is not None:
+                if (parsed_u.scheme or "").lower() not in {"http", "https"}:
+                    raise ValueError("unsafe_url")
+                fetched = fetch_url_fn(target_url)
+                if asyncio.iscoroutine(fetched):
+                    fetched = await fetched
+                if isinstance(fetched, tuple):
+                    page_html, final_url = str(fetched[0] or ""), str(fetched[1] or target_url)
+                else:
+                    page_html, final_url = str(fetched or ""), target_url
+            else:
+                page_html, final_url = await _fetch_recipe_url_safe(target_url)
+        except ValueError:
+            return {
+                "ok": False,
+                "recipe": None,
+                "source": "url_import",
+                "source_label": source_label,
+                "used_llm": False,
+                "error": "unsafe_url",
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "recipe": None,
+                "source": "url_import",
+                "source_label": source_label,
+                "used_llm": False,
+                "error": "fetch_failed",
+            }
+
+        final_host = (urllib.parse.urlparse(final_url).hostname or "").strip()
+        if final_host:
+            source_label = f"Сайт: {final_host}"
+
+        jsonld_raw = _extract_jsonld_recipe(page_html)
+        if jsonld_raw:
+            norm = _normalize_ai_recipe(jsonld_raw, profile=profile, eff_slot="lunch", source="url_import")
+            if norm:
+                return {
+                    "ok": True,
+                    "recipe": norm,
+                    "source": "url_import",
+                    "source_label": source_label,
+                    "used_llm": False,
+                    "error": None,
+                }
+
+        plain = _html_to_plain_text(page_html)
+        if plain and client.is_configured():
+            res = await client.complete_json(
+                _RECIPE_IMPORT_SYSTEM_PROMPT,
+                f"Извлеки один рецепт с веб-страницы ({final_url}):\n\n{plain}",
+                temperature=0.1,
+                max_tokens=1800,
+            )
+            if res.ok and isinstance(res.data, dict):
+                norm = _normalize_ai_recipe(res.data, profile=profile, eff_slot="lunch", source="url_import")
+                if norm:
+                    return {
+                        "ok": True,
+                        "recipe": norm,
+                        "source": "url_import",
+                        "source_label": source_label,
+                        "used_llm": True,
+                        "error": None,
+                    }
+
+        offline_raw = _parse_recipe_text_offline(plain or page_html)
+        norm_off = (
+            _normalize_ai_recipe(offline_raw, profile=profile, eff_slot="lunch", source="url_import")
+            if offline_raw
+            else None
+        )
+        return {
+            "ok": norm_off is not None,
+            "recipe": norm_off,
+            "source": "url_import",
+            "source_label": source_label,
+            "used_llm": False,
+            "error": None if norm_off else "recipe_not_found",
+        }
+
+    if not clean_text:
+        return {
+            "ok": False,
+            "recipe": None,
+            "source": "text_import",
+            "source_label": "Импорт текстом",
+            "used_llm": False,
+            "error": "empty_input",
+        }
+
+    if client.is_configured():
+        res = await client.complete_json(
+            _RECIPE_IMPORT_SYSTEM_PROMPT,
+            f"Извлеки структурированный рецепт из этого текста:\n\n{clean_text}",
+            temperature=0.1,
+            max_tokens=1800,
+        )
+        if res.ok and isinstance(res.data, dict):
+            norm = _normalize_ai_recipe(res.data, profile=profile, eff_slot="lunch", source="text_import")
+            if norm:
+                return {
+                    "ok": True,
+                    "recipe": norm,
+                    "source": "text_import",
+                    "source_label": "Импорт текстом",
+                    "used_llm": True,
+                    "error": None,
+                }
+
+    offline_raw = _parse_recipe_text_offline(clean_text)
+    norm_off = (
+        _normalize_ai_recipe(offline_raw, profile=profile, eff_slot="lunch", source="text_import")
+        if offline_raw
+        else None
+    )
+    return {
+        "ok": norm_off is not None,
+        "recipe": norm_off,
+        "source": "text_import",
+        "source_label": "Импорт текстом",
+        "used_llm": False,
+        "error": None if norm_off else "recipe_not_found",
     }

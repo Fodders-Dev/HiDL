@@ -15,8 +15,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
-from keyboards.common import main_menu_keyboard
+from keyboards.common import food_menu_keyboard, main_menu_keyboard
 from services import fitness_nutrition, household_service, kitchen_ai
+from utils.profile import is_student_mode
 from utils.rows import rows_to_dicts
 from utils.time import format_date_display, local_date_str
 from utils.texts import error
@@ -71,6 +72,11 @@ class ShoppingAddState(StatesGroup):
 class CookingState(StatesGroup):
     recipe_id = State()
     servings = State()
+    confirm = State()
+
+
+class RecipeImportState(StatesGroup):
+    waiting_input = State()
     confirm = State()
 
 # --- HELPERS ---
@@ -221,17 +227,7 @@ def _parse_expires(text: str) -> Tuple[str | None, str | None]:
 
 # --- KEYBOARDS ---
 def kitchen_main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🍳 Что приготовить сейчас?", callback_data="kitchen:quick_pick")],
-        [InlineKeyboardButton(text="✨ Придумать из холодильника", callback_data="kitchen:ai_chef")],
-        [InlineKeyboardButton(text="🔥 Мой КБЖУ сегодня", callback_data="kbju:today")],
-        [InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan")],
-        [InlineKeyboardButton(text="❄️ Мой холодильник", callback_data="kitchen:fridge")],
-        [InlineKeyboardButton(text="📥 Импорт корзины / чека", callback_data="kitchen:cart_import")],
-        [InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes")],
-        [InlineKeyboardButton(text="🛒 Список покупок", callback_data="kitchen:shoplist")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
-    ])
+    return food_menu_keyboard()
 
 def recipes_list_keyboard(recipes: List[dict]) -> InlineKeyboardMarkup:
     rows = []
@@ -246,6 +242,7 @@ def recipes_categories_keyboard(profile: str) -> InlineKeyboardMarkup:
     for i in range(0, len(RECIPE_CATEGORIES), 2):
         pair = RECIPE_CATEGORIES[i : i + 2]
         rows.append([InlineKeyboardButton(text=label, callback_data=f"kitchen:recipes_cat:{key}:0") for key, label in pair])
+    rows.append([InlineKeyboardButton(text="📥 Импорт рецепта (фото / ссылка)", callback_data="kitchen:recipe_import")])
     rows.append([InlineKeyboardButton(text=f"Питание: {_diet_label(profile)}", callback_data="settings:mealprof")])
     rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -279,6 +276,8 @@ def shopping_list_keyboard(items: List[dict], scope: str = "household") -> Inlin
             InlineKeyboardButton(text="🗑", callback_data=f"kitchen:shop_del:{item['id']}:{scope}"),
         ])
     rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"kitchen:shop_add:{scope}")])
+    if any(not i.get("is_bought") for i in items):
+        rows.append([InlineKeyboardButton(text="📋 Скопировать список", callback_data=f"kitchen:shop_export:{scope}")])
     if any(i["is_bought"] for i in items):
         rows.append([InlineKeyboardButton(text="🏠 Перенести отмеченное в холодильник", callback_data=f"kitchen:shop_finish:{scope}")])
     rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
@@ -391,6 +390,49 @@ async def finish_shopping(callback: types.CallbackQuery, db):
     await callback.answer(f"Перенесено продуктов: {count}", show_alert=True)
     await _render_shoplist(callback, db, scope=scope)
 
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:shop_export:"))
+async def export_shoplist(callback: types.CallbackQuery, db):
+    parts = (callback.data or "").split(":")
+    scope = parts[2] if len(parts) > 2 else "household"
+    await _safe_answer_callback(callback)
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    items = [
+        r for r in rows_to_dicts(await repo.list_shopping_items(db, user["id"], scope=scope))
+        if not r.get("is_bought")
+    ]
+    if not items:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"kitchen:shoplist:{scope}")],
+        ])
+        await safe_edit(callback.message, "В списке покупок сейчас нет активных позиций.", reply_markup=kb)
+        return
+
+    mapped = [
+        {
+            "name": str(i.get("item_name") or ""),
+            "qty": float(i.get("quantity") or 1.0),
+            "unit": str(i.get("unit") or "шт"),
+        }
+        for i in items
+    ]
+    scope_title = "Список покупок (личный)" if scope == "personal" else "Общий список покупок дома"
+    exp = kitchen_ai.build_shopping_export(mapped, header=scope_title, preserve_explicit=True)
+    plain = exp["plain_text"][:3600]
+    text = (
+        "📋 <b>Список для копирования</b>\n"
+        "<i>Нажми на блок ниже, чтобы скопировать и вставить в доставку или ИИ:</i>\n\n"
+        f"<pre>{_h(plain)}</pre>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⬅️ К списку", callback_data=f"kitchen:shoplist:{scope}"),
+            InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")],
+    ])
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+
 @router.callback_query(lambda c: c.data == "kitchen:cancel_fsm")
 async def kitchen_cancel_fsm(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -462,7 +504,12 @@ def _format_suggestion_line(idx: int, item: dict) -> str:
     return "\n".join(lines)
 
 
-def _suggestion_action_row(item: dict) -> list[InlineKeyboardButton]:
+def _suggestion_action_row(
+    item: dict,
+    *,
+    back_category: str = "all",
+    back_page: int = 0,
+) -> list[InlineKeyboardButton]:
     recipe = item["recipe"]
     rid = str(recipe.get("id") or "")
     title = str(recipe.get("title") or "Рецепт")
@@ -471,7 +518,7 @@ def _suggestion_action_row(item: dict) -> list[InlineKeyboardButton]:
     missing = item.get("missing") or []
     left = InlineKeyboardButton(
         text=f"🍳 {short_title} · {t_min}м",
-        callback_data=f"kitchen:cook_view:{rid}:2:all:0",
+        callback_data=f"kitchen:cook_view:{rid}:2:{back_category}:{back_page}",
     )
     if missing:
         right = InlineKeyboardButton(
@@ -541,17 +588,79 @@ async def quick_pick_recipes(callback: types.CallbackQuery, db):
 
     rows.append([
         InlineKeyboardButton(text="🔄 Ещё варианты", callback_data=f"kitchen:quick_pick:{energy}:{page + 1}"),
+        InlineKeyboardButton(text="🛒 Не хватает 1–2", callback_data="kitchen:almost_ready:0"),
+    ])
+    rows.append([
         InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
-    ])
-    rows.append([
         InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
-        InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
     ])
     rows.append([
+        InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
         InlineKeyboardButton(text="📖 Рецепты", callback_data="kitchen:recipes"),
-        InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main"),
     ])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
 
+    await safe_edit(
+        callback.message,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(
+    lambda c: c.data and (c.data == "kitchen:almost_ready" or c.data.startswith("kitchen:almost_ready:"))
+)
+async def almost_ready_recipes(callback: types.CallbackQuery, db):
+    await _safe_answer_callback(callback)
+    parts = (callback.data or "").split(":")
+    page = max(0, _safe_int(parts[2], 0)) if len(parts) > 2 else 0
+
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    res = await kitchen_ai.suggest_almost_ready_recipes(db, user, max_missing=2, limit=40)
+    all_items = list(res.get("suggestions") or [])
+    page_size = 4
+    max_page = max(0, (len(all_items) - 1) // page_size)
+    page = min(page, max_page)
+    chunk = all_items[page * page_size : (page + 1) * page_size]
+
+    profile = str(res.get("meal_profile") or "omnivore")
+    pantry_count = int(res.get("pantry_count") or 0)
+    total_matches = int(res.get("total_matches") or 0)
+    advice = res.get("daily_advice") or {}
+
+    lines = [
+        "🛒 <b>Не хватает 1–2 продуктов</b>",
+        f"Питание: <b>{_diet_label(profile)}</b> • Дома: {pantry_count} поз. • Найдено: {total_matches}",
+    ]
+    if advice.get("summary_line"):
+        lines.append(f"🔥 {_h(advice['summary_line'])}")
+    lines.append("")
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if chunk:
+        for idx, item in enumerate(chunk, page * page_size + 1):
+            lines.append(_format_suggestion_line(idx, item))
+            exp_used = item.get("uses_expiring") or []
+            if exp_used:
+                lines.append(f"   ⏰ пустит в дело: {_h(', '.join(exp_used[:3]))}")
+            rows.append(_suggestion_action_row(item, back_category="almost", back_page=page))
+    else:
+        lines.append("Рецептов с нехваткой ровно 1–2 продуктов под твой холодильник пока не нашлось.")
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"kitchen:almost_ready:{page - 1}"))
+    if (page + 1) * page_size < len(all_items):
+        nav.append(InlineKeyboardButton(text="Ещё ➡️", callback_data=f"kitchen:almost_ready:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(text="🍳 Готовить из дома", callback_data="kitchen:quick_pick"),
+        InlineKeyboardButton(text="🛒 Покупки", callback_data="kitchen:shoplist"),
+    ])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")])
     await safe_edit(
         callback.message,
         "\n".join(lines),
@@ -709,7 +818,10 @@ async def view_recipe(callback: types.CallbackQuery, db):
                 InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kbju:log_recipe:{rid}:2"),
             ],
             [InlineKeyboardButton(text="✅ Проверить продукты", callback_data=f"kitchen:cook_check:{rid}:{servings}:{category}:{page}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"kitchen:recipes_cat:{category}:{page}")],
+            [InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=(f"kitchen:almost_ready:{page}" if category == "almost" else f"kitchen:recipes_cat:{category}:{page}"),
+            )],
         ]
     )
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -996,8 +1108,19 @@ def _render_meal_plan_payload(plan_data: dict) -> Tuple[str, InlineKeyboardMarku
     if missing:
         kb_rows.append([
             InlineKeyboardButton(
-                text=f"🛒 Докупить недостающее ({len(missing)})",
+                text=f"🛒 Докупить ({len(missing)})",
                 callback_data=f"kitchen:meal_plan:shop:{days}",
+            ),
+            InlineKeyboardButton(
+                text="📋 Список для доставки",
+                callback_data=f"kitchen:meal_plan:export:{days}",
+            ),
+        ])
+    else:
+        kb_rows.append([
+            InlineKeyboardButton(
+                text="📋 Экспорт списка покупок",
+                callback_data="kitchen:shop_export:household",
             )
         ])
     other_days = 4 if days == 3 else 3
@@ -1055,6 +1178,55 @@ async def mealplan_callbacks(callback: types.CallbackQuery, db):
             show_alert=True,
         )
         plan_data = await kitchen_ai.get_meal_plan_view(db, user, days=days, auto_generate=True)
+    elif action in {"export", "export_all"}:
+        plan_rows = await repo.list_meal_plans_range(db, user["id"], start_date, end_date)
+        if not plan_rows:
+            plan_data = await kitchen_ai.get_meal_plan_view(db, user, days=days, auto_generate=True)
+            plan_rows = list(plan_data.get("items") or [])
+        include_active = action == "export_all"
+        exp = await kitchen_ai.build_meal_plan_shopping_export(
+            db, user, plan_rows, include_active_shopping=include_active
+        )
+        if exp["total_items"] == 0:
+            kb_empty = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⬅️ К меню", callback_data=f"kitchen:meal_plan:view:{days}"),
+                    InlineKeyboardButton(text="🛒 Покупки", callback_data="kitchen:shoplist:household"),
+                ]
+            ])
+            await safe_edit(
+                callback.message,
+                "✅ Всё нужное для этого меню уже есть дома или в списке покупок!",
+                reply_markup=kb_empty,
+            )
+            return
+
+        plain = exp["plain_text"][:3600]
+        exp_text = (
+            "📋 <b>Список продуктов для доставки / ИИ</b>\n"
+            "<i>Нажми на блок ниже, чтобы скопировать и вставить в Перекрёсток, Ленту или чат-помощник:</i>\n\n"
+            f"<pre>{_h(plain)}</pre>"
+        )
+        exp_rows: list[list[InlineKeyboardButton]] = []
+        if exp["missing_count"] > 0:
+            exp_rows.append([
+                InlineKeyboardButton(
+                    text=f"🛒 Добавить недостающее в список ({exp['missing_count']})",
+                    callback_data=f"kitchen:meal_plan:shop:{days}",
+                )
+            ])
+        toggle_btn = (
+            InlineKeyboardButton(text="📅 Только под меню", callback_data=f"kitchen:meal_plan:export:{days}")
+            if include_active
+            else InlineKeyboardButton(text="📦 + Текущий список покупок", callback_data=f"kitchen:meal_plan:export_all:{days}")
+        )
+        exp_rows.append([toggle_btn])
+        exp_rows.append([
+            InlineKeyboardButton(text="⬅️ К меню", callback_data=f"kitchen:meal_plan:view:{days}"),
+            InlineKeyboardButton(text="🛒 Покупки", callback_data="kitchen:shoplist:household"),
+        ])
+        await safe_edit(callback.message, exp_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=exp_rows), parse_mode="HTML")
+        return
     elif action == "gen":
         cur_rows = await repo.list_meal_plans_range(db, user["id"], start_date, end_date)
         excl = [str(r.get("recipe_id") or "") for r in cur_rows if r.get("recipe_id")]
@@ -1355,8 +1527,7 @@ async def cart_import_start(callback: types.CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(CartImportState.waiting_input, F.photo)
-async def cart_import_photo(message: types.Message, state: FSMContext):
+async def _download_photo_bytes(message: types.Message) -> bytes:
     photo = message.photo[-1]
     buf = io.BytesIO()
     dl = await message.bot.download(photo, destination=buf)
@@ -1366,6 +1537,12 @@ async def cart_import_photo(message: types.Message, state: FSMContext):
             img_bytes = dl.getvalue()
         elif isinstance(dl, (bytes, bytearray)):
             img_bytes = bytes(dl)
+    return img_bytes
+
+
+@router.message(CartImportState.waiting_input, F.photo)
+async def cart_import_photo(message: types.Message, state: FSMContext):
+    img_bytes = await _download_photo_bytes(message)
     parsed = await kitchen_ai.parse_cart_input(
         raw_text=message.caption or "",
         image_bytes=img_bytes,
@@ -1641,5 +1818,184 @@ async def ai_chef_back(callback: types.CallbackQuery, state: FSMContext, db):
         advice_summary=str(meta.get("advice_summary") or ""),
     )
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+
+
+# --- HANDLERS: RECIPE IMPORT (PHOTO / URL / TEXT) ---
+_RECIPE_IMPORT_PROMPT = (
+    "📥 <b>Импорт рецепта в общую книгу</b>\n\n"
+    "Пришли <b>любой вариант</b>:\n"
+    "• <b>Фото</b> страницы кулинарной книги или скриншот рецепта;\n"
+    "• <b>Ссылку</b> (<code>https://...</code>) на рецепт;\n"
+    "• <b>Текст</b> рецепта (название, ингредиенты, шаги).\n\n"
+    "Я разберу граммовки, посчитаю КБЖУ и сохраню в «Мои рецепты»."
+)
+
+
+@router.message(Command("addrecipe"))
+async def addrecipe_cmd(message: types.Message, state: FSMContext, db):
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    if is_student_mode(user):
+        await message.answer("Импорт рецептов доступен во взрослом режиме HiDL.")
+        return
+    await state.set_state(RecipeImportState.waiting_input)
+    await message.answer(_RECIPE_IMPORT_PROMPT, reply_markup=_cancel_fsm_keyboard(), parse_mode="HTML")
+
+
+@router.callback_query(lambda c: c.data == "kitchen:recipe_import")
+async def recipe_import_start(callback: types.CallbackQuery, state: FSMContext, db):
+    await _safe_answer_callback(callback)
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    if is_student_mode(user):
+        await callback.message.answer("Импорт рецептов доступен во взрослом режиме HiDL.")
+        return
+    await state.set_state(RecipeImportState.waiting_input)
+    await callback.message.answer(_RECIPE_IMPORT_PROMPT, reply_markup=_cancel_fsm_keyboard(), parse_mode="HTML")
+
+
+async def _show_recipe_import_preview(message: types.Message, state: FSMContext, parsed: dict) -> None:
+    rec = parsed.get("recipe") if parsed.get("ok") else None
+    if not rec:
+        err = str(parsed.get("error") or "")
+        if err == "llm_not_configured":
+            hint = "ИИ-распознавание фото сейчас недоступно — пришли рецепт текстом или ссылкой на сайт с рецептом."
+        elif err == "unsafe_url":
+            hint = "Эта ссылка не подходит (принимаются только внешние публичные http/https страницы)."
+        elif err == "fetch_failed":
+            hint = "Не удалось открыть страницу по ссылке — скопируй текст рецепта сюда, и я разберу его."
+        else:
+            hint = (
+                "Не получилось разобрать рецепт. Пришли название, ингредиенты и шаги с новой строки, "
+                "ссылку на сайт или чёткое фото страницы."
+            )
+        await message.answer(hint, reply_markup=_cancel_fsm_keyboard())
+        return
+
+    src = str(parsed.get("source") or "text_import")
+    src_lbl = str(parsed.get("source_label") or "Импорт")
+    await state.set_state(RecipeImportState.confirm)
+    await state.update_data(imported_recipe=rec, import_source=src, import_source_label=src_lbl)
+
+    nutr = rec.get("nutrition") or fitness_nutrition.estimate_recipe_nutrition(rec)
+    lines = [
+        f"📥 <b>Проверь рецепт</b> ({_h(src_lbl)})",
+        f"\n<b>{_h(rec.get('title'))}</b>",
+    ]
+    if rec.get("desc"):
+        lines.append(f"<i>{_h(rec['desc'])}</i>")
+    lines.append(
+        f"⏱ {int(rec.get('time_minutes') or 20)} мин • 🍽 {int(rec.get('base_servings') or 2)} порц."
+    )
+    if nutr.get("kcal"):
+        lines.append(
+            f"🔥 ~<b>{int(nutr['kcal'])} ккал</b> на 1 порцию "
+            f"(Б {float(nutr['protein_g']):g}г / Ж {float(nutr['fat_g']):g}г / У {float(nutr['carbs_g']):g}г)"
+        )
+    lines.append("\n🧾 <b>Ингредиенты:</b>")
+    ings = list(rec.get("ingredients") or [])
+    for ing in ings[:20]:
+        lines.append(_format_ing_line(ing.get("name", ""), float(ing.get("qty") or 1), str(ing.get("unit") or "")))
+    if len(ings) > 20:
+        lines.append(f"… и ещё {len(ings) - 20}")
+
+    lines.append("\n👩‍🍳 <b>Шаги:</b>")
+    steps = list(rec.get("steps") or [])
+    for idx, step in enumerate(steps[:10], 1):
+        lines.append(f"{idx}. {_h(step)}")
+    if len(steps) > 10:
+        lines.append("…")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сохранить в «Мои рецепты»", callback_data="kitchen:recipe_import_save")],
+        [
+            InlineKeyboardButton(text="🔄 Прислать другой", callback_data="kitchen:recipe_import"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="kitchen:cancel_fsm"),
+        ],
+    ])
+    await message.answer("\n".join(lines)[:4000], reply_markup=kb, parse_mode="HTML")
+
+
+@router.message(RecipeImportState.waiting_input, F.photo)
+async def recipe_import_photo(message: types.Message, state: FSMContext, db):
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    profile = await _get_meal_profile(db, user["id"])
+    img_bytes = await _download_photo_bytes(message)
+    parsed = await kitchen_ai.parse_recipe_from_input(
+        raw_text=message.caption or "",
+        image_bytes=img_bytes,
+        image_mime="image/jpeg",
+        profile=profile,
+    )
+    await _show_recipe_import_preview(message, state, parsed)
+
+
+@router.message(RecipeImportState.waiting_input, lambda m: bool(m.text and not m.text.startswith("/")))
+async def recipe_import_text(message: types.Message, state: FSMContext, db):
+    if _is_cancel_text(message.text):
+        await state.clear()
+        await message.answer("Отменила.", reply_markup=main_menu_keyboard())
+        return
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    profile = await _get_meal_profile(db, user["id"])
+    parsed = await kitchen_ai.parse_recipe_from_input(
+        raw_text=message.text or "",
+        profile=profile,
+    )
+    await _show_recipe_import_preview(message, state, parsed)
+
+
+@router.callback_query(lambda c: c.data == "kitchen:recipe_import_save")
+async def recipe_import_save(callback: types.CallbackQuery, state: FSMContext, db):
+    data = await state.get_data()
+    rec = data.get("imported_recipe")
+    if not isinstance(rec, dict):
+        await state.clear()
+        await _safe_answer_callback(callback, "Рецепт не найден или уже сохранён.", show_alert=True)
+        await safe_edit(callback.message, "Пришли рецепт заново, чтобы сохранить его.", reply_markup=kitchen_main_keyboard())
+        return
+
+    src = str(data.get("import_source") or rec.get("source") or "text_import")
+    src_lbl = str(data.get("import_source_label") or "Импорт")
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    saved = await repo.upsert_user_recipe(
+        db,
+        int(user["id"]),
+        title=str(rec.get("title") or "Рецепт"),
+        desc=str(rec.get("desc") or ""),
+        tags=list(rec.get("tags") or []),
+        base_servings=int(rec.get("base_servings") or 2),
+        time_minutes=int(rec.get("time_minutes") or 20),
+        ingredients=list(rec.get("ingredients") or []),
+        steps=list(rec.get("steps") or []),
+        nutrition=rec.get("nutrition") if isinstance(rec.get("nutrition"), dict) else None,
+        source=src,
+        source_label=src_lbl,
+    )
+    await state.clear()
+    await _safe_answer_callback(callback, "Сохранила в «Мои рецепты» ⭐")
+
+    actor_name = _h(user.get("name") or "Партнёр")
+    await household_service.notify_household_partners(
+        getattr(callback, "bot", None),
+        db,
+        user,
+        f"📖 <b>{actor_name}</b> добавил(а) рецепт в общую книгу: <b>{_h(saved.get('title'))}</b>",
+    )
+
+    rid = str(saved.get("id") or "")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍳 Открыть / приготовить", callback_data=f"kitchen:cook_view:{rid}:2:mine:0")],
+        [
+            InlineKeyboardButton(text="⭐ Мои рецепты", callback_data="kitchen:recipes_cat:mine:0"),
+            InlineKeyboardButton(text="📥 Ещё рецепт", callback_data="kitchen:recipe_import"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")],
+    ])
+    await safe_edit(
+        callback.message,
+        f"⭐ Рецепт <b>«{_h(saved.get('title'))}»</b> сохранён в общую книгу <b>«Мои рецепты»</b>!\n"
+        "Теперь он доступен вам обоим, участвует в подборе и меню на 3–4 дня.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 
