@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from utils.time import format_time_local
 
 PLAYBOOK_PATH = Path(__file__).resolve().parents[1] / "data" / "knowledge" / "coach_playbook.json"
 _PLAYBOOK_CACHE: List[Dict[str, Any]] = []
@@ -218,18 +221,32 @@ def build_body_action_plan(
     nutrition_advice: Optional[Dict[str, Any]],
     user: Dict[str, Any],
     meal_profile: str = "",
+    now_utc: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
-    """Сформировать конкретный разбор и действие на сегодня по замерам тела и активности."""
+    """Сформировать конкретный разбор и действие по замерам тела, активности и времени суток."""
+    now = now_utc or datetime.datetime.utcnow()
+    tz = str(user.get("timezone") or "UTC")
+    try:
+        local_hour = int(format_time_local(now, tz).split(":")[0])
+    except Exception:
+        local_hour = 12
+    is_late_evening = local_hour >= 21 or local_hour < 5
+
     coach_mode = str(user.get("coach_mode") or "balanced").strip().lower()
     goal = str(user.get("weight_goal") or "loss").strip().lower()
     if goal == "mindful":
         return {
             "headline": "Осознанный ритм",
             "diagnosis": "Ты смотришь на самочувствие без жёсткой гонки за цифрами.",
-            "action_today": "Сделай 15–20 минут спокойной прогулки или мягкую разминку и выпей воды.",
+            "action_label": "На завтра" if is_late_evening else "Что делать сегодня",
+            "action_today": (
+                "Главное сегодня — вовремя лечь спать, а завтра выпить воды и спокойно пройтись 15–20 минут."
+                if is_late_evening
+                else "сделай 15–20 минут спокойной прогулки или мягкую разминку и выпей воды."
+            ),
             "principle_title": "Правило 3 минут",
             "principle_source": "BJ Fogg — Tiny Habits",
-            "suggest_lazy_workout": True,
+            "suggest_lazy_workout": not is_late_evening,
         }
 
     ctx = {
@@ -254,39 +271,57 @@ def build_body_action_plan(
 
     diag_parts: List[str] = []
     if visc is not None and visc >= 13.0:
-        diag_parts.append(f"Висц. жир {visc:g} (повышенный — отлично сгорает от шагов и дефицита).")
+        diag_parts.append(f"Висц. жир {visc:g} (повышенный — отлично уходит от регулярных шагов и умеренного дефицита).")
     elif f_d is not None and f_d <= -0.3 and (w_d is None or w_d >= -0.4):
         diag_parts.append("Идёт чистая рекомпозиция: жир падает при удержании мышц.")
 
     if wk_count == 0:
         if coach_mode == "strict":
-            diag_parts.append("На этой неделе 0 тренировок — мышцы в дефиците без стимула не удержатся.")
+            diag_parts.append("За неделю 0 тренировок — мышцы в дефиците без стимула не удержатся.")
         else:
-            diag_parts.append("На этой неделе пока без тренировок — самое время для мягкого старта.")
+            diag_parts.append("На этой неделе пока без тренировок — пора запланировать мягкий старт.")
 
     if not diag_parts:
         diag_parts.append(str((card or {}).get("summary") or "Ровный ритм замеров и умеренный дефицит работают лучше рывков.").split(".")[0] + ".")
 
-    if wk_count == 0:
-        action = (
-            "Сегодня: 3-мин микро-старт («🫠 Лень начинать») или 15 мин ходьбы после еды."
-            if coach_mode != "strict"
-            else "Прямо сейчас: 3-мин старт («🫠 Лень начинать») + минимум 7500 шагов за день!"
-        )
-    elif rem_p >= 30 and float(eat.get("kcal") or 0) > 0:
-        action = f"Докинь сегодня ещё ~{rem_p} г белка (тофу/бобовые/протеин), чтобы защитить мышцы."
+    if is_late_evening:
+        action_label = "На завтра"
+        if wk_count == 0:
+            action = (
+                "сейчас главное — вовремя лечь спать (недосып держит воду и тормозит жиросжигание), "
+                "а завтра утром закрой 3-мин старт или 15 мин ходьбы."
+            )
+        elif rem_p >= 30 and float(eat.get("kcal") or 0) > 0:
+            action = (
+                f"сегодня до сна без перегруза, а завтра докинь белка в первый приём пищи (сегодня не хватило ~{rem_p} г)."
+            )
+        else:
+            action = "сейчас вовремя уйди в сон, а завтра утром повтори спокойный замер натощак и держи 7–8 тыс. шагов."
+        suggest_lazy = False
     else:
-        action = str((card or {}).get("action_rule") or "Держи норму КБЖУ и 7–8 тыс. шагов сегодня.")
+        action_label = "Что делать сегодня"
+        if wk_count == 0:
+            action = (
+                "3-мин микро-старт (кнопка «🫠 Лень начинать» ниже) или 15 мин ходьбы после еды."
+                if coach_mode != "strict"
+                else "прямо сейчас 3-мин старт («🫠 Лень начинать») + минимум 7500 шагов за день!"
+            )
+        elif rem_p >= 30 and float(eat.get("kcal") or 0) > 0:
+            action = f"докинь сегодня ещё ~{rem_p} г белка (тофу/бобовые/протеин), чтобы защитить мышцы."
+        else:
+            action = str((card or {}).get("action_rule") or "держи норму КБЖУ и 7–8 тыс. шагов сегодня.")
+        suggest_lazy = wk_count == 0
 
     tone_line = ""
-    if card:
+    if card and not is_late_evening:
         tone_line = str(card.get("strict_line") if coach_mode == "strict" else card.get("gentle_line") or "")
 
     return {
         "headline": str((card or {}).get("title") or "Фокус тренера"),
         "diagnosis": " ".join(diag_parts).strip(),
+        "action_label": action_label,
         "action_today": f"{tone_line} {action}".strip() if tone_line and coach_mode == "strict" else action,
         "principle_title": str((card or {}).get("title") or ""),
         "principle_source": str((card or {}).get("source") or ""),
-        "suggest_lazy_workout": wk_count == 0,
+        "suggest_lazy_workout": suggest_lazy,
     }

@@ -413,16 +413,46 @@ class SmartScaleUXTests(unittest.IsolatedAsyncioTestCase):
         topics = {c["topic"] for c in cards}
         self.assertTrue(bool(topics & {"visceral_neat", "training_med"}))
 
-        plan = coach_knowledge.build_body_action_plan(
+        # Daytime (10:00 Europe/Moscow) -> actionable today + 3-min start button
+        day_utc = datetime.datetime(2026, 11, 24, 7, 0, 0)
+        plan_day = coach_knowledge.build_body_action_plan(
             latest={"weight": 99.2, "visceral_fat": 15.0},
             trend={"latest": {"weight": 99.2, "visceral_fat": 15.0}, "count": 1},
             week_workouts={"count": 0},
             nutrition_advice={"targets": {"protein_g": 134}, "eaten": {"kcal": 0, "protein_g": 0}},
             user={**self.user, "coach_mode": "strict"},
             meal_profile="vegan",
+            now_utc=day_utc,
         )
-        self.assertTrue(plan["suggest_lazy_workout"])
-        self.assertIn("15", plan["diagnosis"])
+        self.assertTrue(plan_day["suggest_lazy_workout"])
+        self.assertEqual(plan_day["action_label"], "Что делать сегодня")
+        self.assertIn("15", plan_day["diagnosis"])
+
+        summary_html = fitness_nutrition.format_scale_saved_summary(
+            {"weight": 99.2, "body_fat_pct": 29.0, "visceral_fat": 15.0},
+            {"latest": {"weight": 99.2, "visceral_fat": 15.0}, "count": 1},
+            fitness_nutrition.calculate_daily_targets(self.user, {"weight": 99.2, "body_fat_pct": 29.0}),
+            "loss",
+            action_plan=plan_day,
+        )
+        self.assertNotIn("Сегодня: Сегодня:", summary_html)
+        self.assertNotIn("Eric Helms", summary_html)
+        self.assertNotIn("📚", summary_html)
+
+        # Late evening (23:17 Europe/Moscow) -> sleep-aware "На завтра", no walk tonight suggestion
+        night_utc = datetime.datetime(2026, 11, 24, 20, 17, 0)
+        plan_night = coach_knowledge.build_body_action_plan(
+            latest={"weight": 99.2, "visceral_fat": 15.0},
+            trend={"latest": {"weight": 99.2, "visceral_fat": 15.0}, "count": 1},
+            week_workouts={"count": 0},
+            nutrition_advice={"targets": {"protein_g": 134}, "eaten": {"kcal": 0, "protein_g": 0}},
+            user={**self.user, "coach_mode": "balanced"},
+            meal_profile="vegan",
+            now_utc=night_utc,
+        )
+        self.assertEqual(plan_night["action_label"], "На завтра")
+        self.assertFalse(plan_night["suggest_lazy_workout"])
+        self.assertIn("спать", plan_night["action_today"].lower())
 
         llm_adv = _QueuedLLM([])
         reply, meta = await advice_service.build_situational_advice_reply(

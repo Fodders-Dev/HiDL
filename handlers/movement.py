@@ -95,14 +95,15 @@ async def _render_body_card(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboa
     goal = str(user.get("weight_goal") or "loss")
     target = float(user.get("weight_target") or 0)
 
-    local_date = local_date_str(datetime.datetime.utcnow(), user.get("timezone") or "UTC")
+    local_dt = datetime.datetime.utcnow()
+    local_date = local_date_str(local_dt, user.get("timezone") or "UTC")
     week_stats = await repo.workout_stats_week(db, user_id, local_date)
     daily_targets = fitness_nutrition.calculate_daily_targets(
         user, latest, workout_kcal_today=int(week_stats.get("today_kcal_burned") or 0)
     )
     wellness_row = await repo.get_wellness(db, user_id)
     meal_profile = str((dict(wellness_row) if wellness_row else {}).get("meal_profile") or "")
-    nutrition_advice = await fitness_nutrition.get_daily_nutrition_advice(db, user)
+    nutrition_advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=local_dt)
     plan = coach_knowledge.build_body_action_plan(
         latest=latest,
         trend=trend,
@@ -110,6 +111,7 @@ async def _render_body_card(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboa
         nutrition_advice=nutrition_advice,
         user=user,
         meal_profile=meal_profile,
+        now_utc=local_dt,
     )
 
     lines = ["⚖ <b>Умные весы и параметры тела</b> (строго личное, партнёр не видит)"]
@@ -153,7 +155,8 @@ async def _render_body_card(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboa
     if plan.get("diagnosis"):
         lines.append(f"\n🎯 <b>Тренер HiDL:</b> {_h(plan['diagnosis'])}")
     if plan.get("action_today"):
-        lines.append(f"👉 <b>Сегодня:</b> {_h(plan['action_today'])}")
+        lbl = str(plan.get("action_label") or "Сегодня")
+        lines.append(f"👉 <b>{_h(lbl)}:</b> {_h(plan['action_today'])}")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -668,6 +671,7 @@ async def _commit_scale_parsed(message: types.Message, state: FSMContext, db, pa
         nutrition_advice=nutrition_advice,
         user=user,
         meal_profile=meal_profile,
+        now_utc=now_utc,
     )
 
     msg_text = fitness_nutrition.format_scale_saved_summary(

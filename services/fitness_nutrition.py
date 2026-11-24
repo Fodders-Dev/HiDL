@@ -1878,10 +1878,8 @@ def format_scale_saved_summary(
         lines.append("")
         lines.append(f"🎯 <b>Тренер HiDL:</b> {_html_mod.escape(str(action_plan.get('diagnosis') or ''))}")
         if action_plan.get("action_today"):
-            lines.append(f"👉 <b>Что делать сегодня:</b> {_html_mod.escape(str(action_plan['action_today']))}")
-        if action_plan.get("principle_title"):
-            src = f" ({action_plan['principle_source']})" if action_plan.get("principle_source") else ""
-            lines.append(f"<i>📚 {_html_mod.escape(str(action_plan['principle_title']) + src)}</i>")
+            action_label = str(action_plan.get("action_label") or "Что делать сейчас")
+            lines.append(f"👉 <b>{_html_mod.escape(action_label)}:</b> {_html_mod.escape(str(action_plan['action_today']))}")
 
     if low_res_warning:
         lines.append(

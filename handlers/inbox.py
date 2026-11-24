@@ -235,6 +235,7 @@ async def _save_and_reply_scale(
         nutrition_advice=nutrition_advice,
         user=user,
         meal_profile=meal_profile,
+        now_utc=now_utc,
     )
 
     msg_text = fitness_nutrition.format_scale_saved_summary(
