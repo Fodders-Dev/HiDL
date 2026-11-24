@@ -24,13 +24,16 @@ from utils.today import render_today
 router = Router()
 
 @router.callback_query(lambda c: c.data and c.data == "main:menu")
-async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     await state.clear()
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await callback.answer("Главное меню внизу 👇")
+    row = await repo.get_user_by_telegram_id(db, callback.from_user.id)
+    user = dict(row) if row else None
+    await callback.message.answer("Главное меню внизу 👇", reply_markup=main_menu_keyboard(user))
+    await callback.answer()
 
 
 @router.message(Command("menu"))

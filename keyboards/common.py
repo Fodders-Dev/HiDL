@@ -23,6 +23,7 @@ def main_menu_keyboard(user: dict | None = None) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
