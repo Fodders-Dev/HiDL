@@ -130,6 +130,29 @@ _CANONICAL_ALIASES: List[Tuple[str, Tuple[str, ...]]] = [
     ("cheese", ("сыр",)),
 ]
 
+_ING_NOUN_ENDINGS = (
+    "иями", "ями", "ами", "ого", "ему", "ыми", "ими",
+    "ее", "ие", "ые", "ое", "ей", "ой", "ий", "ый",
+    "ам", "ям", "ах", "ях", "ом", "ем", "ым", "им",
+    "ую", "юю", "ая", "яя", "ою", "ею",
+    "ов", "ев", "ия", "ья", "ье",
+    "а", "я", "у", "ю", "е", "о", "ы", "и", "ь", "й",
+)
+
+
+def _ing_stem(word: str) -> str:
+    """Стем ингредиента с безопасными окончаниями (не режет «-ли» у «фасоли», «брокколи» и т.п.)."""
+    w = (word or "").strip().casefold().replace("ё", "е")
+    if len(w) >= 4:
+        for end in _ING_NOUN_ENDINGS:
+            if w.endswith(end) and len(w) - len(end) >= 3:
+                w = w[: -len(end)]
+                break
+    if len(w) >= 4 and w.endswith("ь"):
+        w = w[:-1]
+    return w
+
+
 _CANONICAL_ALIAS_RULES: Tuple[Tuple[str, Tuple[Tuple[str, Tuple[str, ...], str], ...]], ...] = tuple(
     (
         key,
@@ -137,7 +160,7 @@ _CANONICAL_ALIAS_RULES: Tuple[Tuple[str, Tuple[Tuple[str, Tuple[str, ...], str],
             (
                 pat.replace("ё", "е"),
                 tuple(pat.replace("ё", "е").split()),
-                repo._ru_stem(pat.replace("ё", "е")) if " " not in pat.replace("ё", "е") else "",
+                _ing_stem(pat.replace("ё", "е")) if " " not in pat.replace("ё", "е") else "",
             )
             for pat in patterns
         ),
@@ -150,18 +173,34 @@ _MODIFIER_WORDS = {
     "вареный",
     "варёная",
     "вареная",
+    "варёной",
+    "вареной",
     "готовый",
     "готовая",
+    "готовой",
     "консервированный",
     "консервированная",
+    "консервированной",
+    "консервированного",
     "замороженные",
     "замороженная",
+    "замороженной",
     "свежий",
     "свежая",
+    "свежая",
+    "свежей",
+    "свежих",
     "свежие",
     "молодые",
     "спелый",
+    "спелая",
+    "белый",
+    "белая",
+    "белой",
+    "белого",
+    "красный",
     "красная",
+    "красной",
     "белокочанная",
     "репчатый",
     "черри",
@@ -170,13 +209,35 @@ _MODIFIER_WORDS = {
     "колотый",
     "чёрная",
     "черная",
+    "чёрный",
+    "черный",
     "цельнозерновой",
+    "цельнозерновая",
     "любые",
     "греческий",
     "суповой",
     "набор",
     "филе",
     "фарш",
+    "молотый",
+    "молотая",
+    "молотые",
+    "жареный",
+    "жареная",
+    "жареной",
+    "тушеный",
+    "тушеная",
+    "очищенный",
+    "очищенная",
+    "очищенной",
+    "сушеный",
+    "сушеная",
+}
+
+_MODIFIER_STEMS: Set[str] = {
+    _ing_stem(w)
+    for w in _MODIFIER_WORDS
+    if _ing_stem(w) not in {"сыр", "сок", "фил", "фарш"}
 }
 
 
@@ -314,13 +375,13 @@ def _canonical_key(single_name: str) -> Optional[str]:
         return None
     norm_tokens = norm.split()
     norm_token_set = set(norm_tokens)
-    norm_stems = {repo._ru_stem(nt) for nt in norm_tokens}
+    norm_stems = {_ing_stem(nt) for nt in norm_tokens}
     for key, rules in _CANONICAL_ALIAS_RULES:
         for pat_norm, pat_tokens, pat_stem in rules:
             if pat_norm == norm:
                 return key
             if len(pat_tokens) > 1:
-                if all(pt in norm for pt in pat_tokens):
+                if all(pt in norm or _ing_stem(pt) in norm_stems for pt in pat_tokens):
                     return key
             elif pat_norm in norm_token_set or pat_stem in norm_stems:
                 # Не даём одиночному «молоко» перехватить растительное/кокосовое молоко,
@@ -338,10 +399,14 @@ def _canonical_key(single_name: str) -> Optional[str]:
 @lru_cache(maxsize=4096)
 def _meaningful_stems(single_name: str) -> Tuple[str, ...]:
     norm = _clean_ing_text(single_name)
-    words = [w for w in re.findall(r"[a-zа-я0-9]+", norm) if w not in _MODIFIER_WORDS]
+    all_words = re.findall(r"[a-zа-я0-9]+", norm)
+    words = [
+        w for w in all_words
+        if w not in _MODIFIER_WORDS and _ing_stem(w) not in _MODIFIER_STEMS
+    ]
     if not words:
-        words = re.findall(r"[a-zа-я0-9]+", norm)
-    return tuple(repo._ru_stem(w) or w for w in words if len(w) >= 2)
+        words = all_words
+    return tuple(_ing_stem(w) or w for w in words if len(w) >= 2)
 
 
 @lru_cache(maxsize=4096)
@@ -391,8 +456,8 @@ def ingredients_match(name_a: str, name_b: str) -> bool:
             set_a, set_b = set(sa), set(sb)
             if set_a == set_b:
                 return True
-            # Если короткое общее название вроде «сыр» или «тофу» целиком входит в более подробное
-            if (len(set_a) == 1 and set_a.issubset(set_b)) or (len(set_b) == 1 and set_b.issubset(set_a)):
+            # Если одна основа полностью входит в более подробное описание (с учётом уже проверенных групп)
+            if set_a.issubset(set_b) or set_b.issubset(set_a):
                 return True
             if a in b or b in a:
                 return True
@@ -405,7 +470,7 @@ def match_recipe_to_pantry(
     *,
     servings: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Сопоставить ингредиенты рецепта с текущим холодильником."""
+    """Сопоставить ингредиенты рецепта с текущим холодильником с учётом количества."""
     base_servings = int(recipe.get("base_servings") or 1) or 1
     eff_servings = max(1, int(servings or base_servings))
     factor = eff_servings / base_servings
@@ -413,6 +478,8 @@ def match_recipe_to_pantry(
     have: List[Dict[str, Any]] = []
     missing: List[Dict[str, Any]] = []
     staples: List[Dict[str, Any]] = []
+    total_non_staple = 0
+    matched_score = 0.0
 
     for ing in recipe.get("ingredients") or []:
         if not isinstance(ing, dict):
@@ -429,11 +496,47 @@ def match_recipe_to_pantry(
             staples.append({"name": ing_name, "qty": needed_qty, "unit": unit})
             continue
 
-        matched_pantry = next(
-            (p for p in pantry_items if ingredients_match(ing_name, str(p.get("name") or ""))),
-            None,
-        )
-        if matched_pantry:
+        total_non_staple += 1
+        matching_rows = [
+            p for p in pantry_items
+            if ingredients_match(ing_name, str(p.get("name") or ""))
+            and float(p.get("amount") or 0) > 1e-6
+        ]
+        matched_pantry = matching_rows[0] if matching_rows else None
+        if not matched_pantry:
+            missing.append({"name": ing_name, "qty": needed_qty, "unit": unit})
+            continue
+
+        p_unit = str(matched_pantry.get("unit") or "")
+        need_base, kind_n = to_base(needed_qty, unit)
+        total_have_base = 0.0
+        compatible_found = False
+        for mp in matching_rows:
+            mp_amt = float(mp.get("amount") or 0)
+            mp_unit = str(mp.get("unit") or "")
+            hb, kh = to_base(mp_amt, mp_unit)
+            if kind_n == kh and kind_n != "other":
+                total_have_base += hb
+                compatible_found = True
+
+        if compatible_found and total_have_base + 1e-6 < need_base:
+            short_qty = round(from_base(need_base - total_have_base, unit or "г"), 2)
+            if total_have_base >= need_base * 0.2:
+                matched_score += 0.5
+                have.append(
+                    {
+                        "name": ing_name,
+                        "qty": round(from_base(total_have_base, unit or "г"), 2),
+                        "unit": unit,
+                        "pantry_id": int(matched_pantry["id"]),
+                        "pantry_name": str(matched_pantry.get("name") or ing_name),
+                        "pantry_amount": float(matched_pantry.get("amount") or 0),
+                        "pantry_unit": p_unit,
+                    }
+                )
+            missing.append({"name": ing_name, "qty": max(0.01, short_qty), "unit": unit})
+        else:
+            matched_score += 1.0
             have.append(
                 {
                     "name": ing_name,
@@ -442,14 +545,11 @@ def match_recipe_to_pantry(
                     "pantry_id": int(matched_pantry["id"]),
                     "pantry_name": str(matched_pantry.get("name") or ing_name),
                     "pantry_amount": float(matched_pantry.get("amount") or 0),
-                    "pantry_unit": str(matched_pantry.get("unit") or ""),
+                    "pantry_unit": p_unit,
                 }
             )
-        else:
-            missing.append({"name": ing_name, "qty": needed_qty, "unit": unit})
 
-    total_non_staple = len(have) + len(missing)
-    coverage = (len(have) / total_non_staple) if total_non_staple > 0 else 1.0
+    coverage = (matched_score / total_non_staple) if total_non_staple > 0 else 1.0
     return {
         "have": have,
         "missing": missing,
@@ -715,7 +815,35 @@ def _merge_missing_items(
             b1, _ = to_base(float(target["qty"]), target["unit"])
             b2, _ = to_base(qty, unit)
             target["qty"] = round(from_base(b1 + b2, target["unit"]), 2)
+        elif k1 == k2 and k1 == "other" and (target["unit"] or "").strip().lower() == (unit or "").strip().lower():
+            target["qty"] = round(float(target["qty"] or 0) + qty, 2)
     return merged
+
+
+def _pantry_covers_item(pantry: List[Dict[str, Any]], name: str, qty: float, unit: str) -> bool:
+    """Проверить, хватает ли продукта в холодильнике на требуемое количество."""
+    matches = [p for p in pantry if ingredients_match(name, str(p.get("name") or "")) and float(p.get("amount") or 0) > 1e-6]
+    if not matches:
+        return False
+    need_base, kind_n = to_base(qty, unit)
+    total_have = 0.0
+    any_compatible = False
+    for p in matches:
+        p_amt = float(p.get("amount") or 0)
+        p_unit = str(p.get("unit") or "шт")
+        hb, kh = to_base(p_amt, p_unit)
+        if kind_n == kh and kind_n != "other":
+            total_have += hb
+            any_compatible = True
+        elif kind_n == "other" and unit.strip().lower() == p_unit.strip().lower():
+            total_have += p_amt
+            any_compatible = True
+    if any_compatible:
+        if kind_n == "other":
+            return total_have + 1e-6 >= float(qty or 1.0)
+        return total_have + 1e-6 >= need_base
+    # Разные несовместимые единицы (например, банка/бутылка в холодильнике vs граммы в рецепте) — считаем покрытым
+    return True
 
 
 async def add_missing_ingredients_to_shopping(
@@ -736,13 +864,13 @@ async def add_missing_ingredients_to_shopping(
     skipped: List[Dict[str, Any]] = []
     for item in _merge_missing_items(missing_items):
         name = item["name"]
-        in_pantry = any(ingredients_match(name, str(p.get("name") or "")) for p in pantry)
+        qty = float(item.get("qty") or 1.0)
+        unit = str(item.get("unit") or "шт")
+        in_pantry = _pantry_covers_item(pantry, name, qty, unit)
         in_shop = any(ingredients_match(name, str(s.get("item_name") or "")) for s in shop_rows)
         if in_pantry or in_shop:
             skipped.append(item)
             continue
-        qty = float(item.get("qty") or 1.0)
-        unit = str(item.get("unit") or "шт")
         new_id = await repo.create_shopping_item(
             db, user_id, name, qty=qty, unit=unit, category="food", scope=scope
         )
@@ -803,10 +931,19 @@ async def commit_cooked_recipe(
             need_in_pantry = from_base(need_base, p_unit)
             new_amt = max(0.0, cur_amt - need_in_pantry)
         elif kind_h == "count":
-            new_amt = max(0.0, cur_amt - 1.0)
+            if kind_n == "count":
+                new_amt = max(0.0, cur_amt - max(1.0, n_qty))
+            else:
+                ck = _canonical_key(str(item.get("name") or ""))
+                nu_low = n_unit.strip().lower()
+                is_condiment = ck in {"oil_veg", "soy_sauce", "sweet_chili", "sweet_sour", "teriyaki", "ketchup"} or any(
+                    tok in nu_low for tok in ("ч.л", "ст.л", "кап", "щеп")
+                ) or (kind_n in {"weight", "volume"} and need_base <= 60.0)
+                step_deduct = 0.15 if is_condiment else (0.5 if (kind_n in {"weight", "volume"} and need_base >= 400.0) else 0.35)
+                new_amt = max(0.0, round(cur_amt - step_deduct, 2))
         else:
-            # Разные единицы (например, в холодильнике 1 пачка/шт, а в рецепте граммы) — осторожно оставляем без краша
-            new_amt = max(0.0, cur_amt - 0.5)
+            # Разные единицы (например, ложки/банка vs граммы) — аккуратно списываем долю
+            new_amt = max(0.0, round(cur_amt - 0.25, 2))
 
         balances[pid] = new_amt
         if new_amt <= 0.01:
@@ -976,6 +1113,8 @@ def _pick_pantry_protein_booster(
                 {
                     "key": key,
                     "label": _short_pantry_label(p_name, fallback_lbl),
+                    "pantry_name": p_name,
+                    "pantry_unit": str(item.get("unit") or "шт"),
                     "kcal": int(kcal),
                     "protein_g": float(p_g),
                     "fat_g": float(f_g),
@@ -987,6 +1126,33 @@ def _pick_pantry_protein_booster(
         return None
     candidates.sort(key=lambda pair: -pair[0])
     return candidates[0][1]
+
+
+def _scaled_slot_ingredients(
+    recipe: Dict[str, Any],
+    portion_mult: float,
+    booster: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Сформировать ингредиенты слота с учётом коэффициента порции и белкового дополнения."""
+    mult = max(0.5, float(portion_mult or 1.0))
+    scaled: List[Dict[str, Any]] = []
+    for ing in recipe.get("ingredients") or []:
+        if not isinstance(ing, dict) or not ing.get("name"):
+            continue
+        item = dict(ing)
+        unit = str(item.get("unit") or "шт")
+        if abs(mult - 1.0) > 1e-6:
+            item["qty"] = scale_qty(float(item.get("qty") or 1.0), mult, unit)
+        scaled.append(item)
+    if booster and booster.get("pantry_name"):
+        scaled.append(
+            {
+                "name": str(booster["pantry_name"]),
+                "qty": 1.0,
+                "unit": "порц.",
+            }
+        )
+    return scaled
 
 
 def _enrich_slot_for_targets(
@@ -1010,6 +1176,7 @@ def _enrich_slot_for_targets(
             "title": base_title,
             "portion_mult": 1.0,
             "booster": None,
+            "ingredients": _scaled_slot_ingredients(recipe, 1.0, None),
             "est_kcal": int(round(bk)),
             "est_protein_g": round(bp, 1),
             "est_fat_g": round(bf, 1),
@@ -1059,6 +1226,7 @@ def _enrich_slot_for_targets(
         "title": f"{base_title}{mult_tag}{boost_tag}",
         "portion_mult": mult,
         "booster": booster,
+        "ingredients": _scaled_slot_ingredients(recipe, mult, booster),
         "est_kcal": int(round(cur_k)),
         "est_protein_g": round(cur_p, 1),
         "est_fat_g": round(cur_f, 1),
@@ -1299,8 +1467,9 @@ async def generate_meal_plan(
     used_ids: Set[str] = set()
     planned_ingredients: Set[str] = set()
     saved_rows: List[Dict[str, Any]] = []
+    virtual_pantry: List[Dict[str, Any]] = [dict(p) for p in pantry]
     coverage_by_id: Dict[str, float] = {
-        str(r.get("id") or ""): float(match_recipe_to_pantry(r, pantry, servings=2)["coverage"])
+        str(r.get("id") or ""): float(match_recipe_to_pantry(r, virtual_pantry, servings=2)["coverage"])
         for r in candidates
     }
     nutrition_by_id: Dict[str, Dict[str, Any]] = {
@@ -1322,7 +1491,7 @@ async def generate_meal_plan(
                 meal_slot=meal_slot,
                 day_idx=d_idx,
                 plan_date=plan_date,
-                pantry=pantry,
+                pantry=virtual_pantry,
                 used_ids=used_ids,
                 exclude_ids=excl_set,
                 recent_ids=recent_ids,
@@ -1348,11 +1517,17 @@ async def generate_meal_plan(
                 picked,
                 meal_slot,
                 base_nutrition=nutrition_by_id.get(rid) or fitness_nutrition.estimate_recipe_nutrition(picked),
-                pantry=pantry,
+                pantry=virtual_pantry,
                 targets=targets if use_kbju else None,
                 meal_profile=profile,
                 used_boosters=day_used_boosters,
             )
+            slot_ings = list(enriched.get("ingredients") or picked.get("ingredients") or [])
+            _consume_virtual_pool(virtual_pantry, slot_ings)
+            coverage_by_id = {
+                str(r.get("id") or ""): float(match_recipe_to_pantry(r, virtual_pantry, servings=2)["coverage"])
+                for r in candidates
+            }
             row = await repo.upsert_meal_plan_slot(
                 db,
                 user_id,
@@ -1361,7 +1536,7 @@ async def generate_meal_plan(
                 title=enriched["title"],
                 recipe_id=rid,
                 time_minutes=int(picked.get("time_minutes") or 20),
-                ingredients=list(picked.get("ingredients") or []),
+                ingredients=slot_ings,
                 status="planned",
             )
             if row:
@@ -1393,6 +1568,85 @@ async def generate_meal_plan(
     }
 
 
+def _consume_virtual_pool(
+    pool: List[Dict[str, Any]],
+    ingredients: List[Dict[str, Any]],
+    *,
+    name_key: str = "name",
+    qty_key: str = "amount",
+) -> None:
+    """Списать ингредиенты из виртуального остатка (для расчёта меню на несколько дней)."""
+    for ing in ingredients:
+        if not isinstance(ing, dict) or not ing.get("name"):
+            continue
+        ing_name = str(ing["name"])
+        if is_staple_ingredient(ing_name):
+            continue
+        need_qty = float(ing.get("qty") or 1.0)
+        need_unit = str(ing.get("unit") or "шт")
+        need_base, kind_n = to_base(need_qty, need_unit)
+        for p in pool:
+            cur_amt = float(p.get(qty_key) or 0)
+            if cur_amt <= 1e-6 or not ingredients_match(ing_name, str(p.get(name_key) or "")):
+                continue
+            p_unit = str(p.get("unit") or "шт")
+            have_base, kind_h = to_base(cur_amt, p_unit)
+            if kind_n == kind_h and kind_n != "other":
+                take_base = min(have_base, need_base)
+                p[qty_key] = max(0.0, round(from_base(have_base - take_base, p_unit), 3))
+                need_base -= take_base
+                if need_base <= 1e-6:
+                    break
+            elif kind_h == "count":
+                ck = _canonical_key(ing_name)
+                step = 0.15 if ck in {"oil_veg", "soy_sauce", "sweet_chili", "sweet_sour", "teriyaki", "ketchup"} else 0.35
+                p[qty_key] = max(0.0, round(cur_amt - step, 2))
+                break
+            else:
+                p[qty_key] = max(0.0, round(cur_amt - 0.25, 2))
+                break
+
+
+def _subtract_from_pool_and_get_shortfall(
+    pool: List[Dict[str, Any]],
+    name: str,
+    needed_qty: float,
+    needed_unit: str,
+    *,
+    name_key: str,
+    qty_key: str,
+) -> float:
+    """Вычесть доступное количество из виртуального пула и вернуть оставшуюся нехватку."""
+    rem = float(needed_qty or 0)
+    if rem <= 1e-6:
+        return 0.0
+    need_base, kind_n = to_base(rem, needed_unit)
+
+    for entry in pool:
+        cur_amt = float(entry.get(qty_key) or 0)
+        if cur_amt <= 1e-6 or not ingredients_match(name, str(entry.get(name_key) or "")):
+            continue
+        e_unit = str(entry.get("unit") or "шт")
+        have_base, kind_h = to_base(cur_amt, e_unit)
+        if kind_n == kind_h and kind_n != "other":
+            take_base = min(have_base, need_base)
+            entry[qty_key] = max(0.0, round(from_base(have_base - take_base, e_unit), 3))
+            need_base -= take_base
+            rem = max(0.0, from_base(need_base, needed_unit))
+            if need_base <= 1e-6:
+                return 0.0
+        elif kind_n == "other" and (needed_unit or "").strip().lower() == e_unit.strip().lower():
+            take = min(cur_amt, rem)
+            entry[qty_key] = max(0.0, round(cur_amt - take, 3))
+            rem = max(0.0, rem - take)
+            if rem <= 1e-6:
+                return 0.0
+        else:
+            # Бутылка/пачка в наличии покрывает ложки/порции этого же продукта
+            return 0.0
+    return rem
+
+
 async def compute_meal_plan_missing_shopping(
     db,
     user: Dict[str, Any],
@@ -1400,9 +1654,9 @@ async def compute_meal_plan_missing_shopping(
 ) -> List[Dict[str, Any]]:
     """Собрать недостающие продукты по плану питания за вычетом холодильника и активных покупок."""
     user_id = int(user["id"])
-    pantry = rows_to_dicts(await repo.list_pantry_items(db, user_id))
-    shop_rows = [
-        r for r in rows_to_dicts(await repo.list_shopping_items(db, user_id, scope="household"))
+    pantry_pool = [dict(p) for p in rows_to_dicts(await repo.list_pantry_items(db, user_id))]
+    shop_pool = [
+        dict(r) for r in rows_to_dicts(await repo.list_shopping_items(db, user_id, scope="household"))
         if not r.get("is_bought")
     ]
 
@@ -1429,11 +1683,19 @@ async def compute_meal_plan_missing_shopping(
     missing: List[Dict[str, Any]] = []
     for item in merged:
         name = item["name"]
-        if any(ingredients_match(name, str(p.get("name") or "")) for p in pantry):
+        rem = float(item["qty"] or 1.0)
+        unit = str(item["unit"] or "шт")
+        rem = _subtract_from_pool_and_get_shortfall(
+            pantry_pool, name, rem, unit, name_key="name", qty_key="amount"
+        )
+        if rem <= 1e-6:
             continue
-        if any(ingredients_match(name, str(s.get("item_name") or "")) for s in shop_rows):
+        rem = _subtract_from_pool_and_get_shortfall(
+            shop_pool, name, rem, unit, name_key="item_name", qty_key="quantity"
+        )
+        if rem <= 1e-6:
             continue
-        missing.append(item)
+        missing.append({"name": name, "qty": scale_qty(rem, 1.0, unit), "unit": unit})
     return missing
 
 
@@ -1685,7 +1947,7 @@ async def bulk_add_pantry_items(
     synced_shopping: List[str] = []
 
     for item in parsed:
-        pid = await repo.create_pantry_item(
+        pid = await repo.upsert_pantry_item_merged(
             db,
             user_id,
             item["name"],
@@ -1920,7 +2182,7 @@ async def import_cart_items(
         norm = _normalize_cart_item(raw)
         if not norm:
             continue
-        pid = await repo.create_pantry_item(
+        pid = await repo.upsert_pantry_item_merged(
             db,
             user_id,
             norm["name"],

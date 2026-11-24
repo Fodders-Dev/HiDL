@@ -839,21 +839,36 @@ async def complete_checkin(
 async def close_open_food_pulse_slot(
     db,
     user: Dict[str, Any],
-    meal_slot: str,
+    meal_slot: str = "",
     *,
     now_utc: Optional[datetime.datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """Закрыть открытый пищевой слот Пульса (breakfast/lunch/dinner), если пользователь записал еду."""
-    slot = str(meal_slot or "").strip().lower()
-    if slot not in {"breakfast", "lunch", "dinner"}:
-        return None
     now = _naive_utc(now_utc)
     tz = user.get("timezone") or "UTC"
     local_date = local_date_str(now, tz)
-    chk = await repo.get_pulse_checkin(db, int(user["id"]), local_date, slot)
-    if not chk or chk.get("status") not in {"pending", "snoozed"}:
-        return None
-    return await complete_checkin(db, user, int(chk["id"]), now_utc=now)
+    user_id = int(user["id"])
+
+    slot = str(meal_slot or "").strip().lower()
+    if slot in {"breakfast", "lunch", "dinner"}:
+        chk = await repo.get_pulse_checkin(db, user_id, local_date, slot)
+        if not chk or chk.get("status") not in {"pending", "snoozed"}:
+            return None
+        return await complete_checkin(db, user, int(chk["id"]), now_utc=now)
+
+    # Автоопределение открытого пищевого слота по текущему времени или активным чек-инам
+    local_hhmm = format_time_local(now, tz)
+    local_min = _hhmm_to_min(local_hhmm)
+    preferred = (
+        ["breakfast", "lunch", "dinner"]
+        if local_min < 11 * 60
+        else (["lunch", "breakfast", "dinner"] if local_min < 16 * 60 else ["dinner", "lunch", "breakfast"])
+    )
+    for cand in preferred:
+        chk = await repo.get_pulse_checkin(db, user_id, local_date, cand)
+        if chk and chk.get("status") in {"pending", "snoozed"}:
+            return await complete_checkin(db, user, int(chk["id"]), now_utc=now)
+    return None
 
 
 async def confirm_bedtime(

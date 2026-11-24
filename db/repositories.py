@@ -799,6 +799,111 @@ async def create_pantry_item(
     return cursor.lastrowid
 
 
+def _pantry_unit_base(amount: float, unit: str) -> Tuple[float, str, str]:
+    """Преобразовать вес/объём в базовые граммы/мл; вернуть (value, kind, canonical_unit)."""
+    u = (unit or "шт").strip().lower().rstrip(".")
+    val = float(amount or 0)
+    if u in {"кг", "kg"}:
+        return val * 1000.0, "weight", "kg"
+    if u in {"г", "гр", "g"}:
+        return val, "weight", "g"
+    if u in {"л", "l"}:
+        return val * 1000.0, "volume", "l"
+    if u in {"мл", "ml"}:
+        return val, "volume", "ml"
+    if u in {"шт", "piece", "pieces"}:
+        return val, "count", "шт"
+    return val, "other", u or "шт"
+
+
+def _pantry_from_base(amount_base: float, target_unit: str) -> float:
+    u = (target_unit or "").strip().lower().rstrip(".")
+    if u in {"кг", "kg", "л", "l"}:
+        return round(amount_base / 1000.0, 2)
+    return round(amount_base, 2)
+
+
+async def upsert_pantry_item_merged(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    name: str,
+    amount: float,
+    unit: str,
+    expires_at: Optional[str] = None,
+    category: str = "прочее",
+    low_threshold: Optional[float] = None,
+) -> int:
+    """Добавить или объединить продукт в холодильнике без дублей (с конвертацией g↔kg, ml↔l)."""
+    clean_name = re.sub(r"\s+", " ", (name or "").strip())
+    if not clean_name:
+        return 0
+    norm_key = clean_name.casefold().replace("ё", "е")
+    add_amt = float(amount or 0)
+    _, add_kind, canon_u = _pantry_unit_base(add_amt, unit or "шт")
+    store_unit = canon_u if add_kind != "other" else (unit or "шт").strip() or "шт"
+    store_cat = (category or "").strip() or "прочее"
+    if store_cat.lower() in {"misc", "food"}:
+        store_cat = "прочее"
+
+    household_id = await get_or_create_household(conn, user_id)
+    cursor = await conn.execute(
+        """
+        SELECT * FROM pantry_items
+        WHERE household_id = ? AND (is_active IS NULL OR is_active = 1)
+        ORDER BY id ASC
+        """,
+        (household_id,),
+    )
+    existing_rows = await cursor.fetchall()
+    match_row = next(
+        (
+            r for r in existing_rows
+            if re.sub(r"\s+", " ", str(r["name"] or "").strip()).casefold().replace("ё", "е") == norm_key
+        ),
+        None,
+    )
+    now = utc_now_str()
+    if match_row:
+        cur_amt = float(match_row["amount"] or 0)
+        cur_unit = str(match_row["unit"] or "шт")
+        cur_base, cur_kind, _ = _pantry_unit_base(cur_amt, cur_unit)
+        add_base, _, _ = _pantry_unit_base(add_amt, store_unit)
+        if cur_kind == add_kind and cur_kind != "other":
+            new_amt = _pantry_from_base(cur_base + add_base, cur_unit)
+            new_unit = cur_unit
+        elif cur_unit.strip().lower() == store_unit.strip().lower():
+            new_amt = round(cur_amt + add_amt, 2)
+            new_unit = cur_unit
+        else:
+            new_amt = round(cur_amt + add_amt, 2)
+            new_unit = cur_unit
+
+        next_exp = expires_at or match_row["expires_at"]
+        cur_cat = str(match_row["category"] or "прочее")
+        next_cat = store_cat if (cur_cat in {"", "прочее", "misc"} and store_cat not in {"", "прочее"}) else cur_cat
+        await conn.execute(
+            """
+            UPDATE pantry_items
+            SET amount = ?, unit = ?, expires_at = ?, category = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_amt, new_unit, next_exp, next_cat, now, int(match_row["id"])),
+        )
+        await conn.commit()
+        return int(match_row["id"])
+
+    return await create_pantry_item(
+        conn,
+        user_id,
+        clean_name,
+        add_amt,
+        store_unit,
+        expires_at,
+        store_cat,
+        low_threshold=low_threshold,
+    )
+
+
 async def list_pantry_items(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
     """Получить все продукты пользователя, отсортированные по категории и названию."""
     household_id = await get_or_create_household(conn, user_id)
@@ -3375,6 +3480,16 @@ async def reset_month_points(conn: aiosqlite.Connection, current_month: str) -> 
 
 
 # Shopping List Logic
+def _shopping_scope_clause(scope: str, household_id: Optional[int], user_id: int) -> Tuple[str, Tuple[Any, ...]]:
+    """Изолированный SQL-фильтр для личного и общего списка покупок."""
+    if scope == "personal":
+        return "scope = 'personal' AND user_id = ?", (user_id,)
+    return (
+        "(scope IS NULL OR scope = '' OR scope = 'household') AND (household_id = ? OR (household_id IS NULL AND user_id = ?))",
+        (household_id, user_id),
+    )
+
+
 async def create_shopping_item(
     conn: aiosqlite.Connection,
     user_id: int,
@@ -3401,23 +3516,26 @@ async def create_shopping_item(
             await conn.commit()
         except Exception:
             pass
+    scope_sql, scope_params = _shopping_scope_clause(scope, household_id, user_id)
     cursor = await conn.execute(
-        """
-        SELECT id, quantity FROM shopping_list
-        WHERE item_name = ? AND is_bought = 0
-          AND (
-            ((scope IS NULL OR scope = '' OR scope = 'household') AND (household_id = ? OR (household_id IS NULL AND user_id = ?)))
-            OR (scope = 'personal' AND user_id = ?)
-          )
+        f"""
+        SELECT id, quantity, unit FROM shopping_list
+        WHERE LOWER(item_name) = LOWER(?) AND is_bought = 0 AND {scope_sql}
         """,
-        (name, household_id, user_id, user_id),
+        (name.strip(), *scope_params),
     )
     row = await cursor.fetchone()
     now = utc_now_str()
     if row:
+        cur_base, cur_kind, _ = _pantry_unit_base(float(row["quantity"] or 0), str(row["unit"] or "шт"))
+        add_base, add_kind, _ = _pantry_unit_base(float(qty or 0), str(unit or "шт"))
+        if cur_kind == add_kind and cur_kind != "other":
+            new_qty = _pantry_from_base(cur_base + add_base, str(row["unit"] or unit or "шт"))
+        else:
+            new_qty = round(float(row["quantity"] or 0) + float(qty or 0), 2)
         await conn.execute(
-            "UPDATE shopping_list SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-            (qty, now, row["id"])
+            "UPDATE shopping_list SET quantity = ?, updated_at = ? WHERE id = ?",
+            (new_qty, now, row["id"])
         )
         await conn.commit()
         return row["id"]
@@ -3428,7 +3546,7 @@ async def create_shopping_item(
             (user_id, household_id, scope, item_name, quantity, unit, category, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, household_id, scope, name, qty, unit, category, now, now),
+            (user_id, household_id, scope, name.strip(), qty, unit, category, now, now),
         )
         await conn.commit()
         return cursor.lastrowid
@@ -3451,14 +3569,14 @@ async def list_shopping_items(conn: aiosqlite.Connection, user_id: int, scope: s
             await conn.commit()
         except Exception:
             pass
+    scope_sql, scope_params = _shopping_scope_clause(scope, household_id, user_id)
     cursor = await conn.execute(
-        """
+        f"""
         SELECT * FROM shopping_list
-        WHERE ((scope IS NULL OR scope = '' OR scope = 'household') AND (household_id = ? OR (household_id IS NULL AND user_id = ?)))
-           OR (scope = 'personal' AND user_id = ?)
+        WHERE {scope_sql}
         ORDER BY is_bought, category, item_name
         """,
-        (household_id, user_id, user_id),
+        scope_params,
     )
     return await cursor.fetchall()
 
@@ -3470,17 +3588,14 @@ async def mark_shopping_bought(
     if scope == "household":
         household_id = await get_or_create_household(conn, user_id)
     now = utc_now_str()
+    scope_sql, scope_params = _shopping_scope_clause(scope, household_id, user_id)
     await conn.execute(
-        """
+        f"""
         UPDATE shopping_list
         SET is_bought = ?, updated_at = ?
-        WHERE id = ?
-          AND (
-            ((scope IS NULL OR scope = '' OR scope = 'household') AND (household_id = ? OR (household_id IS NULL AND user_id = ?)))
-            OR (scope = 'personal' AND user_id = ?)
-          )
+        WHERE id = ? AND {scope_sql}
         """,
-        (1 if bought else 0, now, item_id, household_id, user_id, user_id),
+        (1 if bought else 0, now, item_id, *scope_params),
     )
     await conn.commit()
 
@@ -3489,16 +3604,13 @@ async def delete_shopping_item(conn: aiosqlite.Connection, user_id: int, item_id
     household_id = None
     if scope == "household":
         household_id = await get_or_create_household(conn, user_id)
+    scope_sql, scope_params = _shopping_scope_clause(scope, household_id, user_id)
     await conn.execute(
-        """
+        f"""
         DELETE FROM shopping_list
-        WHERE id = ?
-          AND (
-            ((scope IS NULL OR scope = '' OR scope = 'household') AND (household_id = ? OR (household_id IS NULL AND user_id = ?)))
-            OR (scope = 'personal' AND user_id = ?)
-          )
+        WHERE id = ? AND {scope_sql}
         """,
-        (item_id, household_id, user_id, user_id),
+        (item_id, *scope_params),
     )
     await conn.commit()
 
@@ -3548,81 +3660,63 @@ async def update_shopping_item_name(
     if scope == "household":
         household_id = await get_or_create_household(conn, user_id)
     now = utc_now_str()
+    scope_sql, scope_params = _shopping_scope_clause(scope, household_id, user_id)
     await conn.execute(
-        """
+        f"""
         UPDATE shopping_list
         SET item_name = ?, updated_at = ?
-        WHERE id = ?
-          AND (
-            ((scope IS NULL OR scope = '' OR scope = 'household') AND (household_id = ? OR (household_id IS NULL AND user_id = ?)))
-            OR (scope = 'personal' AND user_id = ?)
-          )
+        WHERE id = ? AND {scope_sql}
         """,
-        (name.strip(), now, item_id, household_id, user_id, user_id),
+        (name.strip(), now, item_id, *scope_params),
     )
     await conn.commit()
 
 async def complete_shopping_trip(conn: aiosqlite.Connection, user_id: int, scope: str = "household") -> int:
-    """Move bought items from shopping list to pantry."""
+    """Move bought items from shopping list to pantry (and restock household supplies)."""
     scope = scope if scope in {"household", "personal"} else "household"
     now = utc_now_str()
     household_id = await get_or_create_household(conn, user_id)
-    # 1. Select bought items
-    if scope == "personal":
-        cursor = await conn.execute(
-            "SELECT * FROM shopping_list WHERE user_id = ? AND scope = 'personal' AND is_bought = 1",
-            (user_id,),
-        )
-    else:
-        cursor = await conn.execute(
-            """
-            SELECT * FROM shopping_list
-            WHERE (scope IS NULL OR scope = '' OR scope = 'household')
-              AND is_bought = 1
-              AND (household_id = ? OR (household_id IS NULL AND user_id = ?))
-            """,
-            (household_id, user_id),
-        )
+    scope_sql, scope_params = _shopping_scope_clause(scope, household_id, user_id)
+    cursor = await conn.execute(
+        f"SELECT * FROM shopping_list WHERE is_bought = 1 AND {scope_sql}",
+        scope_params,
+    )
     rows = await cursor.fetchall()
+    supply_cats = {"бытовое", "химия", "supplies", "household_supply"}
     count = 0
     for row in rows:
-        pantry_cursor = await conn.execute(
-            "SELECT id FROM pantry_items WHERE household_id = ? AND name = ? AND (is_active IS NULL OR is_active = 1)",
-            (household_id, row["item_name"]),
+        cat_norm = str(row["category"] or "").strip().casefold()
+        item_name = str(row["item_name"] or "").strip()
+        if cat_norm in supply_cats:
+            sup_cur = await conn.execute(
+                """
+                SELECT id FROM supplies
+                WHERE (household_id = ? OR user_id = ?) AND LOWER(name) = LOWER(?)
+                LIMIT 1
+                """,
+                (household_id, user_id, item_name),
+            )
+            sup_row = await sup_cur.fetchone()
+            if sup_row:
+                await update_supply_status(conn, user_id, int(sup_row["id"]), "full")
+            count += 1
+            continue
+
+        await upsert_pantry_item_merged(
+            conn,
+            user_id,
+            item_name,
+            float(row["quantity"] or 1.0),
+            str(row["unit"] or "шт"),
+            None,
+            str(row["category"] or "прочее"),
         )
-        pantry_row = await pantry_cursor.fetchone()
-        if pantry_row:
-             await conn.execute(
-                 "UPDATE pantry_items SET amount = amount + ?, updated_at = ? WHERE id = ?",
-                 (row["quantity"], now, pantry_row["id"])
-             )
-        else:
-             await conn.execute(
-                 """
-                 INSERT INTO pantry_items
-                 (user_id, household_id, name, amount, unit, category, is_active, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
-                 """,
-                 (user_id, household_id, row["item_name"], row["quantity"], row["unit"], row["category"], now, now),
-             )
         count += 1
-    
-    # 3. Delete from shopping list (only bought ones)
-    if scope == "personal":
-        await conn.execute(
-            "DELETE FROM shopping_list WHERE user_id = ? AND scope = 'personal' AND is_bought = 1",
-            (user_id,),
-        )
-    else:
-        await conn.execute(
-            """
-            DELETE FROM shopping_list
-            WHERE (scope IS NULL OR scope = '' OR scope = 'household')
-              AND is_bought = 1
-              AND (household_id = ? OR (household_id IS NULL AND user_id = ?))
-            """,
-            (household_id, user_id),
-        )
+
+    await conn.execute(
+        f"DELETE FROM shopping_list WHERE is_bought = 1 AND {scope_sql}",
+        scope_params,
+    )
     await conn.commit()
     return count
 

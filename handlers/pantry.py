@@ -34,7 +34,10 @@ async def pantry_command(message: types.Message, db) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить продукт", callback_data="kitchen:fridge_add")],
-            [InlineKeyboardButton(text="🗑 Удалить что-то", callback_data="kitchen:fridge_del_view")],
+            [
+                InlineKeyboardButton(text="⏰ Скоро истекает", callback_data="pantry:expiring"),
+                InlineKeyboardButton(text="🗑 Удалить что-то", callback_data="kitchen:fridge_del_view"),
+            ],
             [InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")],
         ]
     )

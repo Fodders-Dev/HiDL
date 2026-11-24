@@ -409,12 +409,29 @@ async def kbju_log_recipe_cb(callback: types.CallbackQuery, db) -> None:
     fat_g = round(float(per_serving["fat_g"]) * servings, 1)
     carbs_g = round(float(per_serving["carbs_g"]) * servings, 1)
 
+    # Защита от двойного нажатия в течение 15 секунд
+    recent_logs = await repo.list_meal_logs(db, int(user["id"]), local_date)
+    rid_str = str(recipe.get("id") or "")
+    for prev in recent_logs[:3]:
+        if (
+            str(prev.get("recipe_id") or "") == rid_str
+            and abs(float(prev.get("servings") or 0) - float(servings)) < 1e-6
+            and str(prev.get("created_at") or "")
+        ):
+            try:
+                created_dt = datetime.datetime.fromisoformat(str(prev["created_at"]).replace("Z", ""))
+                if abs((now_utc - created_dt).total_seconds()) <= 15:
+                    await callback.answer("Уже записала это блюдо 👌")
+                    return
+            except Exception:
+                pass
+
     await repo.add_meal_log(
         db,
         int(user["id"]),
         local_date,
         str(recipe.get("title") or "Блюдо"),
-        recipe_id=str(recipe.get("id") or ""),
+        recipe_id=rid_str,
         servings=servings,
         kcal=kcal,
         protein_g=protein_g,
@@ -422,6 +439,12 @@ async def kbju_log_recipe_cb(callback: types.CallbackQuery, db) -> None:
         carbs_g=carbs_g,
         source="recipe",
     )
+    pulse_res = await pulse_service.close_open_food_pulse_slot(db, user, "", now_utc=now_utc)
+    pulse_line = ""
+    if pulse_res and pulse_res.get("slot"):
+        slot_ru = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}.get(str(pulse_res["slot"]), "Еда")
+        pulse_line = f"\n💓 Чек-ин Пульса «{slot_ru}» закрыт автоматически."
+
     advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
     rem = advice["remaining"]
     kb = InlineKeyboardMarkup(
@@ -434,7 +457,8 @@ async def kbju_log_recipe_cb(callback: types.CallbackQuery, db) -> None:
     )
     await callback.message.answer(
         f"✅ Записала <b>{_h(recipe.get('title'))}</b> ({servings:g} порц.): "
-        f"<b>{kcal} ккал</b> (Б {protein_g:g}г / Ж {fat_g:g}г / У {carbs_g:g}г).\n"
+        f"<b>{kcal} ккал</b> (Б {protein_g:g}г / Ж {fat_g:g}г / У {carbs_g:g}г)."
+        f"{pulse_line}\n"
         f"Остаток на сегодня: <b>{rem['kcal']} ккал</b> · Белок +{rem['protein_g']} г.",
         reply_markup=kb,
         parse_mode="HTML",
