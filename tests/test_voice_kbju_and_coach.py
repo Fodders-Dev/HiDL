@@ -13,7 +13,7 @@ from config import MCPSettings
 from db import repositories as repo
 from db.database import connect, init_db
 from handlers import inbox, movement, natural, nutrition
-from llm_client import LLMResult
+from llm_client import LLMClient, LLMResult, LLMRoute
 from mcp_server.tools import _tool_get_fitness_nutrition
 from scheduler.reminder import ReminderScheduler
 from services import context_builder, fitness_nutrition, inbox_parser, inbox_service, nutrition_web
@@ -456,6 +456,93 @@ class VoiceKbjuAndCoachTests(unittest.IsolatedAsyncioTestCase):
         mcp_out = await _tool_get_fitness_nutrition(self.db, u_fresh, cfg, {})
         self.assertEqual(mcp_out["body_profile"]["coach_mode"], "balanced")
         self.assertEqual(mcp_out["remembered_products_count"], 1)
+
+    async def test_7_search_web_json_low_reasoning_and_multipart_extraction(self) -> None:
+        client = LLMClient(
+            route=LLMRoute(
+                provider="openai",
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+                model="gpt-6-luna",
+            )
+        )
+        recorded_bodies: list[dict] = []
+        queued_responses: list[tuple[int, dict]] = []
+
+        class _FakeResp:
+            def __init__(self, status: int, payload: dict) -> None:
+                self.status = status
+                self._payload = payload
+
+            async def json(self, content_type=None):
+                return self._payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def post(self, url: str, **kwargs):
+                recorded_bodies.append(json.loads(json.dumps(kwargs["json"])))
+                status, payload = queued_responses.pop(0)
+                return _FakeResp(status, payload)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        multipart_payload = {
+            "output_text": None,
+            "output": [
+                {"type": "web_search_call"},
+                {"type": "reasoning"},
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": '{"found": true, "title": "Блин ', "annotations": []},
+                        {
+                            "type": "output_text",
+                            "text": 'Теремок", "kcal_serving": 410}',
+                            "annotations": [{"type": "url_citation", "url": "https://teremok.ru/menu"}],
+                        },
+                    ],
+                },
+            ],
+        }
+        queued_responses.append((200, multipart_payload))
+
+        with patch("llm_client.aiohttp.ClientSession", _FakeSession):
+            res1 = await client.search_web_json("sys", "user", max_tokens=500)
+
+        self.assertTrue(res1.ok)
+        self.assertEqual(recorded_bodies[0]["reasoning"], {"effort": "low"})
+        self.assertGreaterEqual(recorded_bodies[0]["max_output_tokens"], 1200)
+        self.assertEqual(res1.data["title"], "Блин Теремок")
+        self.assertEqual(res1.data["kcal_serving"], 410)
+        self.assertEqual(res1.data["_citations"], ["https://teremok.ru/menu"])
+
+        # Non-reasoning model returning 400 about reasoning triggers 1 fallback retry without "reasoning"
+        recorded_bodies.clear()
+        queued_responses.extend(
+            [
+                (400, {"error": {"message": "Unsupported parameter: 'reasoning' is not supported"}}),
+                (200, multipart_payload),
+            ]
+        )
+        with patch("llm_client.aiohttp.ClientSession", _FakeSession):
+            res2 = await client.search_web_json("sys", "user")
+
+        self.assertTrue(res2.ok)
+        self.assertEqual(len(recorded_bodies), 2)
+        self.assertIn("reasoning", recorded_bodies[0])
+        self.assertNotIn("reasoning", recorded_bodies[1])
 
 
 if __name__ == "__main__":

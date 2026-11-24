@@ -418,7 +418,8 @@ async def search_web_nutrition(
     res = await client.search_web_json(
         _WEB_NUTRITION_SYSTEM,
         f"Найди реальное КБЖУ и стандартный вес порции для: {query.strip()}",
-        max_tokens=500,
+        max_tokens=1400,
+        timeout_sec=25.0,
     )
     if not res.ok or not isinstance(res.data, dict):
         return None

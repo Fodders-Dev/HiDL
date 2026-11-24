@@ -489,30 +489,43 @@ class LLMClient:
         body: dict[str, Any] = {
             "model": openai_route.model,
             "tools": [{"type": "web_search"}],
+            "reasoning": {"effort": "low"},
             "instructions": system_prompt,
             "input": user_prompt,
-            "max_output_tokens": max(250, int(max_tokens or default_tokens or 600)),
+            "max_output_tokens": max(1200, int(max_tokens or default_tokens or 1400)),
             "store": False,
         }
-        timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_sec or max(14.0, default_timeout))))
+        timeout = aiohttp.ClientTimeout(total=max(5.0, float(timeout_sec or max(22.0, default_timeout))))
         request_options: dict[str, Any] = (
             {"proxy": openai_route.proxy_url} if openai_route.proxy_url else {}
         )
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=body, **request_options) as resp:
-                    status = resp.status
-                    try:
-                        payload = await resp.json(content_type=None)
-                    except Exception:
-                        payload = None
-                    if status != 200 or not isinstance(payload, dict):
-                        return LLMResult(
-                            ok=False,
-                            provider=openai_route.provider,
-                            model=openai_route.model,
-                            error=f"http_{status}",
-                        )
+                status = 0
+                payload: Any = None
+                for attempt in range(2):
+                    async with session.post(url, headers=headers, json=body, **request_options) as resp:
+                        status = resp.status
+                        try:
+                            payload = await resp.json(content_type=None)
+                        except Exception:
+                            payload = None
+                    if (
+                        attempt == 0
+                        and status == 400
+                        and "reasoning" in body
+                        and "reasoning" in str(payload or "").lower()
+                    ):
+                        body.pop("reasoning", None)
+                        continue
+                    break
+                if status != 200 or not isinstance(payload, dict):
+                    return LLMResult(
+                        ok=False,
+                        provider=openai_route.provider,
+                        model=openai_route.model,
+                        error=f"http_{status}",
+                    )
         except asyncio.TimeoutError:
             return LLMResult(
                 ok=False,
@@ -529,6 +542,8 @@ class LLMClient:
             )
 
         out_txt = str(payload.get("output_text") or "").strip()
+        need_text = not out_txt
+        text_parts: list[str] = []
         citations: list[str] = []
         for item in payload.get("output") or []:
             if not isinstance(item, dict):
@@ -536,14 +551,15 @@ class LLMClient:
             for part in item.get("content") or []:
                 if not isinstance(part, dict):
                     continue
-                if not out_txt and part.get("text"):
-                    out_txt += str(part.get("text") or "")
+                if need_text and part.get("text"):
+                    text_parts.append(str(part.get("text") or ""))
                 for ann in part.get("annotations") or []:
                     if isinstance(ann, dict) and ann.get("type") == "url_citation":
                         u = str(ann.get("url") or "").strip()
                         if u and u not in citations and len(citations) < 3:
                             citations.append(u)
-        out_txt = out_txt.strip()
+        if need_text:
+            out_txt = "".join(text_parts).strip()
         parsed = extract_json_object(out_txt)
         if parsed is None:
             return LLMResult(
