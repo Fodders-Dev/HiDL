@@ -1,6 +1,10 @@
 import datetime
+import re
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+
+_UTC_OFFSET_RE = re.compile(r"^UTC\s*([+-])\s*(\d{1,2})(?::(\d{2}))?$", re.IGNORECASE)
 
 
 def parse_hhmm(value: str) -> Optional[datetime.time]:
@@ -11,35 +15,44 @@ def parse_hhmm(value: str) -> Optional[datetime.time]:
         return None
 
 
+def _parse_utc_offset_delta(tz: str) -> Optional[datetime.timedelta]:
+    raw = (tz or "").strip()
+    if raw.upper() == "UTC":
+        return datetime.timedelta(0)
+    m = _UTC_OFFSET_RE.match(raw)
+    if not m:
+        return None
+    sign = 1 if m.group(1) == "+" else -1
+    hours = int(m.group(2))
+    minutes = int(m.group(3) or 0)
+    if hours > 14 or minutes >= 60 or (hours == 14 and minutes > 0):
+        return None
+    return datetime.timedelta(hours=sign * hours, minutes=sign * minutes)
+
+
 def tzinfo_from_string(tz: str) -> datetime.tzinfo:
-    """Return tzinfo from IANA name or UTC offset like UTC+3."""
-    if tz.upper() == "UTC":
+    """Return tzinfo from IANA name or UTC offset like UTC+3 or UTC+3:30."""
+    raw = (tz or "").strip()
+    if not raw:
         return datetime.timezone.utc
-    if tz.upper().startswith("UTC"):
-        sign = 1 if "+" in tz else -1
-        try:
-            hours = int(tz.split("+")[-1]) if "+" in tz else int(tz.split("-")[-1])
-            return datetime.timezone(datetime.timedelta(hours=sign * hours))
-        except Exception:
-            return datetime.timezone.utc
+    delta = _parse_utc_offset_delta(raw)
+    if delta is not None:
+        return datetime.timezone.utc if delta == datetime.timedelta(0) else datetime.timezone(delta)
     try:
-        return ZoneInfo(tz)
+        return ZoneInfo(raw)
     except Exception:
         return datetime.timezone.utc
 
 
 def is_valid_timezone(tz: str) -> bool:
     """Validate timezone string."""
-    if tz.upper() == "UTC":
-        return True
-    if tz.upper().startswith("UTC"):
-        try:
-            int(tz.split("+")[-1]) if "+" in tz else int(tz.split("-")[-1])
-            return True
-        except Exception:
-            return False
+    raw = (tz or "").strip()
+    if not raw:
+        return False
+    if raw.upper().startswith("UTC"):
+        return _parse_utc_offset_delta(raw) is not None
     try:
-        ZoneInfo(tz)
+        ZoneInfo(raw)
         return True
     except Exception:
         return False

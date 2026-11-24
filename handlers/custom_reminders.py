@@ -1343,6 +1343,16 @@ async def custom_action(callback: types.CallbackQuery, db) -> None:
 
     status_map = {"done": "done", "skip": "skip", "later": "later"}
     status = status_map.get(action, "pending")
+    prev_statuses = await repo.custom_statuses_for_date(db, user["id"], local_date)
+    prev_status = prev_statuses.get(reminder_id)
+    if action == "done" and prev_status == "done":
+        await callback.answer("Уже отмечено ✔")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
     await repo.log_custom_task(
         db,
         reminder_id=reminder_id,
@@ -1354,14 +1364,28 @@ async def custom_action(callback: types.CallbackQuery, db) -> None:
         await repo.add_points(db, user["id"], 3, local_date=local_date)
 
     if action == "done":
-        await callback.answer("Отмечено ✔")
+        await callback.answer("Отмечено ✔ (+3 очка)")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
     elif action == "skip":
         await callback.answer("Пропущено.")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
     elif action == "later":
-        await callback.answer("Напомню через 30 минут.")
-        asyncio.create_task(
-            _remind_later(callback.message.bot, db, user, reminder_id, local_date, target["title"])
+        from services import pulse_service
+
+        snooze = await pulse_service.schedule_adhoc_snooze(
+            db, dict(user), f"custom_{reminder_id}", "custom", 30, str(target.get("title") or "Напоминание")
         )
+        await callback.answer(f"Напомню в {snooze['next_local_hhmm']} (+30 мин)")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
     else:
         await callback.answer("Обновлено")
 

@@ -199,6 +199,25 @@ async def _start_session(event, state: FSMContext, db, minutes: int) -> None:
         return
     user = await ensure_user(db, event.from_user.id, event.from_user.full_name)
     now_utc = datetime.datetime.utcnow()
+    cooldown_text = _cooldown_text(user, now_utc)
+    if cooldown_text:
+        await state.clear()
+        if isinstance(event, types.CallbackQuery):
+            await event.message.answer(cooldown_text)
+            await event.answer()
+        else:
+            await event.answer(cooldown_text)
+        return
+    active = await repo.get_active_focus_session(db, user["id"])
+    if active:
+        await state.clear()
+        msg_active = f"У тебя уже идёт фокус-сессия «{active['task_title']}». Заверши её перед новым стартом."
+        if isinstance(event, types.CallbackQuery):
+            await event.message.answer(msg_active)
+            await event.answer()
+        else:
+            await event.answer(msg_active)
+        return
     start_ts = now_utc
     checkin_ts = now_utc + datetime.timedelta(minutes=max(5, minutes // 2))
     end_ts = now_utc + datetime.timedelta(minutes=minutes)

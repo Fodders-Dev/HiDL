@@ -114,7 +114,8 @@ async def routine_item_toggle(callback: types.CallbackQuery, db) -> None:
     else:
         done.add(idx)
         added = True
-        await repo.add_points(db, user["id"], 1, local_date=local_date)
+        if prev_status != "done":
+            await repo.add_points(db, user["id"], 1, local_date=local_date)
     await repo.update_task_note(db, user["id"], routine_id, local_date, ",".join(str(i) for i in sorted(done)))
     items_rows = await repo.list_routine_steps_for_routine(db, user["id"], routine_id, include_inactive=True)
     items = [dict(i) for i in items_rows]
@@ -164,8 +165,9 @@ async def routine_finish(callback: types.CallbackQuery, db) -> None:
         )
     ]
     visible = _visible_steps(items, done)
-    # начислить очки за отмеченные видимые пункты
-    points = len([idx for idx, _ in visible if idx in done])
+    prev_status = task["status"] if task else "pending"
+    # Баллы за отмеченные пункты уже начислены при каждом клике — здесь даём только 1 бонусный балл за финиш
+    points = 1 if prev_status != "done" else 0
     if points > 0:
         await repo.add_points(db, user["id"], points, local_date=local_date)
     await repo.upsert_user_task(db, user["id"], routine_id, local_date, status="done")

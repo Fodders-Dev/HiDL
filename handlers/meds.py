@@ -81,7 +81,9 @@ async def meds_menu(message: types.Message, db) -> None:
     await _render_meds_menu(message, db, user)
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("med:"))
+@router.callback_query(
+    lambda c: c.data and c.data.startswith("med:") and c.data.split(":")[1] in {"add", "toggle", "menu", "back"}
+)
 async def meds_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     parts = callback.data.split(":")
     action = parts[1] if len(parts) > 1 else ""
@@ -289,7 +291,9 @@ async def _med_later(bot, db, log_id: int) -> None:
     await bot.send_message(chat_id=user["telegram_id"], text=text, reply_markup=kb)
 
 
-@router.callback_query(lambda c: c.data and (c.data.startswith("medtake:") or c.data.startswith("medskip:")))
+@router.callback_query(
+    lambda c: c.data and (c.data.startswith("medtake:") or c.data.startswith("medskip:") or c.data.startswith("medlater:"))
+)
 async def med_take_or_skip(callback: types.CallbackQuery, db) -> None:
     log_id = int(callback.data.split(":")[1])
     log = await repo.get_med_log(db, log_id)
@@ -300,6 +304,14 @@ async def med_take_or_skip(callback: types.CallbackQuery, db) -> None:
         await repo.set_med_taken(db, log_id, None)
         await callback.answer("Отметила приём.")
         logger.info("med.taken", extra={"log_id": log_id, "med_id": log["med_id"], "user_id": log["user_id"]})
+    elif callback.data.startswith("medlater:"):
+        from services import pulse_service
+
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        med = await repo.get_med(db, log["med_id"])
+        med_name = str((dict(med) if med else {}).get("name") or "Принять препарат")
+        snooze = await pulse_service.schedule_adhoc_snooze(db, dict(user), f"med_{log_id}", "meds", 30, med_name)
+        await callback.answer(f"Напомню в {snooze['next_local_hhmm']} (+30 мин)")
     else:
         await callback.answer("Ок, пропускаем.")
     try:
@@ -351,6 +363,7 @@ async def med_retime_start(callback: types.CallbackQuery, state: FSMContext, db)
     if not med:
         await callback.answer("Не нашла запись.", show_alert=True)
         return
+    med = dict(med)
     await state.update_data(retime_med_id=med_id)
     await state.set_state(MedState.retime)
     await callback.message.answer(
@@ -384,6 +397,7 @@ async def med_retime_finish(message: types.Message, state: FSMContext, db) -> No
         await state.clear()
         await message.answer("Не нашла запись. Попробуй ещё раз через /meds.")
         return
+    med = dict(med)
     schedule_type = med.get("schedule_type") or "custom_times"
     # лёгкая нормализация по количеству времён
     if len(times) == 1:

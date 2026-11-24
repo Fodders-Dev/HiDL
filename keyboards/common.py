@@ -86,6 +86,7 @@ def money_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
             [InlineKeyboardButton(text="🏠 Общие траты дома", callback_data="money:household")],
             [InlineKeyboardButton(text="📊 Отчёт за неделю", callback_data="money:report")],
+            [InlineKeyboardButton(text="🗑 Последние траты", callback_data="money:history")],
             [InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
             [InlineKeyboardButton(text="⏳ До зарплаты", callback_data="money:payday")],
             [InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],

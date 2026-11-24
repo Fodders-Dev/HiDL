@@ -38,3 +38,9 @@ def get_page(chat_id: int, key: str, index: int) -> str:
             _PAGES.pop((chat_id, key), None)
         return chunks[index]
     return ""
+
+
+def has_page(chat_id: int, key: str, index: int) -> bool:
+    """Проверить без побочных эффектов, существует ли страница с указанным индексом."""
+    chunks = _PAGES.get((chat_id, key), [])
+    return 0 <= index < len(chunks)

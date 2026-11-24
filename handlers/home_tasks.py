@@ -12,7 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
-from keyboards.common import main_menu_keyboard
+from keyboards.common import home_menu_keyboard, main_menu_keyboard
 from services import household_service
 from utils.sender import safe_edit, safe_edit_markup
 from utils.rows import row_to_dict, rows_to_dicts
@@ -465,6 +465,10 @@ async def _generate_flow(zones: List[str], mode: str) -> List[dict]:
         add("Спальня: заправь кровать аккуратно", 1, "zone")
         add("Спальня: протри пыль с тумбочек", 2, "zone")
 
+    if "living" in zones:
+        add("Гостиная: разбери вещи на столе и диване", 2, "zone")
+        add("Гостиная: протри пыль с поверхностей", 2, "zone")
+
     if "hallway" in zones:
         add("Прихожая: расставь обувь ровно", 1, "zone")
         add("Прихожая: протри входной коврик или пол у двери", 2, "zone")
@@ -535,9 +539,8 @@ async def cl2_confirm_zones(callback: types.CallbackQuery, state: FSMContext) ->
 
 @router.callback_query(lambda c: c.data == "cl2:new_force")
 async def cl2_force_new(callback: types.CallbackQuery, db, state: FSMContext) -> None:
-    # Mark old as abandoned logic handled by create_cleaning_session automatically (logic updated in repo)
-    # But strictly repo creates active, so it abandons prev active.
-    # Just redirect to clean start
+    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    await repo.abandon_active_cleaning_sessions(db, user["id"])
     await state.clear()
     await start_clean_now(callback, db, state)
 
@@ -743,7 +746,15 @@ def _quick_steps_kb(scenario: str, steps: list[dict]) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Пропустить", callback_data=f"quick:mark:skip:{scenario}:{idx}"),
             ]
         )
+    rows.append([InlineKeyboardButton(text="❌ Выйти", callback_data="quick:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(lambda c: c.data == "quick:cancel")
+async def quick_cancel(callback: types.CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await safe_edit(callback.message, "Быстрый сценарий закрыт 👌", reply_markup=home_menu_keyboard())
+    await callback.answer("Вышли")
 
 
 async def _start_quick(callback: types.CallbackQuery, scenario: str, state: FSMContext, db) -> None:

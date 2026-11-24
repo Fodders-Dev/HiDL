@@ -20,6 +20,7 @@ from utils.user import ensure_user
 router = Router()
 FOCUS_EDIT_REQUESTS = {}
 TIME_EDIT_REQUESTS = {}
+_ACTIVE_FOCUS_TASKS: dict[int, asyncio.Task] = {}
 
 
 class WellnessState(StatesGroup):
@@ -90,7 +91,8 @@ async def wellness_settings(message: types.Message, db, state: FSMContext | None
     await message.answer(_wellness_text(current), reply_markup=wellness_keyboard(current))
 
 
-@router.message(lambda m: m.text and not m.text.startswith("/") and m.from_user.id in FOCUS_EDIT_REQUESTS)
+@router.message(WellnessState.focus_edit, lambda m: bool(m.text and not m.text.startswith("/")))
+@router.message(StateFilter(None), lambda m: m.text and not m.text.startswith("/") and m.from_user.id in FOCUS_EDIT_REQUESTS)
 async def focus_edit_input(message: types.Message, db, state: FSMContext | None = None) -> None:
     raw = message.text.strip()
     if raw.lower() in {"отмена", "назад"}:
@@ -139,11 +141,19 @@ async def gentle_button(message: types.Message, db) -> None:
     )
 
 
-@router.message(lambda m: m.text and not m.text.startswith("/") and m.from_user.id in TIME_EDIT_REQUESTS)
+@router.message(WellnessState.time_edit, lambda m: bool(m.text and not m.text.startswith("/")))
+@router.message(StateFilter(None), lambda m: m.text and not m.text.startswith("/") and m.from_user.id in TIME_EDIT_REQUESTS)
 async def time_edit_input(message: types.Message, db, state: FSMContext | None = None) -> None:
     req = TIME_EDIT_REQUESTS.get(message.from_user.id)
     if not req:
-        return
+        if state:
+            data = await state.get_data()
+            kind = data.get("wellness_time_kind")
+            if not kind:
+                return
+            req = (kind, message.chat.id)
+        else:
+            return
     raw = message.text.strip()
     if raw.lower() in {"отмена", "назад"}:
         TIME_EDIT_REQUESTS.pop(message.from_user.id, None)
@@ -203,6 +213,7 @@ async def wellness_toggle(callback: types.CallbackQuery, db, state: FSMContext |
     elif action == "water_times":
         if state:
             await state.set_state(WellnessState.time_edit)
+            await state.update_data(wellness_time_kind="water")
         await callback.message.answer(
             "Введи часы для воды через запятую в формате HH:MM, например: 11:00,16:00",
             reply_markup=None,
@@ -213,6 +224,7 @@ async def wellness_toggle(callback: types.CallbackQuery, db, state: FSMContext |
     elif action == "meal_times":
         if state:
             await state.set_state(WellnessState.time_edit)
+            await state.update_data(wellness_time_kind="meal")
         await callback.message.answer(
             "Введи часы для еды через запятую в формате HH:MM:\n"
             "• 2 времени (например <code>13:00,19:00</code>) — обед и ужин (про завтрак напомню мягко после подъёма);\n"
@@ -243,6 +255,45 @@ async def wellness_toggle(callback: types.CallbackQuery, db, state: FSMContext |
         reply_markup=wellness_keyboard(updated_dict),
     )
     await callback.answer("Обновлено")
+
+
+def _cancel_focus_timer_task(user_id: int) -> None:
+    prev = _ACTIVE_FOCUS_TASKS.pop(int(user_id), None)
+    if prev and not prev.done():
+        prev.cancel()
+
+
+def _start_focus_timer_task(bot, chat_id: int, user_id: int, work: int, rest: int) -> asyncio.Task:
+    _cancel_focus_timer_task(user_id)
+
+    async def _runner() -> None:
+        try:
+            await asyncio.sleep(max(1, int(work)) * 60)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=f"Ещё раунд {work}/{rest}",
+                            callback_data=f"focus:again:{work}:{rest}",
+                        ),
+                        InlineKeyboardButton(text="Хватит", callback_data="focus:stop"),
+                    ]
+                ]
+            )
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Стоп. Отдыхай. Начать следующий раунд?",
+                reply_markup=kb,
+            )
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _ACTIVE_FOCUS_TASKS.get(int(user_id)) is asyncio.current_task():
+                _ACTIVE_FOCUS_TASKS.pop(int(user_id), None)
+
+    task = asyncio.create_task(_runner())
+    _ACTIVE_FOCUS_TASKS[int(user_id)] = task
+    return task
 
 
 # Focus mode 20/10 simple timers in chat
@@ -285,19 +336,9 @@ async def focus_mode(message: types.Message, db) -> None:
     work = current.get("focus_work", 20)
     rest = current.get("focus_rest", 10)
     await message.answer(f"Стартуем {work}/{rest}: {work} минут делаем, {rest} отдыхаем.")
-    await asyncio.sleep(work * 60)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"Ещё раунд {work}/{rest}",
-                    callback_data=f"focus:again:{work}:{rest}",
-                ),
-                InlineKeyboardButton(text="Хватит", callback_data="focus:stop"),
-            ]
-        ]
-    )
-    await message.answer("Стоп. Отдыхай. Начать следующий раунд?", reply_markup=kb)
+    bot = getattr(message, "bot", None)
+    if bot is not None:
+        _start_focus_timer_task(bot, message.chat.id, message.from_user.id, int(work), int(rest))
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("focus:"))
@@ -305,26 +346,20 @@ async def focus_again(callback: types.CallbackQuery) -> None:
     parts = callback.data.split(":")
     action = parts[1]
     if action == "stop":
+        _cancel_focus_timer_task(callback.from_user.id)
         await callback.answer("Ок, отдыхай.")
-        await callback.message.edit_reply_markup(reply_markup=None)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
     work = int(parts[2]) if len(parts) > 2 else 20
     rest = int(parts[3]) if len(parts) > 3 else 10
     await callback.answer("Стартуем ещё один раунд.")
     await callback.message.answer(f"{work} минут делаем...")
-    await asyncio.sleep(work * 60)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"Ещё раунд {work}/{rest}",
-                    callback_data=f"focus:again:{work}:{rest}",
-                ),
-                InlineKeyboardButton(text="Хватит", callback_data="focus:stop"),
-            ]
-        ]
-    )
-    await callback.message.answer("Стоп. Отдыхай. Ещё раунд?", reply_markup=kb)
+    bot = getattr(callback, "bot", None) or getattr(callback.message, "bot", None)
+    if bot is not None:
+        _start_focus_timer_task(bot, callback.message.chat.id, callback.from_user.id, work, rest)
 
 
 @router.message(Command("gentle"))

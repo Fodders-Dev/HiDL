@@ -1,10 +1,11 @@
+import datetime
 import logging
 
 from aiogram import Router, types
 from aiogram.filters import Command
 
 from keyboards.common import main_menu_keyboard
-from utils.pager import start_paged, get_page
+from utils.pager import start_paged, get_page, has_page
 from research_data import (
     CLEAN_SCHEDULE,
     FINANCE_TIPS,
@@ -33,8 +34,9 @@ async def paginate(callback: types.CallbackQuery) -> None:
         await callback.answer("Больше нет страниц.")
         return
     buttons = []
-    buttons.append([types.InlineKeyboardButton(text="Дальше", callback_data=f"page:{key}:{idx+1}")])
-    kb = types.InlineKeyboardMarkup(inline_keyboard=buttons) if chunk else None
+    if has_page(callback.message.chat.id, key, idx + 1):
+        buttons.append([types.InlineKeyboardButton(text="Дальше", callback_data=f"page:{key}:{idx+1}")])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     await callback.message.answer(chunk, reply_markup=kb or main_menu_keyboard())
     await callback.answer()
 

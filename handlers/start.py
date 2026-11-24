@@ -3,6 +3,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import datetime
 import html
 
 from db import repositories as repo
@@ -167,15 +168,27 @@ async def reg_timezone(message: types.Message, state: FSMContext) -> None:
     if await _handle_reg_cancel(message, state):
         return
     tz_raw = message.text.strip()
+    local_t = parse_hhmm(tz_raw)
+    if local_t is not None:
+        now_utc = datetime.datetime.utcnow()
+        utc_min = now_utc.hour * 60 + now_utc.minute
+        loc_min = local_t.hour * 60 + local_t.minute
+        diff_min = loc_min - utc_min
+        if diff_min <= -12 * 60:
+            diff_min += 24 * 60
+        elif diff_min > 14 * 60:
+            diff_min -= 24 * 60
+        offset_h = int(round(diff_min / 60.0))
+        tz_raw = "UTC" if offset_h == 0 else (f"UTC+{offset_h}" if offset_h > 0 else f"UTC{offset_h}")
     if not is_valid_timezone(tz_raw):
         await message.answer(
-            texts.error("не распознала часовой пояс. Пример: Europe/Moscow или UTC+3."),
+            texts.error("не распознала часовой пояс. Пример: Europe/Moscow, UTC+3 или текущее время HH:MM."),
         )
         return
 
     await state.update_data(timezone=tz_raw)
     await state.set_state(Registration.wake_up)
-    await message.answer("Во сколько просыпаешься обычно? Формат HH:MM, например 07:30. После этого настроим план по дому (5 вопросов).")
+    await message.answer(f"Часовой пояс: {tz_raw}. Во сколько просыпаешься обычно? Формат HH:MM, например 07:30.")
 
 
 @router.message(Registration.wake_up, lambda m: bool(m.text and not m.text.startswith("/")))
@@ -234,8 +247,7 @@ async def reg_sleep(message: types.Message, state: FSMContext, db) -> None:
     await message.answer(
         f"Принято, {data['name']}! Добавила базовые настройки."
         f"{joined_house_note}\n\n"
-        "Главное меню внизу: Сегодня, Еда, Дом, Деньги, Спорт, Покупки,\n"
-        "Расписание, Дневник, Кафе фокуса, Настройки.\n\n"
+        "Главное меню внизу: Сегодня, Еда и покупки, Сон и карма, Расписание, Дневник и Ещё (дом, деньги, спорт, фокус, настройки).\n\n"
         "Если захочешь, мы настроим план по дому из раздела 🧹 Дом — там я задам пару вопросов и соберу список регулярных дел.\n\n"
         "Если что-то захочешь поменять — заходи в ⚙ Настройки. "
         "Если запутаешься — всегда можно набрать /help.",

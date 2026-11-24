@@ -3819,6 +3819,15 @@ async def get_active_session(conn: aiosqlite.Connection, user_id: int) -> Option
     )
     return await cursor.fetchone()
 
+
+async def abandon_active_cleaning_sessions(conn: aiosqlite.Connection, user_id: int) -> None:
+    """Закрыть активную сессию уборки пользователя как прерванную."""
+    await conn.execute(
+        "UPDATE cleaning_sessions SET status = 'abandoned', updated_at = ? WHERE user_id = ? AND status = 'active'",
+        (utc_now_str(), user_id),
+    )
+    await conn.commit()
+
 async def update_session_progress(
     conn: aiosqlite.Connection, session_id: int, current_step_index: int
 ) -> None:

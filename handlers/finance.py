@@ -78,7 +78,7 @@ async def spent_add(message: types.Message, db) -> None:
     parsed = parse_command(message.text or "")
     if parsed and parsed.type == "expense":
         amount = parsed.payload.get("amount")
-        category = parsed.payload.get("category", "другое")
+        category = (parsed.payload.get("category") or "другое").strip().casefold()
         if amount:
             await repo.add_expense(db, user["id"], amount, category)
             await message.answer(f"Записала трату: {amount:.0f} ₽, категория {category}.", reply_markup=main_menu_keyboard())
@@ -135,16 +135,19 @@ async def _compose_spent_week(db, user) -> str:
         month_total = await repo.monthly_expense_sum(db, user["id"])
         text += f"\nМесяц: {format_money(month_total)} / лимит {format_money(budget['monthly_limit'])}"
         # грубая оценка дневного лимита до зарплаты
+        import calendar
         today = datetime.date.today()
-        payday = int(budget.get("payday_day") or 1)
+        payday = max(1, min(31, int(budget.get("payday_day") or 1)))
         year = today.year
         month = today.month
-        if today.day > payday:
+        this_last = calendar.monthrange(year, month)[1]
+        if today.day > min(payday, this_last):
             month += 1
             if month > 12:
                 month = 1
                 year += 1
-        next_pay = datetime.date(year, month, payday)
+        next_last = calendar.monthrange(year, month)[1]
+        next_pay = datetime.date(year, month, min(payday, next_last))
         days_left = max(1, (next_pay - today).days)
         left_money = max(0.0, (budget["monthly_limit"] - month_total))
         text += f"\nДо зарплаты {days_left} дн., можно тратить ≈{format_money(left_money/days_left)} ₽/день."
@@ -345,12 +348,73 @@ async def money_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
+                [types.InlineKeyboardButton(text="🗑 Последние траты", callback_data="money:history")],
                 [types.InlineKeyboardButton(text="🎯 Лимиты", callback_data="money:cat")],
                 [types.InlineKeyboardButton(text="📅 Счета", callback_data="money:bills")],
                 [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")],
             ]
         )
         await safe_edit(callback.message, text, reply_markup=kb)
+    elif action == "history":
+        user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        rows = [dict(r) for r in await repo.expenses_last_days(db, user["id"], days=30)][:10]
+        if not rows:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
+                    [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")],
+                ]
+            )
+            await safe_edit(callback.message, "За последние 30 дней трат пока нет.", reply_markup=kb)
+            await callback.answer()
+            return
+        lines = ["🗑 <b>Последние траты (нажми чтобы удалить):</b>", ""]
+        kb_rows = []
+        for r in rows:
+            cat = html.escape(str(r.get("category") or "другое"))
+            amt = float(r.get("amount") or 0)
+            lines.append(f"• {format_money(amt)} — {cat}")
+            kb_rows.append([
+                types.InlineKeyboardButton(
+                    text=f"🗑 {amt:.0f} ₽ · {str(r.get('category') or 'другое')[:20]}",
+                    callback_data=f"money:del_exp:{r['id']}",
+                )
+            ])
+        kb_rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")])
+        await safe_edit(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+    elif action == "del_exp":
+        user = await _ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        parts_cb = (callback.data or "").split(":")
+        exp_id = int(parts_cb[2]) if len(parts_cb) > 2 and parts_cb[2].isdigit() else 0
+        if exp_id:
+            await repo.delete_expense(db, user["id"], exp_id)
+        rows = [dict(r) for r in await repo.expenses_last_days(db, user["id"], days=30)][:10]
+        if not rows:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [types.InlineKeyboardButton(text="➕ Записать трату", callback_data="money:spent")],
+                    [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")],
+                ]
+            )
+            await safe_edit(callback.message, "Трата удалена ✅\n\nЗа последние 30 дней трат больше нет.", reply_markup=kb)
+            await callback.answer("Удалено")
+            return
+        lines = ["🗑 <b>Последние траты (нажми чтобы удалить):</b>", ""]
+        kb_rows = []
+        for r in rows:
+            cat = html.escape(str(r.get("category") or "другое"))
+            amt = float(r.get("amount") or 0)
+            lines.append(f"• {format_money(amt)} — {cat}")
+            kb_rows.append([
+                types.InlineKeyboardButton(
+                    text=f"🗑 {amt:.0f} ₽ · {str(r.get('category') or 'другое')[:20]}",
+                    callback_data=f"money:del_exp:{r['id']}",
+                )
+            ])
+        kb_rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="money:menu")])
+        await safe_edit(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+        await callback.answer("Трата удалена 🗑")
+        return
     elif action == "cat":
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -423,7 +487,7 @@ async def money_free_parse(message: types.Message, db, state: FSMContext) -> Non
         return
     user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
     amount = parsed.payload.get("amount")
-    category = parsed.payload.get("category", "другое")
+    category = (parsed.payload.get("category") or "другое").strip().casefold()
     if amount is None:
         from handlers.inbox import handle_free_text_inbox
 
@@ -458,7 +522,7 @@ async def spend_amount(message: types.Message, state: FSMContext, db) -> None:
         await message.answer("Введи сумму числом. Пример: 1000 или 1000 еда", reply_markup=_cancel_kb())
         return
     if len(parts) > 1:
-        category = parts[1]
+        category = parts[1].strip().casefold() or "другое"
         data = await state.get_data()
         exp_scope = "household" if data.get("expense_scope") == "household" else "personal"
         user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
@@ -478,7 +542,7 @@ async def spend_category(message: types.Message, state: FSMContext, db) -> None:
         return
     data = await state.get_data()
     amount = data.get("amount")
-    category = message.text.strip()
+    category = message.text.strip().casefold() or "другое"
     user = await _ensure_user(db, message.from_user.id, message.from_user.full_name)
     if amount is None:
         # This is limit flow

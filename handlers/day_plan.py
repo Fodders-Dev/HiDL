@@ -11,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from utils.time import local_date_str
+from utils.sender import safe_edit
 from utils.user import ensure_user
 from utils.rows import rows_to_dicts
 from utils.profile import is_student_mode
@@ -128,6 +129,55 @@ async def plan_tomorrow_extra(message: types.Message, state: FSMContext, db) -> 
     await message.answer("\n".join(lines), reply_markup=main_menu_keyboard(user))
 
 
+def _render_day_plan_list_view(items: List[Dict], page: int = 0) -> tuple[str, types.InlineKeyboardMarkup]:
+    items_per_page = 15
+    total_items = len(items)
+    total_pages = (total_items + items_per_page - 1) // items_per_page if total_items > 0 else 1
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * items_per_page
+    page_items = items[start_idx : start_idx + items_per_page]
+
+    lines = ["<b>🎯 План на день — детали:</b>"]
+    if not items:
+        lines.append("Пока пусто.")
+    else:
+        for item in items:
+            lines.append(_plan_item_line(item))
+
+    kb_rows = []
+    for item in page_items:
+        if not item.get("done"):
+            title = (item.get("title") or "")[:30]
+            kb_rows.append([
+                types.InlineKeyboardButton(
+                    text=f"✅ {title}",
+                    callback_data=f"dplan:done:{item.get('id')}:list:{page}",
+                )
+            ])
+
+    if total_pages > 1:
+        pagination_row = []
+        if page > 0:
+            pagination_row.append(
+                types.InlineKeyboardButton(text="⬅️ Пред", callback_data=f"dplan:list:{page - 1}")
+            )
+        pagination_row.append(
+            types.InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="dplan:noop")
+        )
+        if page < total_pages - 1:
+            pagination_row.append(
+                types.InlineKeyboardButton(text="След ➡️", callback_data=f"dplan:list:{page + 1}")
+            )
+        kb_rows.append(pagination_row)
+
+    kb_rows.append([
+        types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
+        types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
+    ])
+    kb_rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")])
+    return "\n".join(lines), types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("dplan:"))
 async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     """Обработка утреннего пинга плана дня: всё ок / удалить / добавить."""
@@ -141,74 +191,14 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
     items = rows_to_dicts(items_rows)
     
     if action == "list":
-        # Пагинация: page указывается как dplan:list:0, dplan:list:1 и т.д.
         page = 0
         if len(parts) > 2:
             try:
                 page = int(parts[2])
             except ValueError:
                 page = 0
-        
-        ITEMS_PER_PAGE = 15
-        total_items = len(items)
-        total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE if total_items > 0 else 1
-        
-        # Ограничиваем page в разумных пределах
-        page = max(0, min(page, total_pages - 1))
-        
-        start_idx = page * ITEMS_PER_PAGE
-        end_idx = start_idx + ITEMS_PER_PAGE
-        page_items = items[start_idx:end_idx]
-        
-        # Текстовый список
-        lines = ["<b>🎯 План на день — детали:</b>"]
-        if not items:
-            lines.append("Пока пусто.")
-        else:
-            for item in items:
-                lines.append(_plan_item_line(item))
-        
-        # Интерактивные кнопки для текущей страницы
-        kb_rows = []
-        for item in page_items:
-            if not item.get("done"):
-                title = (item.get("title") or "")[:30]
-                kb_rows.append([
-                    types.InlineKeyboardButton(
-                        text=f"✅ {title}",
-                        callback_data=f"dplan:done:{item.get('id')}:list:{page}"
-                    )
-                ])
-        
-        # Пагинация (если нужна)
-        pagination_row = []
-        if total_pages > 1:
-            if page > 0:
-                pagination_row.append(
-                    types.InlineKeyboardButton(text="⬅️ Пред", callback_data=f"dplan:list:{page - 1}")
-                )
-            pagination_row.append(
-                types.InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="dplan:noop")
-            )
-            if page < total_pages - 1:
-                pagination_row.append(
-                    types.InlineKeyboardButton(text="След ➡️", callback_data=f"dplan:list:{page + 1}")
-                )
-        
-        if pagination_row:
-            kb_rows.append(pagination_row)
-        
-        # Управление
-        kb_rows.append([
-            types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
-            types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
-        ])
-        kb_rows.append([
-            types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")
-        ])
-        
-        kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
-        await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+        text, kb = _render_day_plan_list_view(items, page=page)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
         await callback.answer()
         return
     
@@ -294,75 +284,14 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         
         # SMART REFRESH
         if from_list:
-            # Refresh list view, сохраняя текущую страницу
-            items_rows = await repo.list_day_plan_items(db, user["id"], local_date)
-            items = rows_to_dicts(items_rows)
-            
-            ITEMS_PER_PAGE = 15
-            total_items = len(items)
-            total_pages = (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE if total_items > 0 else 1
-            page = max(0, min(page, total_pages - 1))
-            
-            start_idx = page * ITEMS_PER_PAGE
-            end_idx = start_idx + ITEMS_PER_PAGE
-            page_items = items[start_idx:end_idx]
-            
-            lines = ["<b>🎯 План на день — детали:</b>"]
-            if not items:
-                lines.append("Пока пусто.")
-            else:
-                for item in items:
-                    lines.append(_plan_item_line(item))
-            
-            kb_rows = []
-            for item in page_items:
-                if not item.get("done"):
-                    title = (item.get("title") or "")[:30]
-                    kb_rows.append([
-                        types.InlineKeyboardButton(
-                            text=f"✅ {title}",
-                            callback_data=f"dplan:done:{item.get('id')}:list:{page}"
-                        )
-                    ])
-            
-            pagination_row = []
-            if total_pages > 1:
-                if page > 0:
-                    pagination_row.append(
-                        types.InlineKeyboardButton(text="⬅️ Пред", callback_data=f"dplan:list:{page - 1}")
-                    )
-                pagination_row.append(
-                    types.InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="dplan:noop")
-                )
-                if page < total_pages - 1:
-                    pagination_row.append(
-                        types.InlineKeyboardButton(text="След ➡️", callback_data=f"dplan:list:{page + 1}")
-                    )
-            
-            if pagination_row:
-                kb_rows.append(pagination_row)
-            
-            kb_rows.append([
-                types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
-                types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
-            ])
-            kb_rows.append([
-                types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")
-            ])
-            
-            kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
-            try:
-                await callback.message.edit_text("\n".join(lines), reply_markup=kb)
-            except Exception:
-                pass
+            items = rows_to_dicts(await repo.list_day_plan_items(db, user["id"], local_date))
+            text, kb = _render_day_plan_list_view(items, page=page)
+            await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
         else:
             # Refresh /today dashboard
             from utils.today import render_today
             text, kb = await render_today(db, user)
-            try:
-                await callback.message.edit_text(text, reply_markup=kb or main_menu_keyboard(user))
-            except Exception:
-                pass
+            await safe_edit(callback.message, text, reply_markup=kb or main_menu_keyboard(user), parse_mode="HTML")
         return
     if action == "del" and len(parts) > 2:
         try:
@@ -371,27 +300,9 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             await callback.answer()
             return
         await repo.delete_day_plan_item(db, user["id"], item_id)
-        
-        # Refresh the delete menu or list?
-        # Probably go back to list or refresh delmenu.
-        # Let's go back to list to show it's gone.
-        items_rows = await repo.list_day_plan_items(db, user["id"], local_date)
-        items = rows_to_dicts(items_rows)
-        lines = ["<b>🎯 План на день — детали:</b>"]
-        if not items:
-            lines.append("Пока пусто.")
-        for item in items:
-            lines.append(_plan_item_line(item))
-        kb = types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
-                    types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
-                ],
-                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")]
-            ]
-        )
-        await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+        items = rows_to_dicts(await repo.list_day_plan_items(db, user["id"], local_date))
+        text, kb = _render_day_plan_list_view(items, page=0)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
         await callback.answer("Убрала из плана.")
         return
     await callback.answer()

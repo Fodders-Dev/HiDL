@@ -811,8 +811,6 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
-            if not self._legacy_pings_active(user):
-                continue
             if _sleep_window_active(user, now_utc):
                 continue
             wellness_row = await repo.get_wellness(self.conn, user["id"])
@@ -863,8 +861,8 @@ class ReminderScheduler:
                                 self.conn, user["id"], water_last_key=key
                             )
                             wellness = await repo.get_wellness(self.conn, user["id"])
-            # Meal reminders
-            if wellness.get("meal_enabled") and not student_mode:
+            # Meal reminders (only when legacy pings active; water works regardless)
+            if wellness.get("meal_enabled") and not student_mode and self._legacy_pings_active(user):
                 for t in meal_times:
                     key = f"{local_date}-{t}"
                     if wellness.get("meal_last_key") == key:
@@ -1242,7 +1240,7 @@ class ReminderScheduler:
                 continue
             if user.get("quiet_mode"):
                 continue
-            if not self._legacy_pings_active(user):
+            if _sleep_window_active(user, now_utc):
                 continue
             
             # Получаем настройки wellness
