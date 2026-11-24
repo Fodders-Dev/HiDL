@@ -2065,6 +2065,77 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
     if ur_info and "nutrition_json" not in ur_cols:
         await conn.execute("ALTER TABLE user_recipes ADD COLUMN nutrition_json TEXT NOT NULL DEFAULT '';")
 
+    reg_hh_info = await conn.execute_fetchall("PRAGMA table_info(regular_tasks);")
+    reg_hh_cols = {row["name"] for row in reg_hh_info}
+    for col_name, col_def in (
+        ("household_id", "INTEGER"),
+        ("last_done_by_user_id", "INTEGER"),
+        ("last_done_by_name", "TEXT DEFAULT ''"),
+    ):
+        if reg_hh_info and col_name not in reg_hh_cols:
+            await conn.execute(f"ALTER TABLE regular_tasks ADD COLUMN {col_name} {col_def};")
+    if reg_hh_info:
+        await conn.execute(
+            """
+            UPDATE regular_tasks
+            SET household_id = (SELECT household_id FROM users WHERE users.id = regular_tasks.user_id)
+            WHERE household_id IS NULL
+            """
+        )
+
+    sup_hh_info = await conn.execute_fetchall("PRAGMA table_info(supplies);")
+    sup_hh_cols = {row["name"] for row in sup_hh_info}
+    for col_name, col_def in (
+        ("household_id", "INTEGER"),
+        ("updated_by_user_id", "INTEGER"),
+        ("updated_by_name", "TEXT DEFAULT ''"),
+    ):
+        if sup_hh_info and col_name not in sup_hh_cols:
+            await conn.execute(f"ALTER TABLE supplies ADD COLUMN {col_name} {col_def};")
+    if sup_hh_info:
+        await conn.execute(
+            """
+            UPDATE supplies
+            SET household_id = (SELECT household_id FROM users WHERE users.id = supplies.user_id)
+            WHERE household_id IS NULL
+            """
+        )
+
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS household_dinner_polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            created_by_user_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            votes_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'open',
+            winner_recipe_id TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_hh_polls_hh_date
+            ON household_dinner_polls(household_id, local_date, status);
+
+        CREATE TABLE IF NOT EXISTS household_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            household_id INTEGER NOT NULL,
+            from_user_id INTEGER NOT NULL,
+            from_name TEXT NOT NULL DEFAULT '',
+            to_user_id INTEGER,
+            kind TEXT NOT NULL DEFAULT 'request',
+            text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            response_note TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_hh_reqs_hh_status
+            ON household_requests(household_id, status, kind);
+        """
+    )
+
     existing_articles = await conn.execute_fetchall(
         "SELECT title FROM knowledge_articles;"
     )

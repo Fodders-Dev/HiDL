@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import gzip
 import hashlib
 import hmac
 import html
 import json
+import os
 import secrets
+import sqlite3
+import tempfile
 import time
 from typing import Any, Optional
 
@@ -299,6 +303,102 @@ async def handle_health(request: web.Request) -> web.Response:
     )
 
 
+async def _resolve_app_db_path(app: web.Application) -> str:
+    path = app.get("desk_database_path")
+    if path is None:
+        rows = await app["db_conn"].execute_fetchall("PRAGMA database_list")
+        path = (rows[0]["file"] if rows else "") or ":memory:"
+        app["desk_database_path"] = path
+    return str(path)
+
+
+def _verify_static_ops_bearer(request: web.Request) -> Optional[web.Response]:
+    cfg: MCPSettings = request.app["mcp_settings"]
+    expected = (cfg.bearer_token or "").strip()
+    if not expected:
+        return web.json_response({"ok": False, "error": "ops_token_not_configured"}, status=503)
+    auth = (request.headers.get("Authorization") or "").strip()
+    parts = auth.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    token = parts[1].strip()
+    if not token or not hmac.compare_digest(token, expected):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    return None
+
+
+def _read_bot_heartbeat(db_path: str) -> tuple[Optional[float], bool]:
+    if not db_path or db_path == ":memory:" or db_path.startswith("file::memory:"):
+        return None, False
+    hb_path = os.path.join(os.path.dirname(db_path) or ".", "bot_heartbeat.json")
+    if not os.path.exists(hb_path):
+        return None, False
+    try:
+        with open(hb_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        ts = float(payload.get("ts") or 0.0)
+        if ts <= 0:
+            return None, False
+        age = round(max(0.0, time.time() - ts), 1)
+        return age, age < 180.0
+    except Exception:
+        return None, False
+
+
+def _create_verified_sqlite_gz(db_path: str) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="hidl_bk_") as td:
+        out_db = os.path.join(td, "hidl_backup.db")
+        src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        dst = sqlite3.connect(out_db)
+        try:
+            src.backup(dst)
+            chk = dst.execute("PRAGMA integrity_check").fetchone()[0]
+            assert chk == "ok", f"integrity_check failed: {chk}"
+        finally:
+            dst.close()
+            src.close()
+        with open(out_db, "rb") as f:
+            raw = f.read()
+        return gzip.compress(raw)
+
+
+async def handle_internal_status(request: web.Request) -> web.Response:
+    err = _verify_static_ops_bearer(request)
+    if err is not None:
+        return err
+    db: aiosqlite.Connection = request.app["db_conn"]
+    cur = await db.execute("SELECT COUNT(*) FROM users")
+    row = await cur.fetchone()
+    users_count = int(row[0] if row else 0)
+    db_path = await _resolve_app_db_path(request.app)
+    age, bot_alive = _read_bot_heartbeat(db_path)
+    return web.json_response(
+        {
+            "ok": True,
+            "service": "hidl-mcp",
+            "db_ok": True,
+            "users_count": users_count,
+            "bot_heartbeat_age_sec": age,
+            "bot_alive": bot_alive,
+        }
+    )
+
+
+async def handle_internal_backup(request: web.Request) -> web.Response:
+    err = _verify_static_ops_bearer(request)
+    if err is not None:
+        return err
+    db_path = await _resolve_app_db_path(request.app)
+    if not db_path or db_path == ":memory:" or db_path.startswith("file::memory:"):
+        return web.json_response({"ok": False, "error": "in_memory_db"}, status=400)
+    gz_bytes = await asyncio.to_thread(_create_verified_sqlite_gz, db_path)
+    return web.Response(
+        body=gz_bytes,
+        content_type="application/gzip",
+        headers={"Content-Disposition": 'attachment; filename="hidl.db.gz"'},
+    )
+
+
 async def handle_gcal_callback(request: web.Request) -> web.Response:
     db: aiosqlite.Connection = request.app["db_conn"]
     err = (request.query.get("error") or "").strip()
@@ -427,6 +527,8 @@ def create_mcp_app(
     app.router.add_get("/", handle_index)
     app.router.add_get("/privacy", handle_privacy)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/internal/status", handle_internal_status)
+    app.router.add_get("/internal/backup", handle_internal_backup)
     app.router.add_get("/gcal/callback", handle_gcal_callback)
 
     app.router.add_post("/integrations/desk/link-tokens", handle_desk_link_tokens)

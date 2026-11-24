@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import base64
 import datetime
+import gzip
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -19,6 +23,7 @@ from config import MCPSettings
 from db import repositories as repo
 from db.database import connect, init_db
 from mcp_server.app import create_mcp_app
+from scheduler.reminder import ReminderScheduler
 from utils.today import render_today
 
 
@@ -539,6 +544,60 @@ class MCPServerTests(unittest.IsolatedAsyncioTestCase):
             ro_client, tok, "tools/call", {"name": "hidl_add_task", "arguments": {"title": "Нельзя"}}
         )
         self.assertTrue(ro_call["result"]["isError"])
+
+    async def test_internal_ops_status_and_backup_endpoints(self):
+        client = await self._start_client()
+        tok = self.settings.bearer_token
+
+        # 1. Unauthenticated / wrong bearer must be rejected (401)
+        for path in ("/internal/status", "/internal/backup"):
+            r_noauth = await client.get(path)
+            self.assertEqual(r_noauth.status, 401)
+            r_bad = await client.get(path, headers={"Authorization": "Bearer wrong-token"})
+            self.assertEqual(r_bad.status, 401)
+
+        # 2. Missing heartbeat initially -> bot_alive=False, db_ok=True
+        r_st1 = await client.get("/internal/status", headers={"Authorization": f"Bearer {tok}"})
+        self.assertEqual(r_st1.status, 200)
+        d1 = await r_st1.json()
+        self.assertTrue(d1["ok"])
+        self.assertTrue(d1["db_ok"])
+        self.assertGreaterEqual(d1["users_count"], 2)
+        self.assertFalse(d1["bot_alive"])
+        self.assertIsNone(d1["bot_heartbeat_age_sec"])
+
+        # 3. Fresh heartbeat written by ReminderScheduler -> bot_alive=True
+        sched = ReminderScheduler(SimpleNamespace(send_message=AsyncMock()), self.db_conn)
+        await sched.write_bot_heartbeat()
+        r_st2 = await client.get("/internal/status", headers={"Authorization": f"Bearer {tok}"})
+        self.assertEqual(r_st2.status, 200)
+        d2 = await r_st2.json()
+        self.assertTrue(d2["bot_alive"])
+        self.assertIsNotNone(d2["bot_heartbeat_age_sec"])
+        self.assertLess(d2["bot_heartbeat_age_sec"], 10.0)
+
+        # 4. Stale heartbeat -> bot_alive=False
+        hb_file = Path(self._tmpdir.name) / "bot_heartbeat.json"
+        hb_file.write_text(json.dumps({"ts": 1000.0, "iso": "1970-01-01T00:16:40Z"}), encoding="utf-8")
+        r_st3 = await client.get("/internal/status", headers={"Authorization": f"Bearer {tok}"})
+        d3 = await r_st3.json()
+        self.assertFalse(d3["bot_alive"])
+        self.assertGreater(d3["bot_heartbeat_age_sec"], 180.0)
+
+        # 5. Verified gzipped SQLite snapshot from /internal/backup
+        r_bk = await client.get("/internal/backup", headers={"Authorization": f"Bearer {tok}"})
+        self.assertEqual(r_bk.status, 200)
+        gz_bytes = await r_bk.read()
+        raw_db = gzip.decompress(gz_bytes)
+        check_path = Path(self._tmpdir.name) / "restored_check.db"
+        check_path.write_bytes(raw_db)
+        chk_conn = sqlite3.connect(str(check_path))
+        try:
+            self.assertEqual(chk_conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            cnt = chk_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            self.assertGreaterEqual(cnt, 2)
+        finally:
+            chk_conn.close()
 
 
 if __name__ == "__main__":

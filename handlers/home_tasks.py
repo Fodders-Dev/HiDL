@@ -1,4 +1,5 @@
 import datetime
+import html
 from typing import List, Optional
 import json
 
@@ -12,6 +13,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
+from services import household_service
 from utils.sender import safe_edit, safe_edit_markup
 from utils.rows import row_to_dict, rows_to_dicts
 from utils.time import format_date_display, local_date_str
@@ -157,7 +159,26 @@ def _format_task_line(t) -> str:
     freq = row.get("frequency_days") or row.get("freq_days") or 7
     next_due = row.get("next_due_date") or row.get("next_due") or ""
     next_disp = format_date_display(next_due) if next_due else "—"
-    return f"{status} {zone_icon} {row['title']} — каждые {freq} д., до {next_disp}"
+    by_name = str(row.get("last_done_by_name") or "").strip()
+    actor_note = f" · закрыл(а): {by_name}" if (row.get("last_done_date") and by_name) else ""
+    return f"{status} {zone_icon} {row['title']} — каждые {freq} д., до {next_disp}{actor_note}"
+
+
+async def _complete_regular_task_and_notify(db, user, callback: types.CallbackQuery, task_id: int, today: str) -> None:
+    u_dict = dict(user)
+    tasks = rows_to_dicts(await repo.list_regular_tasks(db, u_dict["id"], due_only=False, include_inactive=False))
+    task = next((t for t in tasks if int(t.get("id") or 0) == int(task_id)), None)
+    actor_name = str(u_dict.get("name") or "")
+    await repo.mark_regular_done(db, u_dict["id"], int(task_id), today, actor_name=actor_name)
+    pts = (task.get("points") if task else 3) or 3
+    await repo.add_points(db, u_dict["id"], pts, local_date=today)
+    if task:
+        await household_service.notify_household_partners(
+            getattr(callback, "bot", None),
+            db,
+            u_dict,
+            f"🧹 <b>{html.escape(actor_name or 'Партнёр')}</b> закрыл(а) дело по дому: {html.escape(str(task.get('title') or ''))} ✅",
+        )
 
 
 async def show_week_plan(
@@ -217,11 +238,7 @@ async def plan_mark_done(callback: types.CallbackQuery, db) -> None:
     task_id = int(callback.data.split(":")[2])
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    tasks = rows_to_dicts(await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False))
-    task = next((t for t in tasks if t.get("id") == task_id), None)
-    await repo.mark_regular_done(db, user["id"], task_id, today)
-    pts = (task.get("points") if task else 3) or 3
-    await repo.add_points(db, user["id"], pts, local_date=today)
+    await _complete_regular_task_and_notify(db, user, callback, task_id, today)
     await callback.answer("Готово")
     await _refresh_plan(callback, db)
 
@@ -261,11 +278,7 @@ async def all_done(callback: types.CallbackQuery, db) -> None:
     task_id = int(callback.data.split(":")[2])
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
-    tasks = rows_to_dicts(await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False))
-    task = next((t for t in tasks if t.get("id") == task_id), None)
-    await repo.mark_regular_done(db, user["id"], task_id, today)
-    pts = (task.get("points") if task else 3) or 3
-    await repo.add_points(db, user["id"], pts, local_date=today)
+    await _complete_regular_task_and_notify(db, user, callback, task_id, today)
     await callback.answer("Отметила")
     await _refresh_all(callback, db)
 
@@ -928,11 +941,7 @@ async def legacy_reg(callback: types.CallbackQuery, db) -> None:
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     today = local_date_str(datetime.datetime.utcnow(), user["timezone"])
     if action == "done":
-        tasks = rows_to_dicts(await repo.list_regular_tasks(db, user["id"], due_only=False, include_inactive=False))
-        task = next((t for t in tasks if t.get("id") == task_id), None)
-        await repo.mark_regular_done(db, user["id"], task_id, today)
-        pts = (task.get("points") if task else 3) or 3
-        await repo.add_points(db, user["id"], pts, local_date=today)
+        await _complete_regular_task_and_notify(db, user, callback, task_id, today)
         await callback.answer("Готово")
     elif action.startswith("later"):
         days = 1

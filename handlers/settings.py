@@ -66,6 +66,8 @@ async def _render_household_screen(db, user: dict) -> tuple[str, InlineKeyboardM
     ]
     rec_on = bool(cfg.get("share_recipes", True))
     bills_on = bool(cfg.get("share_bills", True))
+    tasks_on = bool(cfg.get("share_home_tasks", True))
+    sup_on = bool(cfg.get("share_supplies", True))
     notif_on = bool(cfg.get("notify_partner", True))
     rows = [
         [InlineKeyboardButton(
@@ -77,9 +79,18 @@ async def _render_household_screen(db, user: dict) -> tuple[str, InlineKeyboardM
             callback_data="settings:household_toggle:share_bills",
         )],
         [InlineKeyboardButton(
+            text=f"{'✅' if tasks_on else '⭕️'} Общие дела по дому",
+            callback_data="settings:household_toggle:share_home_tasks",
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅' if sup_on else '⭕️'} Общая бытовая химия",
+            callback_data="settings:household_toggle:share_supplies",
+        )],
+        [InlineKeyboardButton(
             text=f"{'✅' if notif_on else '⭕️'} Уведомления дома",
             callback_data="settings:household_toggle:notify_partner",
         )],
+        [InlineKeyboardButton(text="🏠 Открыть хаб «Наш дом»", callback_data="hh:hub")],
         [
             InlineKeyboardButton(text="🔄 Новый код", callback_data="settings:household_regen"),
             InlineKeyboardButton(text="🔗 Ввести код", callback_data="settings:household_join"),
@@ -397,7 +408,7 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
         if key == "share_recipes":
             new_val = not bool(cur_settings.get("share_recipes", True))
             await repo.update_household_settings(db, hid, share_recipes=new_val, share_meal_plan=new_val)
-        elif key in {"share_bills", "notify_partner"}:
+        elif key in {"share_bills", "notify_partner", "share_home_tasks", "share_supplies"}:
             new_val = not bool(cur_settings.get(key, True))
             await repo.update_household_settings(db, hid, **{key: new_val})
         text, kb = await _render_household_screen(db, user)

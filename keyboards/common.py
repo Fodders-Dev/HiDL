@@ -31,18 +31,21 @@ def more_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
+                InlineKeyboardButton(text="🏠 Наш дом", callback_data="hh:hub"),
                 InlineKeyboardButton(text="🧹 Дом", callback_data="more:home"),
+            ],
+            [
                 InlineKeyboardButton(text="💰 Деньги", callback_data="more:money"),
-            ],
-            [
                 InlineKeyboardButton(text="🏋️ Спорт", callback_data="more:sport"),
-                InlineKeyboardButton(text="☕ Кафе фокуса", callback_data="more:focus"),
             ],
             [
+                InlineKeyboardButton(text="☕ Кафе фокуса", callback_data="more:focus"),
                 InlineKeyboardButton(text="🤒 Болею / ЧП (24ч)", callback_data="pulse:sick:prompt:more"),
-                InlineKeyboardButton(text="⚙ Настройки", callback_data="settings:main"),
             ],
-            [InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")],
+            [
+                InlineKeyboardButton(text="⚙ Настройки", callback_data="settings:main"),
+                InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu"),
+            ],
         ]
     )
 
@@ -81,6 +84,7 @@ def money_menu_keyboard() -> InlineKeyboardMarkup:
 def home_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Наш дом", callback_data="hh:hub")],
             [InlineKeyboardButton(text="🧽 Уборка сейчас", callback_data="home:now")],
             [InlineKeyboardButton(text="⚡ Быстрые сценарии", callback_data="home:quickmenu")],
             [InlineKeyboardButton(text="📅 План на неделю", callback_data="home:week")],

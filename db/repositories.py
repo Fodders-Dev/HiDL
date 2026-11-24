@@ -273,7 +273,18 @@ DEFAULT_HOUSEHOLD_SETTINGS: Dict[str, bool] = {
     "share_meal_plan": True,
     "share_bills": True,
     "notify_partner": True,
+    "share_home_tasks": True,
+    "share_supplies": True,
 }
+
+
+async def _household_sharing_state(
+    conn: aiosqlite.Connection, user_id: int, setting_key: str
+) -> tuple[int, bool]:
+    hid = await get_or_create_household(conn, int(user_id))
+    house = await get_household(conn, hid)
+    enabled = bool((house or {}).get("settings", {}).get(setting_key, True))
+    return hid, enabled
 
 
 def generate_household_invite_code() -> str:
@@ -348,14 +359,96 @@ async def set_user_household(
     conn: aiosqlite.Connection, user_id: int, household_id: int
 ) -> None:
     now = utc_now_str()
+    uid = int(user_id)
+    hid = int(household_id)
     await conn.execute(
         "UPDATE users SET household_id = ?, updated_at = ? WHERE id = ?",
-        (household_id, now, user_id),
+        (hid, now, uid),
     )
     await conn.execute(
         "UPDATE user_recipes SET household_id = ? WHERE user_id = ?",
-        (household_id, user_id),
+        (hid, uid),
     )
+
+    # Deduplicate shared regular_tasks when joining a household (keep newer copy)
+    existing_tasks = rows_to_dicts(
+        await conn.execute_fetchall(
+            """
+            SELECT id, title, COALESCE(last_done_date, '') AS last_done_date, COALESCE(updated_at, '') AS updated_at
+            FROM regular_tasks
+            WHERE household_id = ? AND user_id != ? AND (is_active IS NULL OR is_active=1)
+            """,
+            (hid, uid),
+        )
+    )
+    existing_task_map = {str(r["title"] or "").strip().casefold(): r for r in existing_tasks}
+    user_tasks = rows_to_dicts(
+        await conn.execute_fetchall(
+            """
+            SELECT id, title, COALESCE(last_done_date, '') AS last_done_date, COALESCE(updated_at, '') AS updated_at
+            FROM regular_tasks
+            WHERE user_id = ? AND (is_active IS NULL OR is_active=1)
+            """,
+            (uid,),
+        )
+    )
+    for ut in user_tasks:
+        key = str(ut["title"] or "").strip().casefold()
+        target = existing_task_map.get(key)
+        if target:
+            u_stamp = (ut["last_done_date"], ut["updated_at"], int(ut["id"]))
+            t_stamp = (target["last_done_date"], target["updated_at"], int(target["id"]))
+            if ut["last_done_date"] and u_stamp > t_stamp:
+                await conn.execute(
+                    "UPDATE regular_tasks SET is_active = 0, updated_at = ? WHERE id = ?",
+                    (now, int(target["id"])),
+                )
+                await conn.execute(
+                    "UPDATE regular_tasks SET household_id = ?, updated_at = ? WHERE id = ?",
+                    (hid, now, int(ut["id"])),
+                )
+                existing_task_map[key] = ut
+            else:
+                await conn.execute(
+                    "UPDATE regular_tasks SET household_id = ?, is_active = 0, updated_at = ? WHERE id = ?",
+                    (hid, now, int(ut["id"])),
+                )
+        else:
+            await conn.execute(
+                "UPDATE regular_tasks SET household_id = ?, updated_at = ? WHERE id = ?",
+                (hid, now, int(ut["id"])),
+            )
+
+    # Deduplicate shared supplies when joining a household
+    existing_supplies = rows_to_dicts(
+        await conn.execute_fetchall(
+            "SELECT id, name, status, COALESCE(updated_at, '') AS updated_at FROM supplies WHERE household_id = ? AND user_id != ?",
+            (hid, uid),
+        )
+    )
+    existing_sup_map = {str(r["name"] or "").strip().casefold(): r for r in existing_supplies}
+    user_supplies = rows_to_dicts(
+        await conn.execute_fetchall(
+            "SELECT id, name, status, COALESCE(updated_at, '') AS updated_at FROM supplies WHERE user_id = ?",
+            (uid,),
+        )
+    )
+    for us in user_supplies:
+        key = str(us["name"] or "").strip().casefold()
+        target = existing_sup_map.get(key)
+        if target:
+            if target["status"] == "full" and us["status"] != "full":
+                await conn.execute(
+                    "UPDATE supplies SET status = ?, updated_at = ? WHERE id = ?",
+                    (us["status"], now, int(target["id"])),
+                )
+            await conn.execute("DELETE FROM supplies WHERE id = ?", (int(us["id"]),))
+        else:
+            await conn.execute(
+                "UPDATE supplies SET household_id = ?, updated_at = ? WHERE id = ?",
+                (hid, now, int(us["id"])),
+            )
+
     await conn.commit()
 
 
@@ -416,6 +509,14 @@ async def leave_household(conn: aiosqlite.Connection, user_id: int) -> int:
     )
     await conn.execute(
         "UPDATE user_recipes SET household_id = ? WHERE user_id = ?",
+        (new_hid, user_id),
+    )
+    await conn.execute(
+        "UPDATE regular_tasks SET household_id = ? WHERE user_id = ?",
+        (new_hid, user_id),
+    )
+    await conn.execute(
+        "UPDATE supplies SET household_id = ? WHERE user_id = ?",
         (new_hid, user_id),
     )
     await conn.commit()
@@ -756,16 +857,25 @@ async def pantry_expiring(
 
 
 async def ensure_supplies(conn: aiosqlite.Connection, user_id: int) -> None:
-    """
-    Создать базовый список бытовой химии для пользователя, если его ещё нет.
-
-    Это аналог ensure_regular_tasks, но для расходников.
-    """
-    cursor = await conn.execute(
-        "SELECT COUNT(*) AS cnt FROM supplies WHERE user_id = ?", (user_id,)
+    """Создать базовый список бытовой химии и расходников для дома/пользователя."""
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_supplies")
+    await conn.execute(
+        "UPDATE supplies SET household_id = ? WHERE user_id = ? AND household_id IS NULL",
+        (hid, uid),
     )
+    if shared:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM supplies WHERE household_id = ? OR user_id = ?",
+            (hid, uid),
+        )
+    else:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM supplies WHERE user_id = ?", (uid,)
+        )
     row = await cursor.fetchone()
     if row and row["cnt"] > 0:
+        await conn.commit()
         return
     now = utc_now_str()
     defaults = [
@@ -778,41 +888,139 @@ async def ensure_supplies(conn: aiosqlite.Connection, user_id: int) -> None:
     for name, category in defaults:
         await conn.execute(
             """
-            INSERT INTO supplies (user_id, name, category, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'full', ?, ?)
+            INSERT INTO supplies (user_id, household_id, name, category, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'full', ?, ?)
             """,
-            (user_id, name, category, now, now),
+            (uid, hid, name, category, now, now),
         )
     await conn.commit()
 
 
-async def list_supplies(conn: aiosqlite.Connection, user_id: int) -> List[aiosqlite.Row]:
-    """Вернуть все записи по бытовой химии и расходникам пользователя."""
-    cursor = await conn.execute(
-        """
-        SELECT * FROM supplies
-        WHERE user_id = ?
-        ORDER BY name
-        """,
-        (user_id,),
+async def list_supplies(conn: aiosqlite.Connection, user_id: int) -> List[Dict[str, Any]]:
+    """Вернуть все записи по бытовой химии и расходникам пользователя (или дома)."""
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_supplies")
+    await conn.execute(
+        "UPDATE supplies SET household_id = ? WHERE user_id = ? AND household_id IS NULL",
+        (hid, uid),
     )
-    return await cursor.fetchall()
+    await conn.commit()
+    if shared:
+        rows = rows_to_dicts(
+            await conn.execute_fetchall(
+                """
+                SELECT * FROM supplies
+                WHERE household_id = ? OR user_id = ?
+                ORDER BY datetime(updated_at) DESC, id DESC
+                """,
+                (hid, uid),
+            )
+        )
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            k = str(r.get("name") or "").strip().casefold()
+            if k and k not in dedup:
+                dedup[k] = r
+        return sorted(dedup.values(), key=lambda x: str(x.get("name") or "").casefold())
+    rows = rows_to_dicts(
+        await conn.execute_fetchall(
+            """
+            SELECT * FROM supplies
+            WHERE user_id = ?
+            ORDER BY name
+            """,
+            (uid,),
+        )
+    )
+    return rows
+
+
+async def get_supply_by_id(
+    conn: aiosqlite.Connection, user_id: int, supply_id: int
+) -> Optional[Dict[str, Any]]:
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_supplies")
+    if shared:
+        cur = await conn.execute(
+            "SELECT * FROM supplies WHERE id = ? AND (household_id = ? OR user_id = ?)",
+            (int(supply_id), hid, uid),
+        )
+    else:
+        cur = await conn.execute(
+            "SELECT * FROM supplies WHERE id = ? AND user_id = ?",
+            (int(supply_id), uid),
+        )
+    row = await cur.fetchone()
+    return row_to_dict(row) if row else None
+
+
+async def _resolve_actor_name(
+    conn: aiosqlite.Connection, user_id: int, actor_name: str = ""
+) -> str:
+    clean_actor = str(actor_name or "").strip()
+    if clean_actor:
+        return clean_actor
+    u = await get_user(conn, int(user_id))
+    return str(row_to_dict(u).get("name") or "") if u else ""
 
 
 async def update_supply_status(
-    conn: aiosqlite.Connection, user_id: int, supply_id: int, status: str
-) -> None:
-    """Обновить статус конкретного расходника (full/low/empty)."""
+    conn: aiosqlite.Connection,
+    user_id: int,
+    supply_id: int,
+    status: str,
+    *,
+    actor_name: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Обновить статус конкретного расходника (full/low/empty) с атрибуцией автора."""
+    uid = int(user_id)
+    item = await get_supply_by_id(conn, uid, supply_id)
+    if not item:
+        return None
+    clean_actor = await _resolve_actor_name(conn, uid, actor_name)
     now = utc_now_str()
     await conn.execute(
         """
         UPDATE supplies
-        SET status = ?, updated_at = ?
-        WHERE user_id = ? AND id = ?
+        SET status = ?, updated_by_user_id = ?, updated_by_name = ?, updated_at = ?
+        WHERE id = ?
         """,
-        (status, now, user_id, supply_id),
+        (status, uid, clean_actor, now, int(supply_id)),
     )
     await conn.commit()
+    return await get_supply_by_id(conn, uid, supply_id)
+
+
+async def add_supply_item(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    name: str,
+    category: str = "расходники",
+) -> int:
+    """Добавить новый расходник/бытовую химию в общий список дома."""
+    uid = int(user_id)
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return 0
+    existing = await list_supplies(conn, uid)
+    for row in existing:
+        if str(row.get("name") or "").strip().casefold() == clean_name.casefold():
+            return int(row["id"])
+    hid = await get_or_create_household(conn, uid)
+    actor_name = await _resolve_actor_name(conn, uid)
+    now = utc_now_str()
+    cur = await conn.execute(
+        """
+        INSERT INTO supplies (
+            user_id, household_id, name, category, status,
+            updated_by_user_id, updated_by_name, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, 'full', ?, ?, ?, ?)
+        """,
+        (uid, hid, clean_name, str(category or "расходники").strip(), uid, actor_name, now, now),
+    )
+    await conn.commit()
+    return int(cur.lastrowid)
 
 
 async def insert_receipt_photo(
@@ -1678,12 +1886,25 @@ async def ensure_regular_tasks(
     conn: aiosqlite.Connection, user_id: int, local_date: Optional[str] = None
 ) -> None:
     """Seed default home tasks with zones/points if none exist."""
-    cursor = await conn.execute(
-        "SELECT COUNT(*) as cnt FROM regular_tasks WHERE user_id = ? AND (is_active IS NULL OR is_active=1)",
-        (user_id,),
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_home_tasks")
+    await conn.execute(
+        "UPDATE regular_tasks SET household_id = ? WHERE user_id = ? AND household_id IS NULL",
+        (hid, uid),
     )
+    if shared:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) as cnt FROM regular_tasks WHERE (household_id = ? OR user_id = ?) AND (is_active IS NULL OR is_active=1)",
+            (hid, uid),
+        )
+    else:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) as cnt FROM regular_tasks WHERE user_id = ? AND (is_active IS NULL OR is_active=1)",
+            (uid,),
+        )
     row = await cursor.fetchone()
     if row and row["cnt"] > 0:
+        await conn.commit()
         return
     today = local_date or datetime.date.today().isoformat()
     now = utc_now_str()
@@ -1706,10 +1927,13 @@ async def ensure_regular_tasks(
         next_due = datetime.date.fromisoformat(today) + datetime.timedelta(days=freq)
         await conn.execute(
             """
-            INSERT INTO regular_tasks (user_id, title, frequency_days, zone, points, is_active, last_done_date, next_due_date, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 1, NULL, ?, ?, ?)
+            INSERT INTO regular_tasks (
+                user_id, household_id, title, frequency_days, zone, points, is_active,
+                last_done_date, next_due_date, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?)
             """,
-            (user_id, title, freq, zone, points, next_due.isoformat(), now, now),
+            (uid, hid, title, freq, zone, points, next_due.isoformat(), now, now),
         )
     await conn.commit()
 
@@ -1721,76 +1945,138 @@ async def list_regular_tasks(
     local_date: Optional[str] = None,
     due_in_days: Optional[int] = None,
     include_inactive: bool = False,
-) -> List[aiosqlite.Row]:
-    conditions = ["user_id = ?"]
-    params: list[Any] = [user_id]
+) -> List[Dict[str, Any]]:
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_home_tasks")
+    await conn.execute(
+        "UPDATE regular_tasks SET household_id = ? WHERE user_id = ? AND household_id IS NULL",
+        (hid, uid),
+    )
+    await conn.commit()
+
+    conditions = ["(household_id = ? OR user_id = ?)" if shared else "user_id = ?"]
+    params: list[Any] = [hid, uid] if shared else [uid]
     if not include_inactive:
         conditions.append("(is_active IS NULL OR is_active=1)")
-    if due_only and local_date:
-        conditions.append("date(next_due_date) <= date(?)")
-        params.append(local_date)
-    if due_in_days is not None and local_date:
-        conditions.append("date(next_due_date) <= date(?, '+' || ? || ' day')")
-        params.extend([local_date, due_in_days])
     where_clause = " AND ".join(conditions)
-    cursor = await conn.execute(
-        f"SELECT * FROM regular_tasks WHERE {where_clause} ORDER BY date(next_due_date), id",
-        params,
+    raw_rows = rows_to_dicts(
+        await conn.execute_fetchall(
+            f"SELECT * FROM regular_tasks WHERE {where_clause} ORDER BY id ASC",
+            params,
+        )
     )
-    return await cursor.fetchall()
+    if shared:
+        best_by_title: Dict[str, Dict[str, Any]] = {}
+        for r in raw_rows:
+            k = str(r.get("title") or "").strip().casefold()
+            if not k:
+                continue
+            prev = best_by_title.get(k)
+            if prev is None:
+                best_by_title[k] = r
+            else:
+                r_key = (str(r.get("last_done_date") or ""), str(r.get("updated_at") or ""), int(r["id"]))
+                p_key = (str(prev.get("last_done_date") or ""), str(prev.get("updated_at") or ""), int(prev["id"]))
+                if r_key > p_key:
+                    best_by_title[k] = r
+        rows = list(best_by_title.values())
+    else:
+        rows = raw_rows
+
+    if (due_only or due_in_days is not None) and local_date:
+        base_dt = datetime.date.fromisoformat(local_date)
+        max_dt = (
+            base_dt
+            if due_only and due_in_days is None
+            else (
+                base_dt + datetime.timedelta(days=int(due_in_days))
+                if due_in_days is not None
+                else None
+            )
+        )
+        filtered = []
+        for r in rows:
+            nd = str(r.get("next_due_date") or "").strip()
+            if not nd:
+                continue
+            try:
+                nd_dt = datetime.date.fromisoformat(nd[:10])
+            except Exception:
+                continue
+            if due_only and due_in_days is None and nd_dt <= base_dt:
+                filtered.append(r)
+            elif max_dt is not None and nd_dt <= max_dt:
+                filtered.append(r)
+        rows = filtered
+
+    rows.sort(key=lambda r: (str(r.get("next_due_date") or "9999-12-31"), int(r["id"])))
+    return rows
 
 
 async def next_regular_task_date(
     conn: aiosqlite.Connection, user_id: int
 ) -> Optional[str]:
-    cursor = await conn.execute(
-        "SELECT next_due_date FROM regular_tasks WHERE user_id = ? AND (is_active IS NULL OR is_active=1) ORDER BY date(next_due_date) LIMIT 1",
-        (user_id,),
-    )
-    row = await cursor.fetchone()
-    return row["next_due_date"] if row else None
+    tasks = await list_regular_tasks(conn, user_id, include_inactive=False)
+    dates = [str(t.get("next_due_date") or "") for t in tasks if t.get("next_due_date")]
+    return min(dates) if dates else None
 
 
 async def mark_regular_done(
-    conn: aiosqlite.Connection, user_id: int, task_id: int, done_date: str
-) -> None:
-    now = utc_now_str()
-    cursor = await conn.execute(
-        "SELECT frequency_days FROM regular_tasks WHERE id = ? AND user_id = ?",
-        (task_id, user_id),
-    )
+    conn: aiosqlite.Connection,
+    user_id: int,
+    task_id: int,
+    done_date: str,
+    *,
+    actor_name: str = "",
+) -> Optional[Dict[str, Any]]:
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_home_tasks")
+    where = "id = ? AND (user_id = ? OR household_id = ?)" if shared else "id = ? AND user_id = ?"
+    params: tuple[Any, ...] = (int(task_id), uid, hid) if shared else (int(task_id), uid)
+    cursor = await conn.execute(f"SELECT * FROM regular_tasks WHERE {where}", params)
     row = await cursor.fetchone()
-    freq = row["frequency_days"] if row else 7
+    if not row:
+        return None
+    freq = row["frequency_days"] or 7
     next_due = calc_next_due(done_date, freq)
+    clean_actor = await _resolve_actor_name(conn, uid, actor_name)
+    now = utc_now_str()
     await conn.execute(
-        """
+        f"""
         UPDATE regular_tasks
-        SET last_done_date = ?, next_due_date = ?, updated_at = ?
-        WHERE id = ? AND user_id = ?
+        SET last_done_date = ?, next_due_date = ?,
+            last_done_by_user_id = ?, last_done_by_name = ?, updated_at = ?
+        WHERE {where}
         """,
-        (done_date, next_due, now, task_id, user_id),
+        (done_date, next_due, uid, clean_actor, now, *params),
     )
     await conn.commit()
+    cur2 = await conn.execute("SELECT * FROM regular_tasks WHERE id = ?", (int(task_id),))
+    res = await cur2.fetchone()
+    return row_to_dict(res) if res else None
 
 
 async def postpone_regular_task(
     conn: aiosqlite.Connection, user_id: int, task_id: int, days: int = 1
 ) -> None:
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_home_tasks")
+    where = "id = ? AND (user_id = ? OR household_id = ?)" if shared else "id = ? AND user_id = ?"
+    params: tuple[Any, ...] = (int(task_id), uid, hid) if shared else (int(task_id), uid)
     now = utc_now_str()
-    cursor = await conn.execute(
-        "SELECT next_due_date FROM regular_tasks WHERE id = ? AND user_id = ?",
-        (task_id, user_id),
-    )
+    cursor = await conn.execute(f"SELECT next_due_date FROM regular_tasks WHERE {where}", params)
     row = await cursor.fetchone()
-    current_due = row["next_due_date"] if row and row["next_due_date"] else datetime.date.today().isoformat()
+    if not row:
+        return
+    current_due = row["next_due_date"] if row["next_due_date"] else datetime.date.today().isoformat()
     new_due = calc_next_due(current_due, days)
     await conn.execute(
-        """
+        f"""
         UPDATE regular_tasks
         SET next_due_date = ?, updated_at = ?
-        WHERE id = ? AND user_id = ? AND (is_active IS NULL OR is_active=1)
+        WHERE {where} AND (is_active IS NULL OR is_active=1)
         """,
-        (new_due, now, task_id, user_id),
+        (new_due, now, *params),
     )
     await conn.commit()
 
@@ -1798,31 +2084,65 @@ async def postpone_regular_task(
 async def set_regular_frequency(
     conn: aiosqlite.Connection, user_id: int, task_id: int, frequency_days: int
 ) -> None:
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_home_tasks")
+    where = "id = ? AND (user_id = ? OR household_id = ?)" if shared else "id = ? AND user_id = ?"
+    params: tuple[Any, ...] = (int(task_id), uid, hid) if shared else (int(task_id), uid)
     freq = max(1, frequency_days)
     now = utc_now_str()
     await conn.execute(
-        """
+        f"""
         UPDATE regular_tasks
         SET frequency_days = ?, next_due_date = date(coalesce(last_done_date, next_due_date), '+' || ? || ' day'), updated_at = ?
-        WHERE id = ? AND user_id = ? AND (is_active IS NULL OR is_active=1)
+        WHERE {where} AND (is_active IS NULL OR is_active=1)
         """,
-        (freq, freq, now, task_id, user_id),
+        (freq, freq, now, *params),
     )
     await conn.commit()
 
 
 async def list_regular_tasks_done_on_date(
     conn: aiosqlite.Connection, user_id: int, done_date: str
-) -> List[aiosqlite.Row]:
-    cursor = await conn.execute(
-        """
-        SELECT * FROM regular_tasks
-        WHERE user_id = ? AND last_done_date = ? AND (is_active IS NULL OR is_active=1)
-        ORDER BY id
-        """,
-        (user_id, done_date),
+) -> List[Dict[str, Any]]:
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_home_tasks")
+    if shared:
+        return rows_to_dicts(
+            await conn.execute_fetchall(
+                """
+                SELECT * FROM regular_tasks
+                WHERE (household_id = ? OR user_id = ?) AND last_done_date = ? AND (is_active IS NULL OR is_active=1)
+                ORDER BY id
+                """,
+                (hid, uid, done_date),
+            )
+        )
+    return rows_to_dicts(
+        await conn.execute_fetchall(
+            """
+            SELECT * FROM regular_tasks
+            WHERE user_id = ? AND last_done_date = ? AND (is_active IS NULL OR is_active=1)
+            ORDER BY id
+            """,
+            (uid, done_date),
+        )
     )
-    return await cursor.fetchall()
+
+
+async def list_regular_tasks_done_in_range(
+    conn: aiosqlite.Connection, household_id: int, start_date: str, end_date: str
+) -> List[Dict[str, Any]]:
+    return rows_to_dicts(
+        await conn.execute_fetchall(
+            """
+            SELECT * FROM regular_tasks
+            WHERE household_id = ? AND last_done_date >= ? AND last_done_date <= ?
+              AND (is_active IS NULL OR is_active=1)
+            ORDER BY last_done_date DESC, id DESC
+            """,
+            (int(household_id), start_date, end_date),
+        )
+    )
 
 
 async def custom_statuses_for_date(
@@ -1995,11 +2315,19 @@ async def upsert_regular_task(
 
 
 async def deactivate_regular_task(conn: aiosqlite.Connection, user_id: int, task_id: int) -> None:
+    uid = int(user_id)
+    hid, shared = await _household_sharing_state(conn, uid, "share_home_tasks")
     now = utc_now_str()
-    await conn.execute(
-        "UPDATE regular_tasks SET is_active = 0, updated_at = ? WHERE id = ? AND user_id = ?",
-        (now, task_id, user_id),
-    )
+    if shared:
+        await conn.execute(
+            "UPDATE regular_tasks SET is_active = 0, updated_at = ? WHERE id = ? AND (user_id = ? OR household_id = ?)",
+            (now, int(task_id), uid, hid),
+        )
+    else:
+        await conn.execute(
+            "UPDATE regular_tasks SET is_active = 0, updated_at = ? WHERE id = ? AND user_id = ?",
+            (now, int(task_id), uid),
+        )
     await conn.commit()
 
 
@@ -6048,4 +6376,333 @@ async def resolve_pending_meal(
         (eff_status, int(resolved_meal_id) if resolved_meal_id is not None else None, int(pending_id)),
     )
     await conn.commit()
+
+
+# --- Household Stage 2: dinner polls, requests, care nudges, weekly stats ---
+
+
+def _decode_dinner_poll(row: Optional[aiosqlite.Row | Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    d = row_to_dict(row)
+    try:
+        d["options"] = json.loads(d.get("options_json") or "[]")
+    except Exception:
+        d["options"] = []
+    try:
+        votes_raw = json.loads(d.get("votes_json") or "{}")
+        d["votes"] = {str(k): int(v) for k, v in votes_raw.items()} if isinstance(votes_raw, dict) else {}
+    except Exception:
+        d["votes"] = {}
+    return d
+
+
+async def create_dinner_poll(
+    conn: aiosqlite.Connection,
+    household_id: int,
+    created_by_user_id: int,
+    local_date: str,
+    options: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE household_dinner_polls
+        SET status = 'closed', updated_at = ?
+        WHERE household_id = ? AND local_date = ? AND status = 'open'
+        """,
+        (now, int(household_id), str(local_date)),
+    )
+    cur = await conn.execute(
+        """
+        INSERT INTO household_dinner_polls (
+            household_id, created_by_user_id, local_date, options_json,
+            votes_json, status, winner_recipe_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, '{}', 'open', '', ?, ?)
+        """,
+        (
+            int(household_id),
+            int(created_by_user_id),
+            str(local_date),
+            json.dumps(options, ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    return await get_dinner_poll(conn, int(cur.lastrowid))  # type: ignore[return-value]
+
+
+async def get_dinner_poll(
+    conn: aiosqlite.Connection, poll_id: int
+) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM household_dinner_polls WHERE id = ?", (int(poll_id),))
+    return _decode_dinner_poll(await cur.fetchone())
+
+
+async def get_latest_open_dinner_poll(
+    conn: aiosqlite.Connection, household_id: int, local_date: str
+) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute(
+        """
+        SELECT * FROM household_dinner_polls
+        WHERE household_id = ? AND local_date = ? AND status = 'open'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (int(household_id), str(local_date)),
+    )
+    return _decode_dinner_poll(await cur.fetchone())
+
+
+async def vote_dinner_poll(
+    conn: aiosqlite.Connection, poll_id: int, user_id: int, option_idx: int
+) -> Optional[Dict[str, Any]]:
+    poll = await get_dinner_poll(conn, poll_id)
+    if not poll:
+        return None
+    options = poll.get("options") or []
+    if option_idx < 0 or option_idx >= len(options):
+        return poll
+    votes = dict(poll.get("votes") or {})
+    votes[str(int(user_id))] = int(option_idx)
+    now = utc_now_str()
+    await conn.execute(
+        "UPDATE household_dinner_polls SET votes_json = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(votes, ensure_ascii=False), now, int(poll_id)),
+    )
+    await conn.commit()
+    return await get_dinner_poll(conn, poll_id)
+
+
+async def decide_dinner_poll(
+    conn: aiosqlite.Connection, poll_id: int, option_idx: int
+) -> Optional[Dict[str, Any]]:
+    poll = await get_dinner_poll(conn, poll_id)
+    if not poll:
+        return None
+    options = poll.get("options") or []
+    if option_idx < 0 or option_idx >= len(options):
+        return poll
+    winner_id = str(options[option_idx].get("id") or "")
+    now = utc_now_str()
+    await conn.execute(
+        """
+        UPDATE household_dinner_polls
+        SET status = 'decided', winner_recipe_id = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (winner_id, now, int(poll_id)),
+    )
+    await conn.commit()
+    return await get_dinner_poll(conn, poll_id)
+
+
+async def create_household_request(
+    conn: aiosqlite.Connection,
+    household_id: int,
+    from_user_id: int,
+    from_name: str,
+    text: str,
+    *,
+    kind: str = "request",
+    to_user_id: Optional[int] = None,
+    status: str = "open",
+    now_utc: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    now = (
+        now_utc.astimezone(datetime.timezone.utc).replace(tzinfo=None).isoformat()
+        if (now_utc and now_utc.tzinfo is not None)
+        else (now_utc.isoformat() if now_utc else utc_now_str())
+    )
+    cur = await conn.execute(
+        """
+        INSERT INTO household_requests (
+            household_id, from_user_id, from_name, to_user_id, kind,
+            text, status, response_note, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+        """,
+        (
+            int(household_id),
+            int(from_user_id),
+            str(from_name or "").strip(),
+            int(to_user_id) if to_user_id is not None else None,
+            str(kind or "request").strip(),
+            str(text or "").strip(),
+            str(status or "open").strip(),
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    return await get_household_request(conn, int(cur.lastrowid))  # type: ignore[return-value]
+
+
+async def get_household_request(
+    conn: aiosqlite.Connection, req_id: int
+) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM household_requests WHERE id = ?", (int(req_id),))
+    row = await cur.fetchone()
+    return row_to_dict(row) if row else None
+
+
+async def list_household_requests(
+    conn: aiosqlite.Connection,
+    household_id: int,
+    *,
+    kind: Optional[str] = "request",
+    statuses: Optional[tuple[str, ...]] = ("open", "accepted", "snoozed"),
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    conds = ["household_id = ?"]
+    params: list[Any] = [int(household_id)]
+    if kind:
+        conds.append("kind = ?")
+        params.append(kind)
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        conds.append(f"status IN ({placeholders})")
+        params.extend(statuses)
+    params.append(int(limit))
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT * FROM household_requests
+        WHERE {' AND '.join(conds)}
+        ORDER BY id DESC LIMIT ?
+        """,
+        params,
+    )
+    return rows_to_dicts(rows)
+
+
+async def update_household_request_status(
+    conn: aiosqlite.Connection,
+    household_id: int,
+    req_id: int,
+    status: str,
+    *,
+    response_note: str = "",
+    now_utc: Optional[datetime.datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    now = (
+        now_utc.astimezone(datetime.timezone.utc).replace(tzinfo=None).isoformat()
+        if (now_utc and now_utc.tzinfo is not None)
+        else (now_utc.isoformat() if now_utc else utc_now_str())
+    )
+    await conn.execute(
+        """
+        UPDATE household_requests
+        SET status = ?, response_note = ?, updated_at = ?
+        WHERE id = ? AND household_id = ?
+        """,
+        (str(status), str(response_note or ""), now, int(req_id), int(household_id)),
+    )
+    await conn.commit()
+    return await get_household_request(conn, req_id)
+
+
+async def recent_household_nudge_exists(
+    conn: aiosqlite.Connection,
+    household_id: int,
+    from_user_id: int,
+    kind: str,
+    *,
+    within_hours: int = 2,
+    now_utc: Optional[datetime.datetime] = None,
+) -> bool:
+    now = now_utc or datetime.datetime.utcnow()
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    cutoff = (now - datetime.timedelta(hours=max(1, int(within_hours)))).isoformat()
+    cur = await conn.execute(
+        """
+        SELECT 1 FROM household_requests
+        WHERE household_id = ? AND from_user_id = ? AND kind = ?
+          AND datetime(created_at) >= datetime(?)
+        LIMIT 1
+        """,
+        (int(household_id), int(from_user_id), str(kind), cutoff),
+    )
+    return (await cur.fetchone()) is not None
+
+
+async def count_household_weekly_activity(
+    conn: aiosqlite.Connection,
+    household_id: int,
+    *,
+    since_date: str,
+    since_utc_iso: str,
+) -> Dict[str, Any]:
+    hid = int(household_id)
+    task_rows = rows_to_dicts(
+        await conn.execute_fetchall(
+            """
+            SELECT last_done_by_user_id, COALESCE(NULLIF(last_done_by_name, ''), 'Участник') AS actor_name,
+                   COUNT(*) AS cnt
+            FROM regular_tasks
+            WHERE household_id = ? AND last_done_date >= ? AND (is_active IS NULL OR is_active=1)
+            GROUP BY last_done_by_user_id, actor_name
+            """,
+            (hid, since_date),
+        )
+    )
+    done_tasks_total = sum(int(r.get("cnt") or 0) for r in task_rows)
+    by_actor = {str(r["actor_name"]): int(r["cnt"]) for r in task_rows if int(r.get("cnt") or 0) > 0}
+
+    cur_req_done = await conn.execute(
+        """
+        SELECT COUNT(*) FROM household_requests
+        WHERE household_id = ? AND kind = 'request' AND status = 'done'
+          AND datetime(updated_at) >= datetime(?)
+        """,
+        (hid, since_utc_iso),
+    )
+    done_requests = int((await cur_req_done.fetchone())[0])
+
+    cur_req_open = await conn.execute(
+        """
+        SELECT COUNT(*) FROM household_requests
+        WHERE household_id = ? AND kind = 'request' AND status IN ('open', 'accepted', 'snoozed')
+        """,
+        (hid,),
+    )
+    open_requests = int((await cur_req_open.fetchone())[0])
+
+    cur_thanks = await conn.execute(
+        """
+        SELECT COUNT(*) FROM household_requests
+        WHERE household_id = ? AND kind = 'nudge_thanks' AND datetime(created_at) >= datetime(?)
+        """,
+        (hid, since_utc_iso),
+    )
+    thanks_count = int((await cur_thanks.fetchone())[0])
+
+    cur_nudges = await conn.execute(
+        """
+        SELECT COUNT(*) FROM household_requests
+        WHERE household_id = ? AND kind LIKE 'nudge_%' AND datetime(created_at) >= datetime(?)
+        """,
+        (hid, since_utc_iso),
+    )
+    nudges_count = int((await cur_nudges.fetchone())[0])
+
+    cur_exp = await conn.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0) FROM expenses
+        WHERE household_id = ? AND scope = 'household' AND datetime(created_at) >= datetime(?)
+        """,
+        (hid, since_utc_iso),
+    )
+    expenses_7d = float((await cur_exp.fetchone())[0] or 0.0)
+
+    return {
+        "done_tasks_total": done_tasks_total,
+        "done_tasks_by_actor": by_actor,
+        "done_requests": done_requests,
+        "open_requests": open_requests,
+        "thanks_count": thanks_count,
+        "nudges_count": nudges_count,
+        "expenses_7d": round(expenses_7d, 2),
+    }
 

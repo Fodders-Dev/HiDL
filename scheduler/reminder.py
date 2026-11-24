@@ -1,4 +1,7 @@
 import datetime
+import json
+import os
+import time
 from typing import Optional
 from collections import defaultdict
 
@@ -63,8 +66,44 @@ class ReminderScheduler:
         self.bot = bot
         self.conn = db_conn
         self.scheduler = AsyncIOScheduler(timezone="UTC")
+        self._db_file_path: Optional[str] = None
+
+    async def _resolve_db_file_path(self) -> str:
+        if self._db_file_path is None:
+            rows = await self.conn.execute_fetchall("PRAGMA database_list;")
+            main_row = next((r for r in rows if r["name"] == "main"), None)
+            self._db_file_path = str(main_row["file"] or "") if main_row else ""
+        return self._db_file_path
+
+    async def write_bot_heartbeat(self) -> None:
+        db_path = await self._resolve_db_file_path()
+        if not db_path or db_path == ":memory:" or db_path.startswith("file::memory:"):
+            return
+        hb_dir = os.path.dirname(db_path) or "."
+        hb_path = os.path.join(hb_dir, "bot_heartbeat.json")
+        tmp_path = f"{hb_path}.tmp"
+        payload = {
+            "ts": time.time(),
+            "iso": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, hb_path)
+
+    async def _tick_bot_heartbeat(self) -> None:
+        try:
+            await self.write_bot_heartbeat()
+        except Exception as exc:
+            log_debug(f"[heartbeat] write failed: {exc}")
 
     def start(self) -> None:
+        self.scheduler.add_job(
+            self._tick_bot_heartbeat,
+            "interval",
+            seconds=60,
+            id="bot_heartbeat_tick",
+            next_run_time=datetime.datetime.now(datetime.timezone.utc),
+        )
         self.scheduler.add_job(self._tick_desk_outbox, "interval", seconds=20, id="desk_outbox_tick")
         self.scheduler.add_job(self._tick, "interval", seconds=60, id="routine_tick")
         self.scheduler.add_job(self._tick_wellness, "interval", seconds=60, id="wellness_tick")
