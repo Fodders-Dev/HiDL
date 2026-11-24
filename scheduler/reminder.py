@@ -389,66 +389,84 @@ class ReminderScheduler:
                     )
             await self._tick_custom(user, now_utc, local_date)
 
-    async def _tick_day_plan(self) -> None:
-        """Утренний пинг по плану дня: один раз около времени подъёма."""
-        now_utc = datetime.datetime.utcnow()
+    async def _tick_day_plan(self, now_utc: Optional[datetime.datetime] = None) -> int:
+        """Утренний пинг по делам дня (в локальном утреннем окне + автоподтягивание хвостов)."""
+        now = now_utc or datetime.datetime.utcnow()
         users = await repo.list_users(self.conn)
+        sent_count = 0
         for user_row in users:
             user = dict(user_row)
             if is_student_mode(user):
                 continue
-            local_date = local_date_str(now_utc, user["timezone"])
-            if user["pause_until"] and local_date <= (user["pause_until"] or ""):
+            tz = str(user.get("timezone") or "UTC")
+            local_date = local_date_str(now, tz)
+            if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
                 continue
             if user.get("quiet_mode"):
                 continue
-            if not self._legacy_pings_active(user):
+            if _sleep_window_active(user, now):
                 continue
-            if _sleep_window_active(user, now_utc):
+
+            local_hhmm = format_time_local(now, tz)
+            now_t = parse_hhmm(local_hhmm)
+            wake_t = parse_hhmm(str(user.get("wake_up_time") or "08:00")) or datetime.time(8, 0)
+            if now_t is None:
                 continue
-            plan = await repo.get_day_plan(self.conn, user["id"], local_date)
+            now_m = now_t.hour * 60 + now_t.minute
+            wake_m = wake_t.hour * 60 + wake_t.minute
+            if not (0 <= ((now_m - wake_m) % (24 * 60)) <= 180):
+                continue
+
+            uid = int(user["id"])
+            existing_plan = await repo.get_day_plan(self.conn, uid, local_date)
+            if existing_plan and dict(existing_plan).get("morning_sent") == local_date:
+                continue
+
+            await repo.sync_overdue_day_plan_items(self.conn, uid, local_date)
+            items_rows = await repo.list_day_plan_items(self.conn, uid, local_date)
+            open_items = [dict(r) for r in items_rows if not r["done"]]
+            if not open_items:
+                continue
+
+            plan = await repo.get_day_plan(self.conn, uid, local_date)
             if not plan:
                 continue
-            plan = dict(plan)
-            if plan.get("morning_sent") == local_date:
-                log_debug(f"[day_plan] already sent user={user['id']} date={local_date}")
-                continue
-            wake_time = user.get("wake_up_time") or "08:00"
-            if not should_trigger(now_utc, user["timezone"], wake_time, window_minutes=15):
-                continue
-            items_rows = await repo.list_day_plan_items(self.conn, user["id"], local_date)
-            items = [dict(r) for r in items_rows]
-            if not items:
-                continue
-            important = [i for i in items if i.get("is_important")]
-            extra = [i for i in items if not i.get("is_important")]
-            lines = ["Доброе утро. Вчера ты запланировал(а) на сегодня:"]
-            for it in important:
-                lines.append(f"• {it['title']}")
-            for it in extra:
-                lines.append(f"• {it['title']}")
-            lines.append("Что-то убрать или добавить?")
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="Всё ок", callback_data="dplan:ok"),
-                    ],
-                    [
-                        InlineKeyboardButton(text="Удалить пункт", callback_data="dplan:delmenu"),
-                    ],
-                    [
-                        InlineKeyboardButton(text="Добавить дело", callback_data="dplan:add"),
-                    ],
+
+            lines = [f"📋 <b>Твои дела на сегодня ({len(open_items)}):</b>"]
+            for idx, it in enumerate(open_items[:6], 1):
+                star = "⭐ " if it.get("is_important") else ""
+                lines.append(f"{idx}. {star}{_html_mod.escape(str(it['title']))}")
+            if len(open_items) > 6:
+                lines.append(f"<i>…и ещё {len(open_items) - 6} в плане дня</i>")
+            lines.append("\nОтмечай закрытые прямо кнопками ниже:")
+
+            kb_rows = [
+                [
+                    InlineKeyboardButton(
+                        text=f"✅ {str(it['title'])[:24]}",
+                        callback_data=f"dplan:done:{it['id']}:list:0",
+                    )
+                ]
+                for it in open_items[:3]
+            ]
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(text="📅 Весь план", callback_data="dplan:list"),
+                    InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
                 ]
             )
             sent = await self._safe_send_message(
-                user, local_date, "\n".join(lines), reply_markup=kb
+                user,
+                local_date,
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+                parse_mode="HTML",
             )
             if sent:
                 await repo.mark_day_plan_morning_sent(self.conn, plan["id"], local_date)
-                log_debug(
-                    f"[day_plan] sent user={user['id']} items={len(items)} date={local_date}"
-                )
+                sent_count += 1
+                log_debug(f"[day_plan] sent user={uid} items={len(open_items)} date={local_date}")
+        return sent_count
 
     async def _tick_day_plan_evening(self) -> None:
         """Вечернее напоминание о планировании завтрашнего дня."""
@@ -1109,12 +1127,36 @@ class ReminderScheduler:
                 continue
             await repo.ensure_regular_tasks(self.conn, user["id"], today)
             tasks = await repo.list_regular_tasks(self.conn, user["id"], due_only=False)
-            if not tasks:
+            ideas = [
+                dict(r)
+                for r in await repo.list_journal_entries(self.conn, user["id"], entry_type="idea", limit=4)
+            ]
+            if not tasks and not ideas:
                 continue
-            lines = ["План по дому на неделю:"]
-            for t in tasks:
-                lines.append(f"• {t['title']} — до {t['next_due_date']}")
-            await self._safe_send_message(user, today, "\n".join(lines))
+            lines: list[str] = []
+            if tasks:
+                lines.append("🏠 <b>План по дому на неделю:</b>")
+                for t in tasks:
+                    lines.append(f"• {_html_mod.escape(str(t['title']))} — до {t['next_due_date']}")
+            if ideas:
+                if lines:
+                    lines.append("")
+                lines.append("💡 <b>Твои идеи и цели (перевести в задачу на неделю?):</b>")
+                for idx, idea in enumerate(ideas, 1):
+                    txt = str(idea.get("title") or idea.get("user_text") or "").strip()
+                    if txt:
+                        lines.append(f"{idx}. {_html_mod.escape(txt)}")
+            kb_rows = [
+                [
+                    InlineKeyboardButton(
+                        text=f"➡️ В задачу: {str(idea.get('title') or idea.get('user_text') or 'Идея')[:22]}",
+                        callback_data=f"diary:to_task:{idea['id']}",
+                    )
+                ]
+                for idea in ideas[:3]
+            ]
+            kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+            await self._safe_send_message(user, today, "\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
     async def _tick_affirmations(self) -> None:
         """Отправка аффирмаций по расписанию пользователя."""

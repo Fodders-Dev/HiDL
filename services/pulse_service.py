@@ -279,6 +279,7 @@ async def _gather_slot_context(
 ) -> Dict[str, Any]:
     ctx: Dict[str, Any] = {}
     if slot_key in {"wake", "winddown", "afternoon"}:
+        await repo.sync_overdue_day_plan_items(db, int(user["id"]), local_date)
         plan_items = await repo.list_day_plan_items(db, int(user["id"]), local_date)
         pending_items = [dict(i) for i in plan_items if not i["done"]]
         ctx["pending_titles"] = [str(i.get("title") or "") for i in pending_items if i.get("title")]
@@ -436,7 +437,11 @@ def build_pulse_message(
             )
             lines = [intro, header_badge]
             if pending_titles:
-                lines.append(f"🎯 Главное: {html.escape(pending_titles[0])}")
+                lines.append("📋 <b>Открытые дела:</b>")
+                for t in pending_titles[:3]:
+                    lines.append(f"• {html.escape(t)}")
+                if len(pending_titles) > 3:
+                    lines.append(f"<i>…и ещё {len(pending_titles) - 3} в плане дня</i>")
             text = "\n".join(lines)
         elif level == 2:
             text = (
@@ -476,11 +481,15 @@ def build_pulse_message(
                 f"ОТМЕТЬСЯ ПО УЖИНУ СЕЙЧАС ИЛИ ПОЛУЧИШЬ ШТРАФ ПО КАРМЕ."
             )
     elif slot_key == "winddown":
-        tail_line = (
-            f"\n📌 Незакрытых дел в плане дня: <b>{pending_count}</b> — можешь перекинуть их на завтра в 1 клик."
-            if pending_count
-            else "\n✅ Хвостов в плане дня нет — красавчик."
-        )
+        if pending_count:
+            top_list = "\n".join(f"• {html.escape(t)}" for t in pending_titles[:3])
+            more = f"\n<i>…и ещё {pending_count - 3}</i>" if pending_count > 3 else ""
+            tail_line = (
+                f"\n📌 Незакрытых дел на сегодня (<b>{pending_count}</b>):\n"
+                f"{top_list}{more}\nМожешь перекинуть хвосты на завтра в 1 клик."
+            )
+        else:
+            tail_line = "\n✅ Хвостов в плане дня нет — красавчик."
         if level == 1:
             text = (
                 f"🌇 <b>За час до отбоя — сворачиваем день.</b> ({header_badge})\n"
@@ -568,7 +577,10 @@ def build_pulse_message(
         rows = [
             [InlineKeyboardButton(text="💧 Вода + в строю", callback_data=f"pulse:done:{cid}")],
             [
+                InlineKeyboardButton(text="📋 План дня", callback_data="dplan:list"),
                 InlineKeyboardButton(text="⏰ Через 30 мин", callback_data=f"pulse:snooze:{cid}:30"),
+            ],
+            [
                 InlineKeyboardButton(text="🆘 Нет сил", callback_data="help:menu"),
             ],
         ]
@@ -589,7 +601,10 @@ def build_pulse_message(
         ]
     elif slot_key == "winddown":
         rows = [
-            [InlineKeyboardButton(text="➡️ Перенести хвосты на завтра", callback_data=f"pulse:rollover:{cid}")],
+            [
+                InlineKeyboardButton(text="➡️ Перенести хвосты", callback_data=f"pulse:rollover:{cid}"),
+                InlineKeyboardButton(text="📋 План дня", callback_data="dplan:list"),
+            ],
             [
                 InlineKeyboardButton(text="🪥 Зубы почистил", callback_data=f"pulse:hygiene:{cid}:teeth"),
                 InlineKeyboardButton(text="✅ Сворачиваю день", callback_data=f"pulse:done:{cid}"),
@@ -724,9 +739,17 @@ async def complete_checkin(
         current_chk = updated or checkin
         if slot_key == "wake" and str(current_chk.get("status") or "") == "missed":
             tz = user.get("timezone") or "UTC"
+            local_d = local_date_str(now, tz)
             local_hhmm = format_time_local(now, tz)
             await repo.clear_user_sleep_confirmed(db, int(user["id"]))
-            await repo.update_sleep_ping(db, int(user["id"]), "morning", local_date_str(now, tz))
+            await repo.update_sleep_ping(db, int(user["id"]), "morning", local_d)
+            await repo.sync_overdue_day_plan_items(db, int(user["id"]), local_d)
+            wake_items = [
+                str(d.get("title") or "")
+                for i in await repo.list_day_plan_items(db, int(user["id"]), local_d)
+                for d in (dict(i),)
+                if not d.get("done") and d.get("title")
+            ][:4]
             current_meta = _load_meta(current_chk)
             current_meta["late_wake_at_local"] = local_hhmm
             current_meta["late_wake_at_utc"] = now.isoformat()
@@ -740,16 +763,27 @@ async def complete_checkin(
             res = await _already_resolved_result(db, user, current_chk, is_wake=True)
             res["late_wake_recorded"] = True
             res["local_time"] = local_hhmm
+            if wake_items:
+                res["pending_tasks"] = wake_items
             if bf_hhmm:
                 res["breakfast_scheduled_hhmm"] = bf_hhmm
             return res
         return await _already_resolved_result(db, user, current_chk, is_wake=slot_key == "wake")
     winning = updated or checkin
     bf_hhmm: Optional[str] = None
+    wake_items: List[str] = []
     if slot_key == "wake":
         await repo.clear_user_sleep_confirmed(db, int(user["id"]))
         tz = user.get("timezone") or "UTC"
-        await repo.update_sleep_ping(db, int(user["id"]), "morning", local_date_str(now, tz))
+        local_d = local_date_str(now, tz)
+        await repo.update_sleep_ping(db, int(user["id"]), "morning", local_d)
+        await repo.sync_overdue_day_plan_items(db, int(user["id"]), local_d)
+        wake_items = [
+            str(d.get("title") or "")
+            for i in await repo.list_day_plan_items(db, int(user["id"]), local_d)
+            for d in (dict(i),)
+            if not d.get("done") and d.get("title")
+        ][:4]
         bf_hhmm = await _maybe_schedule_breakfast_after_wake(db, user, now)
 
     karma_res = await karma_service.record_karma_event(
@@ -769,6 +803,8 @@ async def complete_checkin(
         "is_wake": slot_key == "wake",
         "previous_card": _card_ref(winning),
     }
+    if wake_items:
+        out["pending_tasks"] = wake_items
     if bf_hhmm:
         out["breakfast_scheduled_hhmm"] = bf_hhmm
     return out

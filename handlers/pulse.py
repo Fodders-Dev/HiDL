@@ -306,10 +306,16 @@ async def cb_pulse_done(callback: types.CallbackQuery, db) -> None:
             if res.get("breakfast_scheduled_hhmm")
             else ""
         )
+        p_tasks = list(res.get("pending_tasks") or [])
+        tasks_note = (
+            "\n\n📋 <b>Задачи на сегодня:</b>\n" + "\n".join(f"• {html.escape(t)}" for t in p_tasks[:4])
+            if p_tasks
+            else ""
+        )
         text = (
             f"☀️ <b>Добро пожаловать в день!</b>\n"
             f"Карма: <b>{sign}</b> → {mode['emoji']} <b>{score}/100</b> ({html.escape(mode['label'])})\n\n"
-            f"Добей быстрый утренний минимум в 1 тап:{bf_note}"
+            f"Добей быстрый утренний минимум в 1 тап:{bf_note}{tasks_note}"
         )
         await safe_edit(callback.message, text, reply_markup=kb)
         await _rebind_closed_card_reference(db, callback, res, keep_current=True)
@@ -395,10 +401,16 @@ async def cb_pulse_manual_wake(callback: types.CallbackQuery, db) -> None:
         if res.get("breakfast_scheduled_hhmm")
         else ""
     )
+    p_tasks = list(res.get("pending_tasks") or [])
+    tasks_note = (
+        "\n\n📋 <b>Задачи на сегодня:</b>\n" + "\n".join(f"• {html.escape(t)}" for t in p_tasks[:4])
+        if p_tasks
+        else ""
+    )
     text = (
         f"☀️ <b>Доброе утро! Подъём отмечен.</b>\n"
         f"Карма: <b>{sign}</b> → <b>{score}/100</b>.\n\n"
-        f"Отметь воду и зубы:{bf_note}"
+        f"Отметь воду и зубы:{bf_note}{tasks_note}"
     )
     await safe_edit(callback.message, text, reply_markup=kb)
     await _rebind_closed_card_reference(db, callback, res, keep_current=True)

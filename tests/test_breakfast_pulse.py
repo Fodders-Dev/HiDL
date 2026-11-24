@@ -262,11 +262,13 @@ class BreakfastPulseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bf_row["status"], "done")
 
         # Case B: cooking a breakfast recipe via kitchen_ai.commit_cooked_recipe closes breakfast Pulse
-        bf2_utc = datetime.datetime(2026, 11, 25, 5, 25)
+        next_day = datetime.date.fromisoformat(today_local) + datetime.timedelta(days=1)
+        next_day_str = next_day.isoformat()
+        bf2_utc = datetime.datetime(next_day.year, next_day.month, next_day.day, 5, 25)
         await repo.upsert_pulse_checkin(
             self.db,
             self.uid,
-            "2026-11-25",
+            next_day_str,
             "breakfast",
             "food",
             bf2_utc.isoformat(),
@@ -292,7 +294,7 @@ class BreakfastPulseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(cook_res["ok"])
         self.assertEqual(cook_res["pulse_closed"], "breakfast")
-        bf2_row = await repo.get_pulse_checkin(self.db, self.uid, "2026-11-25", "breakfast")
+        bf2_row = await repo.get_pulse_checkin(self.db, self.uid, next_day_str, "breakfast")
         self.assertEqual(bf2_row["status"], "done")
 
 

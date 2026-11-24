@@ -213,9 +213,16 @@ async def build_user_day_snapshot(
         except Exception:
             late_wake_time = ""
 
+    await repo.sync_overdue_day_plan_items(db, user_id, local_date)
     plan_rows = rows_to_dicts(await repo.list_day_plan_items(db, user_id, local_date))
     pending_tasks = [p for p in plan_rows if not p.get("done")]
     done_tasks_count = sum(1 for p in plan_rows if p.get("done"))
+    idea_rows = rows_to_dicts(await repo.list_journal_entries(db, user_id, entry_type="idea", limit=6))
+    active_ideas = [
+        str(j.get("title") or j.get("user_text") or "").strip()
+        for j in idea_rows
+        if str(j.get("title") or j.get("user_text") or "").strip()
+    ]
 
     reminders = rows_to_dicts(await repo.list_custom_reminders(db, user_id))
     events_today = await calendar_service.get_unified_events_for_date(db, user_id, local_date)
@@ -285,6 +292,7 @@ async def build_user_day_snapshot(
         "equipment": equipment,
         "portrait_text": memory.get("portrait_text") or "",
         "patterns": patterns,
+        "active_ideas": active_ideas,
     }
 
 
@@ -434,6 +442,8 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         lines.append(f"Последнее событие кармы: {last_ev}.")
     if snapshot.get("portrait_text"):
         lines.append("Портрет привычек:\n" + str(snapshot["portrait_text"]))
+    if snapshot.get("active_ideas"):
+        lines.append("Активные идеи и цели пользователя: " + "; ".join(snapshot["active_ideas"][:6]) + ".")
     return "\n".join(lines)
 
 

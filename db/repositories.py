@@ -4709,6 +4709,89 @@ async def rollover_unfinished_day_plan_items(
     return inserted
 
 
+async def sync_overdue_day_plan_items(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    target_date: str,
+    *,
+    lookback_days: int = 7,
+) -> int:
+    """Автоматически подтянуть незакрытые дела за последние N дней в актуальный день target_date."""
+    try:
+        min_date = (
+            datetime.date.fromisoformat(str(target_date))
+            - datetime.timedelta(days=max(1, int(lookback_days)))
+        ).isoformat()
+    except Exception:
+        return 0
+
+    src_cur = await conn.execute(
+        """
+        SELECT dpi.id, dpi.title
+        FROM day_plans dp
+        JOIN day_plan_items dpi ON dpi.plan_id = dp.id
+        WHERE dp.user_id = ? AND dp.plan_date >= ? AND dp.plan_date < ? AND COALESCE(dpi.done, 0) = 0
+        ORDER BY dp.plan_date ASC, dpi.is_important DESC, dpi.id ASC
+        """,
+        (int(user_id), min_date, str(target_date)),
+    )
+    overdue_rows = rows_to_dicts(await src_cur.fetchall())
+    if not overdue_rows:
+        return 0
+
+    now = utc_now_str()
+    plan_cur = await conn.execute(
+        "SELECT id FROM day_plans WHERE user_id = ? AND plan_date = ?",
+        (int(user_id), str(target_date)),
+    )
+    plan_row = await plan_cur.fetchone()
+    if plan_row:
+        target_plan_id = int(plan_row["id"])
+        await conn.execute(
+            "UPDATE day_plans SET updated_at = ? WHERE id = ?",
+            (now, target_plan_id),
+        )
+    else:
+        ins_cur = await conn.execute(
+            """
+            INSERT INTO day_plans (user_id, plan_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(user_id), str(target_date), now, now),
+        )
+        target_plan_id = int(ins_cur.lastrowid)
+
+    existing_cur = await conn.execute(
+        """
+        SELECT dpi.title
+        FROM day_plans dp
+        JOIN day_plan_items dpi ON dpi.plan_id = dp.id
+        WHERE dp.user_id = ? AND dp.plan_date = ?
+        """,
+        (int(user_id), str(target_date)),
+    )
+    existing_titles = {
+        str(r["title"] or "").strip().lower() for r in await existing_cur.fetchall()
+    }
+
+    moved = 0
+    for item in overdue_rows:
+        title = str(item.get("title") or "").strip()
+        key = title.lower()
+        if not title or key in existing_titles:
+            continue
+        await conn.execute(
+            "UPDATE day_plan_items SET plan_id = ?, updated_at = ? WHERE id = ?",
+            (target_plan_id, now, int(item["id"])),
+        )
+        existing_titles.add(key)
+        moved += 1
+
+    if moved:
+        await conn.commit()
+    return moved
+
+
 async def get_or_create_profile_memory(
     conn: aiosqlite.Connection, user_id: int
 ) -> Dict[str, Any]:

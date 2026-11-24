@@ -136,6 +136,7 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
     user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
     now_utc = datetime.datetime.utcnow()
     local_date = local_date_str(now_utc, user["timezone"])
+    await repo.sync_overdue_day_plan_items(db, user["id"], local_date)
     items_rows = await repo.list_day_plan_items(db, user["id"], local_date)
     items = rows_to_dicts(items_rows)
     

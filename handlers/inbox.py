@@ -909,6 +909,7 @@ async def _render_diary_view(
             lines.append("Пока пусто. Напиши или надиктуй мысль в чат — я сохраню.")
         else:
             del_row: list[InlineKeyboardButton] = []
+            task_row: list[InlineKeyboardButton] = []
             for idx, e in enumerate(entries, 1):
                 src_icon = "🎙" if e.get("source") == "voice" else "💬"
                 note = (e.get("model_note") or "").strip()
@@ -923,6 +924,15 @@ async def _render_diary_view(
                             callback_data=f"diary:del:{e['id']}:{tab}",
                         )
                     )
+                    if entry_type == "idea":
+                        task_row.append(
+                            InlineKeyboardButton(
+                                text=f"➡️ В задачу {idx}",
+                                callback_data=f"diary:to_task:{e['id']}",
+                            )
+                        )
+            if task_row:
+                rows.append(task_row)
             if del_row:
                 rows.append(del_row)
 
@@ -969,6 +979,33 @@ async def diary_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
         text, kb = await _render_diary_view(db, user, tab=tab)
         await safe_edit(callback.message, text, reply_markup=kb)
         await callback.answer("Удалила запись")
+        return
+
+    if action == "to_task" and len(parts) > 2:
+        eid = int(parts[2])
+        entry = await repo.get_journal_entry(db, user["id"], eid)
+        if not entry:
+            await callback.answer("Запись не найдена", show_alert=True)
+            return
+        local_date = local_date_str(datetime.datetime.utcnow(), user.get("timezone") or "UTC")
+        task_title = str(entry.get("title") or entry.get("user_text") or "Идея").strip()
+        await repo.add_day_plan_item(
+            db, user["id"], local_date, task_title, category="idea", is_important=True
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📋 План на день", callback_data="dplan:list"),
+                    InlineKeyboardButton(text="💡 К идеям", callback_data="diary:tab:idea"),
+                ]
+            ]
+        )
+        await callback.message.answer(
+            f"✅ Перевела идею в важную задачу на сегодня:\n<b>{_esc(task_title)}</b>",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        await callback.answer("Добавлено в задачи на сегодня!")
         return
 
     if action == "export":

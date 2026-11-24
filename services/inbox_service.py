@@ -29,6 +29,7 @@ from services.inbox_parser import (
     ParsedInboxItem,
     analyze_inbox_text,
     compute_one_time_last_sent,
+    resolve_temporal_expression,
 )
 from utils.pantry import format_quantity
 from utils.rows import rows_to_dicts
@@ -206,6 +207,11 @@ def _format_action_line(action: dict[str, Any]) -> str:
         if delta > 0 and score_after is not None:
             return f"{icon} {label}: {title} (задача закрыта, +{delta} кармы → {score_after}/100)"
         return f"{icon} {label}: {title} (задача закрыта)"
+    if kind == "task":
+        p_date = str(payload.get("plan_date") or "")
+        c_date = str(payload.get("created_date") or "")
+        if p_date and c_date and p_date != c_date:
+            return f"{icon} {label} (на {format_date_display(p_date)[:5]}): {title}"
     return f"{icon} {label}: {title}"
 
 
@@ -628,6 +634,34 @@ async def _persist_meal_item(
     )
 
 
+_TASK_DATE_HINT_RE = re.compile(
+    r"(?:завтра|послезавтра|сегодня|понедель|вторник|сред[ау]|четверг|пятниц|суббот|воскрес|\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b|\b\d{4}-\d{2}-\d{2}\b)",
+    re.IGNORECASE,
+)
+
+
+def _resolve_task_plan_date(
+    item: ParsedInboxItem,
+    local_date: str,
+    now_utc: datetime.datetime,
+    tz_str: str,
+) -> str:
+    d_hint = str(getattr(item, "date_hint", None) or "").strip()
+    quote = str(getattr(item, "source_quote", None) or "").strip()
+    if not d_hint and not _TASK_DATE_HINT_RE.search(quote):
+        return local_date
+    sched = resolve_temporal_expression(
+        d_hint or None,
+        None,
+        quote or d_hint,
+        now_utc,
+        tz_str,
+    )
+    if getattr(sched, "resolved_date", None) and sched.resolved_date >= local_date:
+        return str(sched.resolved_date)
+    return local_date
+
+
 async def _persist_parsed_items(
     db,
     user: dict[str, Any],
@@ -660,10 +694,12 @@ async def _persist_parsed_items(
         }:
             kind = "task" if kind == "shopping" else "diary"
         if kind == "task":
+            tz_user = str(user.get("timezone") or "UTC")
+            task_date = _resolve_task_plan_date(item, local_date, now, tz_user)
             item_id = await repo.add_day_plan_item(
                 db,
                 user["id"],
-                local_date,
+                task_date,
                 item.title,
                 category="inbox",
                 is_important=False,
@@ -677,7 +713,12 @@ async def _persist_parsed_items(
                 target_id=item_id,
                 title=item.title,
                 source_quote=item.source_quote,
-                payload={"plan_date": local_date, "model_note": item.model_note, "tags": item.tags},
+                payload={
+                    "plan_date": task_date,
+                    "created_date": local_date,
+                    "model_note": item.model_note,
+                    "tags": item.tags,
+                },
                 status="active",
             )
         elif kind == "shopping":

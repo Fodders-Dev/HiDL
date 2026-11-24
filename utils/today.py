@@ -150,6 +150,7 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
             )
 
     # day plan (важные/дополнительные дела)
+    await repo.sync_overdue_day_plan_items(db, user["id"], local_date)
     plan_items = rows_to_dicts(await repo.list_day_plan_items(db, user["id"], local_date))
     cal_events_today = await calendar_service.get_unified_events_for_date(db, user["id"], local_date)
     important_plan = [p for p in plan_items if p.get("is_important")]
