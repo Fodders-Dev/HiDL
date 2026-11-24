@@ -35,6 +35,10 @@ def more_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🧹 Дом", callback_data="more:home"),
             ],
             [
+                InlineKeyboardButton(text="📅 План на день", callback_data="dplan:list"),
+                InlineKeyboardButton(text="🔔 Напоминания", callback_data="rem:list"),
+            ],
+            [
                 InlineKeyboardButton(text="💰 Деньги", callback_data="more:money"),
                 InlineKeyboardButton(text="🏋️ Спорт", callback_data="more:sport"),
             ],

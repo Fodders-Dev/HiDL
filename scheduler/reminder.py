@@ -126,6 +126,7 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_calendar_alerts, "interval", seconds=60, id="calendar_alerts_tick")
         self.scheduler.add_job(self._tick_pending_meals, "interval", minutes=2, id="pending_meals_autocommit")
         self.scheduler.add_job(self._tick_nutrition_evening, "interval", minutes=15, id="nutrition_evening_checkin")
+        self.scheduler.add_job(self._tick_household_snoozes, "interval", seconds=60, id="household_snooze_tick")
         self.scheduler.start()
 
     @staticmethod
@@ -143,6 +144,51 @@ class ReminderScheduler:
 
     async def _tick_calendar_alerts(self) -> None:
         await calendar_service.process_calendar_alerts_tick(self.conn, self.bot)
+
+    async def _tick_household_snoozes(
+        self, now_utc: datetime.datetime | None = None
+    ) -> int:
+        """Напомнить об отложенных просьбах по дому после 30-минутной паузы."""
+        now = now_utc or datetime.datetime.utcnow()
+        due_reqs = await repo.list_due_snoozed_household_requests(self.conn, now)
+        sent = 0
+        for req in due_reqs:
+            rid = int(req["id"])
+            hid = int(req["household_id"])
+            from_uid = int(req.get("from_user_id") or 0)
+            from_name = str(req.get("from_name") or "Партнёр")
+            body = str(req.get("text") or "")
+            members = await repo.list_household_members(self.conn, hid)
+            targets = [m for m in members if int(m["id"]) != from_uid]
+            if not targets and members:
+                targets = members
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="👍 Принято", callback_data=f"hh:req:act:{rid}:accepted"),
+                        InlineKeyboardButton(text="⏰ Ещё 30 мин", callback_data=f"hh:req:act:{rid}:snoozed"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="✅ Готово", callback_data=f"hh:req:act:{rid}:done"),
+                        InlineKeyboardButton(text="📋 Все просьбы", callback_data="hh:req:list"),
+                    ],
+                ]
+            )
+            msg_text = (
+                f"⏰ <b>Напоминание о просьбе #{rid}</b> (от {_html_mod.escape(from_name)}):\n"
+                f"{_html_mod.escape(body)}"
+            )
+            for member in targets:
+                m_dict = dict(member)
+                local_date = local_date_str(now, m_dict.get("timezone") or "UTC")
+                if m_dict.get("quiet_mode") or (m_dict.get("pause_until") and local_date <= str(m_dict["pause_until"])):
+                    continue
+                if _sleep_window_active(m_dict, now):
+                    continue
+                if await self._safe_send_message(m_dict, local_date, msg_text, reply_markup=kb, parse_mode="HTML"):
+                    sent += 1
+            await repo.update_household_request_status(self.conn, hid, rid, "open", now_utc=now)
+        return sent
 
     async def _tick_desk_outbox(self, now_utc: datetime.datetime | None = None) -> int:
         """Drain a bounded set of due Desk batches on an isolated DB connection."""

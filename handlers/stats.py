@@ -46,8 +46,15 @@ def _streak(by_date, today_str: str) -> int:
 
 
 @router.message(Command("stats"))
-async def stats(message: types.Message, db) -> None:
-    user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
+async def stats(
+    message: types.Message,
+    db,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
+    uid_tg = tg_user_id if tg_user_id is not None else (message.from_user.id if message.from_user else message.chat.id)
+    uname = tg_full_name if tg_full_name is not None else (message.from_user.full_name if message.from_user else "Друг")
+    user = await ensure_user(db, uid_tg, uname)
 
     now_utc = datetime.datetime.utcnow()
     local_today = local_date_str(now_utc, user["timezone"])
@@ -137,7 +144,12 @@ async def stats(message: types.Message, db) -> None:
 
 @router.callback_query(lambda c: c.data == "stats:view")
 async def stats_view(callback: types.CallbackQuery, db) -> None:
-    await stats(callback.message, db)
+    await stats(
+        callback.message,
+        db,
+        tg_user_id=callback.from_user.id,
+        tg_full_name=callback.from_user.full_name,
+    )
     await callback.answer()
 
 

@@ -312,7 +312,8 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
                 summary_lines.append(affirm_line)
     today_heading = "План дня" if student else f"План на {format_date_display(local_date)}"
     blocks = [f"{pause_note}{quiet_note}<b>{today_heading}</b>\n" + "\n".join(summary_lines)]
-    if routine_lines:
+    pulse_on = bool(user.get("pulse_enabled", 1))
+    if routine_lines and (first_pending_routine_row is not None or not pulse_on):
         blocks.append("<b>🌞 Рутины:</b>\n" + "\n".join(routine_lines))
     if custom_lines and not student:
         blocks.append("<b>🔔 Свои напоминания:</b>\n" + "\n".join(custom_lines))
@@ -382,40 +383,50 @@ async def render_today(db, user) -> Tuple[str, types.InlineKeyboardMarkup]:
         kb_buttons.append(first_pending_routine_row)
     if not student:
         kb_buttons.append(
-        [
-            types.InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub"),
-            types.InlineKeyboardButton(text="💡 Совет сейчас", callback_data="advice:more"),
-        ]
+            [
+                types.InlineKeyboardButton(text="🌙 Сон и карма", callback_data="pulse:hub"),
+                types.InlineKeyboardButton(text="💡 Совет сейчас", callback_data="advice:more"),
+            ]
         )
     has_any_reminders = bool(custom)
-    kb_buttons.append([types.InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")])
-    if has_any_reminders:
-        kb_buttons.append([types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")])
-    else:
-        kb_buttons.append([types.InlineKeyboardButton(text="➕ Добавить напоминание", callback_data="rem:add")])
+    rem_btn = (
+        types.InlineKeyboardButton(text="Напоминания", callback_data="rem:list")
+        if has_any_reminders
+        else types.InlineKeyboardButton(text="➕ Напоминание", callback_data="rem:add")
+    )
     if student:
-        kb_buttons.append([types.InlineKeyboardButton(text="📚 Учёба / Desk", callback_data="desk:main")])
-        kb_buttons.append([types.InlineKeyboardButton(text="☕ Кафе фокуса", callback_data="more:focus")])
-        kb_buttons.append([types.InlineKeyboardButton(text="😴 Сон и пауза", callback_data="pause:menu")])
+        kb_buttons.append([types.InlineKeyboardButton(text="📚 Учёба / Desk", callback_data="desk:main"), rem_btn])
+        kb_buttons.append([
+            types.InlineKeyboardButton(text="📅 План на день", callback_data="dplan:list"),
+            types.InlineKeyboardButton(text="☕ Кафе фокуса", callback_data="more:focus"),
+        ])
+        kb_buttons.append([
+            types.InlineKeyboardButton(text="😴 Сон и пауза", callback_data="pause:menu"),
+            types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view"),
+        ])
+        kb_buttons.append([types.InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")])
     else:
-        kb_buttons.append([types.InlineKeyboardButton(text="🧹 План по дому", callback_data="home:week")])
-    kb_buttons.append([types.InlineKeyboardButton(text="📅 План на день", callback_data="dplan:list")])
-    if not student:
-        kb_buttons.append([types.InlineKeyboardButton(text="Финансы", callback_data="money:report")])
-    kb_buttons.append([types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view")])
-    
-    # Кнопка для просмотра скрытого плана - УДАЛЕНА, так как теперь есть кнопка "План на день" выше.
+        kb_buttons.append([
+            types.InlineKeyboardButton(text="📅 План на день", callback_data="dplan:list"),
+            rem_btn,
+        ])
+        kb_buttons.append([
+            types.InlineKeyboardButton(text="🍽 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+            types.InlineKeyboardButton(text="🧹 План по дому", callback_data="home:week"),
+        ])
+        kb_buttons.append([
+            types.InlineKeyboardButton(text="Финансы", callback_data="money:report"),
+            types.InlineKeyboardButton(text="Мои очки", callback_data="stats:view"),
+        ])
+        extra_row = []
+        if meds_total:
+            extra_row.append(types.InlineKeyboardButton(text="Таблетки", callback_data="meds:today"))
+        if soon_pantry_d or expired_pantry_d:
+            extra_row.append(types.InlineKeyboardButton(text="Продукты", callback_data="pantry:expiring"))
+        if extra_row:
+            kb_buttons.append(extra_row)
+        kb_buttons.append([types.InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")])
 
-    if meds_total and not student:
-        kb_buttons.append(
-            [types.InlineKeyboardButton(text="Таблетки", callback_data="meds:today")]
-        )
-    if (soon_pantry_d or expired_pantry_d) and not student:
-        kb_buttons.append(
-            [types.InlineKeyboardButton(text="Продукты", callback_data="pantry:expiring")]
-        )
-    # Быстрые кнопки для плана дня - УДАЛЕНЫ
-    # Теперь все дела доступны через интерактивную кнопку "📅 План на день"
     inline_kb = types.InlineKeyboardMarkup(inline_keyboard=kb_buttons)
 
     return "\n\n".join(blocks), inline_kb

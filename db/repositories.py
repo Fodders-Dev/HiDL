@@ -5881,6 +5881,18 @@ async def list_schedule_events_range(
     return rows_to_dicts(await cur.fetchall())
 
 
+async def mark_schedule_event_alert_sent(
+    conn: aiosqlite.Connection,
+    event_id: int,
+) -> None:
+    """Отметить, что пред-событийное предупреждение по локальному событию уже отправлено."""
+    await conn.execute(
+        "UPDATE schedule_events SET pre_alert_sent = 1, updated_at = ? WHERE id = ?",
+        (utc_now_str(), int(event_id)),
+    )
+    await conn.commit()
+
+
 def _decode_recipe_json_list(raw: Any) -> List[Any]:
     if isinstance(raw, list):
         return raw
@@ -6962,23 +6974,50 @@ async def update_household_request_status(
     status: str,
     *,
     response_note: str = "",
+    snooze_until_utc: Optional[str] = None,
     now_utc: Optional[datetime.datetime] = None,
 ) -> Optional[Dict[str, Any]]:
-    now = (
-        now_utc.astimezone(datetime.timezone.utc).replace(tzinfo=None).isoformat()
-        if (now_utc and now_utc.tzinfo is not None)
-        else (now_utc.isoformat() if now_utc else utc_now_str())
-    )
+    now_dt = now_utc or datetime.datetime.utcnow()
+    if now_dt.tzinfo is not None:
+        now_dt = now_dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    now = now_dt.isoformat()
+    if str(status) == "snoozed":
+        eff_snooze = snooze_until_utc or (now_dt + datetime.timedelta(minutes=30)).isoformat()
+    else:
+        eff_snooze = ""
     await conn.execute(
         """
         UPDATE household_requests
-        SET status = ?, response_note = ?, updated_at = ?
+        SET status = ?, response_note = ?, snooze_until_utc = ?, updated_at = ?
         WHERE id = ? AND household_id = ?
         """,
-        (str(status), str(response_note or ""), now, int(req_id), int(household_id)),
+        (str(status), str(response_note or ""), eff_snooze, now, int(req_id), int(household_id)),
     )
     await conn.commit()
     return await get_household_request(conn, req_id)
+
+
+async def list_due_snoozed_household_requests(
+    conn: aiosqlite.Connection,
+    now_utc: Optional[datetime.datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Вернуть отложенные просьбы дома, чей 30-минутный таймер уже истёк."""
+    now_dt = now_utc or datetime.datetime.utcnow()
+    if now_dt.tzinfo is not None:
+        now_dt = now_dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    now_iso = now_dt.isoformat()
+    cur = await conn.execute(
+        """
+        SELECT * FROM household_requests
+        WHERE status = 'snoozed'
+          AND snooze_until_utc IS NOT NULL
+          AND snooze_until_utc != ''
+          AND datetime(snooze_until_utc) <= datetime(?)
+        ORDER BY id ASC
+        """,
+        (now_iso,),
+    )
+    return rows_to_dicts(await cur.fetchall())
 
 
 async def recent_household_nudge_exists(

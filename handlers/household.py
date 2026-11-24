@@ -104,6 +104,10 @@ async def _render_hub(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboardMark
             ],
             [InlineKeyboardButton(text="🤗 Забота и спасибо", callback_data="hh:care:menu")],
             [
+                InlineKeyboardButton(text="🛒 Общие покупки", callback_data="kitchen:shoplist:household"),
+                InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
+            ],
+            [
                 InlineKeyboardButton(text="📅 Общие дела", callback_data="home:week"),
                 InlineKeyboardButton(text="🧴 Расходники", callback_data="home:supplies"),
             ],
@@ -179,6 +183,38 @@ async def hh_vote_reroll_cb(callback: types.CallbackQuery, db) -> None:
     await callback.answer("Подобрала 3 других варианта 🎲")
 
 
+async def _sync_decided_dinner_to_meal_plan(
+    db,
+    household_id: int,
+    local_date: str,
+    option: Dict[str, Any],
+    *,
+    acting_user_id: int,
+) -> None:
+    """Сохранить выбранное блюдо голосования в план питания дома (слот ужина на сегодня)."""
+    from services import kitchen_ai
+
+    rid = str(option.get("id") or "").strip()
+    rec = await kitchen_ai.get_recipe_for_user(db, acting_user_id, rid) if rid else None
+    title = str((rec or {}).get("title") or option.get("title") or "Ужин")
+    t_min = int((rec or {}).get("time_minutes") or option.get("time_min") or 20)
+    ings = list((rec or {}).get("ingredients") or [])
+    members = await repo.list_household_members(db, household_id)
+    target_uids = [int(m["id"]) for m in members] if members else [acting_user_id]
+    for uid in target_uids:
+        await repo.upsert_meal_plan_slot(
+            db,
+            uid,
+            local_date,
+            "dinner",
+            title=title,
+            recipe_id=rid,
+            time_minutes=t_min,
+            ingredients=ings,
+            status="planned",
+        )
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("hh:vote:pick:"))
 async def hh_vote_pick_cb(callback: types.CallbackQuery, db) -> None:
     user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
@@ -201,6 +237,8 @@ async def hh_vote_pick_cb(callback: types.CallbackQuery, db) -> None:
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
     opts = poll.get("options") or []
     if 0 <= idx < len(opts):
+        local_date = str(poll.get("local_date") or local_date_str(datetime.datetime.utcnow(), str(user.get("timezone") or "UTC")))
+        await _sync_decided_dinner_to_meal_plan(db, hid, local_date, opts[idx], acting_user_id=int(user["id"]))
         title = str(opts[idx].get("title") or "")
         actor = str(user.get("name") or "Партнёр")
         p_kb = InlineKeyboardMarkup(
@@ -220,7 +258,7 @@ async def hh_vote_pick_cb(callback: types.CallbackQuery, db) -> None:
             f"🎉 <b>{html.escape(actor)}</b> зафиксировал(а) блюдо на сегодня: <b>{html.escape(title)}</b>!",
             reply_markup=p_kb,
         )
-    await callback.answer("Выбрано! 🎉")
+    await callback.answer("Выбрано и добавлено в меню! 🎉")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("hh:vote:"))
@@ -257,6 +295,8 @@ async def hh_vote_cast_cb(callback: types.CallbackQuery, db) -> None:
     actor = str(user.get("name") or "Партнёр")
     if len(members) >= 2 and chosen_opt:
         if unanimous:
+            local_date = str(poll.get("local_date") or local_date_str(datetime.datetime.utcnow(), str(user.get("timezone") or "UTC")))
+            await _sync_decided_dinner_to_meal_plan(db, hid, local_date, chosen_opt, acting_user_id=int(user["id"]))
             p_kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [

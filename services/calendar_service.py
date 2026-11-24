@@ -1460,6 +1460,14 @@ async def process_calendar_alerts_tick(
 
         # 1. Пред-событийные предупреждения (15-30м, с локацией 30-45м)
         ext_today = await repo.list_calendar_events_range(db, uid, local_date, local_date)
+        seen_event_keys = {
+            (
+                str(ev.get("event_date") or ""),
+                str(ev.get("start_time") or ""),
+                str(ev.get("title") or "").strip().casefold(),
+            )
+            for ev in ext_today
+        }
         for ev in ext_today:
             if ev.get("is_all_day") or ev.get("pre_alert_sent"):
                 continue
@@ -1486,6 +1494,44 @@ async def process_calendar_alerts_tick(
                         chat_id=getattr(getattr(sent_msg, "chat", None), "id", None),
                         message_id=getattr(sent_msg, "message_id", None),
                     )
+                    sent_count += 1
+                except Exception:
+                    pass
+
+        # 1b. Пред-событийные предупреждения для локальных событий расписания (schedule_events)
+        loc_today = rows_to_dicts(await repo.list_schedule_events(db, uid, local_date))
+        for lev in loc_today:
+            if lev.get("pre_alert_sent"):
+                continue
+            key = (
+                str(lev.get("event_date") or local_date),
+                str(lev.get("start_time") or ""),
+                str(lev.get("title") or "").strip().casefold(),
+            )
+            if key in seen_event_keys:
+                continue
+            bounds = _event_utc_bounds(
+                {
+                    "event_date": lev.get("event_date") or local_date,
+                    "start_time": lev.get("start_time"),
+                    "end_time": lev.get("end_time"),
+                    "is_all_day": 0,
+                },
+                tz,
+            )
+            if not bounds:
+                continue
+            st_utc, _ = bounds
+            mins_left = (st_utc - now).total_seconds() / 60.0
+            if 15.0 <= mins_left <= 30.0:
+                mins_int = max(1, int(round(mins_left)))
+                text_loc = (
+                    f"🗓 <b>Через {mins_int} мин: {html.escape(str(lev.get('title') or 'Событие'))}</b> "
+                    f"({html.escape(str(lev.get('start_time') or ''))}–{html.escape(str(lev.get('end_time') or ''))})"
+                )
+                try:
+                    await bot.send_message(chat_id=tg_id, text=text_loc, parse_mode="HTML")
+                    await repo.mark_schedule_event_alert_sent(db, int(lev["id"]))
                     sent_count += 1
                 except Exception:
                     pass

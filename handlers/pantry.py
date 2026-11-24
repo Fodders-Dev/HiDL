@@ -7,10 +7,15 @@ from utils.rows import rows_to_dicts
 from utils.user import ensure_user
 
 
-async def pantry_command(message: types.Message, db) -> None:
+async def pantry_command(
+    message: types.Message,
+    db,
+    tg_user_id: int | None = None,
+    tg_full_name: str | None = None,
+) -> None:
     """Backward-compat entrypoint for old `food:pantry` callbacks."""
-    tg_id = message.from_user.id if message.from_user else message.chat.id
-    full_name = message.from_user.full_name if message.from_user else "Друг"
+    tg_id = tg_user_id if tg_user_id is not None else (message.from_user.id if message.from_user else message.chat.id)
+    full_name = tg_full_name if tg_full_name is not None else (message.from_user.full_name if message.from_user else "Друг")
     user = await ensure_user(db, tg_id, full_name)
 
     rows_all = await repo.list_pantry_items(db, user["id"])

@@ -433,6 +433,7 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             category TEXT DEFAULT 'misc',
             source TEXT DEFAULT 'manual',
             external_key TEXT DEFAULT '',
+            pre_alert_sent INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -2172,6 +2173,7 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
             text TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'open',
             response_note TEXT DEFAULT '',
+            snooze_until_utc TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -2179,6 +2181,16 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
             ON household_requests(household_id, status, kind);
         """
     )
+
+    sched_ev_info = await conn.execute_fetchall("PRAGMA table_info(schedule_events);")
+    sched_ev_cols = {row["name"] for row in sched_ev_info}
+    if sched_ev_info and "pre_alert_sent" not in sched_ev_cols:
+        await conn.execute("ALTER TABLE schedule_events ADD COLUMN pre_alert_sent INTEGER DEFAULT 0;")
+
+    hh_req_info = await conn.execute_fetchall("PRAGMA table_info(household_requests);")
+    hh_req_cols = {row["name"] for row in hh_req_info}
+    if hh_req_info and "snooze_until_utc" not in hh_req_cols:
+        await conn.execute("ALTER TABLE household_requests ADD COLUMN snooze_until_utc TEXT DEFAULT '';")
 
     existing_articles = await conn.execute_fetchall(
         "SELECT title FROM knowledge_articles;"

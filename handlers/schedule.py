@@ -153,15 +153,29 @@ def _parse_weekdays(raw: str) -> str | None:
 
 
 def _schedule_keyboard(local_date: str, connected: bool = False, user: dict | None = None) -> InlineKeyboardMarkup:
+    try:
+        cur_dt = datetime.date.fromisoformat(local_date)
+    except ValueError:
+        cur_dt = datetime.date.today()
+    prev_d = (cur_dt - datetime.timedelta(days=1)).isoformat()
+    next_d = (cur_dt + datetime.timedelta(days=1)).isoformat()
+    today_d = local_date_str(datetime.datetime.utcnow(), (user or {}).get("timezone") or "UTC")
+
     gcal_row = [InlineKeyboardButton(text="🔗 Google Calendar", callback_data="sched:gcal")]
     if connected:
         gcal_row.append(InlineKeyboardButton(text="🔄 Синхр.", callback_data="sched:sync"))
     student = is_student_mode(user)
     rows = [
             [
-                InlineKeyboardButton(text="➕ Блок (работа/учёба/дорога)", callback_data="sched:add_block"),
-                InlineKeyboardButton(text="➕ Событие", callback_data="sched:add_event"),
+                InlineKeyboardButton(text="◀️ Пред.", callback_data=f"sched:date:{prev_d}"),
+                InlineKeyboardButton(text="📅 Сегодня", callback_data=f"sched:date:{today_d}"),
+                InlineKeyboardButton(text="След. ▶️", callback_data=f"sched:date:{next_d}"),
             ],
+            [
+                InlineKeyboardButton(text="➕ Блок (работа/учёба/дорога)", callback_data="sched:add_block"),
+                InlineKeyboardButton(text="➕ Событие", callback_data=f"sched:add_event:{local_date}"),
+            ],
+            [InlineKeyboardButton(text="🗑 Убрать блок/событие", callback_data=f"sched:manage:{local_date}")],
             gcal_row,
     ]
     if not student:
@@ -174,6 +188,42 @@ def _schedule_keyboard(local_date: str, connected: bool = False, user: dict | No
         rows.append([InlineKeyboardButton(text="⚡ Вставить спорт 30м", callback_data=f"sched:suggest:{local_date}:sport")])
     rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="main:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_schedule_manage(db, user: dict, target_date: str) -> tuple[str, InlineKeyboardMarkup]:
+    blocks = rows_to_dicts(await repo.list_schedule_blocks(db, user["id"]))
+    events = rows_to_dicts(await repo.list_schedule_events(db, user["id"], target_date))
+    rows: list[list[InlineKeyboardButton]] = []
+    lines = [f"🗑 <b>Управление расписанием ({target_date})</b>"]
+    if not events and not blocks:
+        lines.append("\nПока нет локальных событий и фиксированных блоков.")
+    else:
+        if events:
+            lines.append("\n<b>События на эту дату:</b>")
+            for ev in events[:12]:
+                title = str(ev.get("title") or "Событие")
+                when = f"{ev.get('start_time', '')}–{ev.get('end_time', '')}"
+                lines.append(f"• {when} — {html.escape(title)}")
+                rows.append([
+                    InlineKeyboardButton(
+                        text=f"🗑 {when} {title[:22]}",
+                        callback_data=f"sched:del_ev:{ev['id']}:{target_date}",
+                    )
+                ])
+        if blocks:
+            lines.append("\n<b>Постоянные блоки:</b>")
+            for b in blocks[:12]:
+                title = str(b.get("title") or "Блок")
+                when = f"{b.get('start_time', '')}–{b.get('end_time', '')}"
+                lines.append(f"• {when} — {html.escape(title)}")
+                rows.append([
+                    InlineKeyboardButton(
+                        text=f"🗑 Блок: {when} {title[:18]}",
+                        callback_data=f"sched:del_blk:{b['id']}:{target_date}",
+                    )
+                ])
+    rows.append([InlineKeyboardButton(text="⬅️ К расписанию", callback_data=f"sched:date:{target_date}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _render_schedule_text(db, user: dict, local_date: str) -> tuple[str, list[Interval], list[tuple[int, int]]]:
@@ -377,11 +427,43 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         await callback.answer("Отменила.")
         return
 
-    if action == "home":
+    if action in {"home", "date"}:
+        target_date = data[2] if action == "date" and len(data) > 2 else local_date
+        try:
+            datetime.date.fromisoformat(target_date)
+        except ValueError:
+            target_date = local_date
         conns = await repo.list_user_calendar_connections(db, user["id"], enabled_only=True)
-        text, _, _ = await _render_schedule_text(db, user, local_date)
-        await safe_edit(callback.message, text, reply_markup=_schedule_keyboard(local_date, connected=bool(conns), user=user), parse_mode="HTML")
+        text, _, _ = await _render_schedule_text(db, user, target_date)
+        await safe_edit(callback.message, text, reply_markup=_schedule_keyboard(target_date, connected=bool(conns), user=user), parse_mode="HTML")
         await callback.answer()
+        return
+
+    if action == "manage":
+        target_date = data[2] if len(data) > 2 else local_date
+        m_text, m_kb = await _render_schedule_manage(db, user, target_date)
+        await safe_edit(callback.message, m_text, reply_markup=m_kb, parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if action == "del_ev":
+        ev_id = int(data[2]) if len(data) > 2 and data[2].isdigit() else 0
+        target_date = data[3] if len(data) > 3 else local_date
+        if ev_id:
+            await repo.delete_schedule_event(db, user["id"], ev_id)
+        m_text, m_kb = await _render_schedule_manage(db, user, target_date)
+        await safe_edit(callback.message, m_text, reply_markup=m_kb, parse_mode="HTML")
+        await callback.answer("Событие удалено 🗑")
+        return
+
+    if action == "del_blk":
+        blk_id = int(data[2]) if len(data) > 2 and data[2].isdigit() else 0
+        target_date = data[3] if len(data) > 3 else local_date
+        if blk_id:
+            await repo.delete_schedule_block(db, user["id"], blk_id)
+        m_text, m_kb = await _render_schedule_manage(db, user, target_date)
+        await safe_edit(callback.message, m_text, reply_markup=m_kb, parse_mode="HTML")
+        await callback.answer("Блок удалён 🗑")
         return
 
     if action == "gcal":
@@ -449,9 +531,11 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         return
 
     if action == "add_event":
+        target_date = data[2] if len(data) > 2 else local_date
         await state.set_state(ScheduleState.add_event)
+        await state.update_data(sched_event_date=target_date)
         await callback.message.answer(
-            "Добавим событие на сегодня.\n"
+            f"Добавим событие на <b>{target_date}</b>.\n"
             "Напиши так:\n"
             "<b>Спорт; 19:00-19:30</b>",
             parse_mode="HTML",
@@ -466,7 +550,7 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
         if is_student_mode(user) and kind in {"cook", "shop"}:
             await callback.answer("Этот бытовой вариант скрыт в профиле ученика.", show_alert=True)
             return
-        text, _, slots = await _render_schedule_text(db, user, target_date)
+        _, _, slots = await _render_schedule_text(db, user, target_date)
         duration = {"sport": 30, "cook": 45, "shop": 60}.get(kind, 30)
         title = {"sport": "Спорт", "cook": "Готовка", "shop": "Покупки"}.get(kind, "Событие")
         picked = _pick_slot(slots, duration)
@@ -485,8 +569,14 @@ async def schedule_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             push_to_google=True,
         )
         conns = await repo.list_user_calendar_connections(db, user["id"], enabled_only=True)
-        await callback.message.answer(text, reply_markup=_schedule_keyboard(target_date, connected=bool(conns), user=user), parse_mode="HTML")
-        await callback.answer("Добавила")
+        refreshed_text, _, _ = await _render_schedule_text(db, user, target_date)
+        await safe_edit(
+            callback.message,
+            refreshed_text,
+            reply_markup=_schedule_keyboard(target_date, connected=bool(conns), user=user),
+            parse_mode="HTML",
+        )
+        await callback.answer(f"Добавила: {title} ({_from_min(a)}–{_from_min(b)})")
         return
 
     await callback.answer()
@@ -580,7 +670,8 @@ async def schedule_add_event(message: types.Message, state: FSMContext, db) -> N
     user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
     if await _handle_cancel(message, state, user):
         return
-    local_date = local_date_str(datetime.datetime.utcnow(), user["timezone"])
+    st_data = await state.get_data()
+    local_date = str(st_data.get("sched_event_date") or local_date_str(datetime.datetime.utcnow(), user["timezone"]))
     raw = (message.text or "").strip()
     parts = [p.strip() for p in raw.split(";")]
     if len(parts) < 2:

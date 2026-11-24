@@ -16,12 +16,22 @@ from keyboards.common import (
     settings_menu_keyboard,
 )
 from utils.menu_match import match_menu_label
+from utils.sender import safe_edit
 from utils.time import format_time_local, local_date_str
 from utils.tone import tone_message, tone_short_ack
 from utils.user import ensure_user
 from utils.today import render_today
 
 router = Router()
+
+
+def _cb_msg(callback: types.CallbackQuery) -> types.Message:
+    """Вернуть сообщение с подставленным callback.from_user (а не аккаунтом бота)."""
+    msg = callback.message
+    try:
+        return msg.model_copy(update={"from_user": callback.from_user})
+    except Exception:
+        return msg
 
 @router.callback_query(lambda c: c.data and c.data == "main:menu")
 async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext, db) -> None:
@@ -52,7 +62,7 @@ async def cmd_today(message: types.Message, db, state: FSMContext) -> None:
     user_row = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     user = dict(user_row)
     text, kb = await render_today(db, user)
-    await message.answer(text, reply_markup=kb or main_menu_keyboard(user))
+    await message.answer(text, reply_markup=kb or main_menu_keyboard(user), parse_mode="HTML")
 
 
 @router.message(Command("settings"))
@@ -164,7 +174,7 @@ async def today_menu(callback: types.CallbackQuery, db) -> None:
     user = dict(user_row)
     from utils.today import render_today
     text, kb = await render_today(db, user)
-    await callback.message.edit_text(text, reply_markup=kb)
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 
@@ -187,20 +197,26 @@ async def points_menu(message: types.Message, db, state: FSMContext) -> None:
 @router.callback_query(lambda c: c.data and c.data.startswith("food:"))
 async def food_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -> None:
     action = callback.data.split(":")[1]
+    msg = _cb_msg(callback)
     if action == "plate":
-        await guides.plate(callback.message, db)
+        await guides.plate(msg, db)
     elif action == "recipes":
-        await guides.recipes_fast(callback.message, db)
+        await guides.recipes_fast(msg, db)
     elif action == "meal_plan":
-        await guides.meal_plan(callback.message)
+        await guides.meal_plan(msg)
     elif action == "shoplist":
-        await guides.shoplist(callback.message)
+        await guides.shoplist(msg)
     elif action == "pantry":
         from handlers import pantry
 
-        await pantry.pantry_command(callback.message, db)
+        await pantry.pantry_command(
+            msg,
+            db,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+        )
     elif action == "expiring_recipes":
-        await guides._suggest_from_expiring(callback.message, db)  # noqa: SLF001
+        await guides._suggest_from_expiring(msg, db)  # noqa: SLF001
     await callback.answer()
 
 
@@ -261,7 +277,12 @@ async def home_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
     elif action == "points":
         from handlers import stats
 
-        await stats.stats(callback.message, db)
+        await stats.stats(
+            callback.message,
+            db,
+            tg_user_id=callback.from_user.id,
+            tg_full_name=callback.from_user.full_name,
+        )
     await callback.answer()
 
 
@@ -300,19 +321,27 @@ async def settings_callbacks(callback: types.CallbackQuery, db, state: FSMContex
         await callback.answer()
         return
     action = parts[1]
+    msg = _cb_msg(callback)
     if action == "gentle":
         from handlers import wellness
 
         # используем тот же сценарий, что и по слову «щадящий» в чате:
         # одно нажатие включает щадящий день, повторный — предложит /resume.
-        await wellness.gentle_button(callback.message, db)
+        await wellness.gentle_button(msg, db)
     elif action == "tone":
-        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
-        await callback.message.answer("Тон общения: выбери стиль в настройках ниже.", reply_markup=main_menu_keyboard(user))
+        from handlers import settings as settings_handler
+
+        await settings_handler.settings_select(
+            callback.model_copy(update={"data": "settings:main"}),
+            state=state,
+            db=db,
+            skip_answer=True,
+        )
+        return
     elif action == "wellness":
         from handlers import wellness
 
-        await wellness.wellness_settings(callback.message, db)
+        await wellness.wellness_settings(msg, db)
     elif action == "profile":
         from handlers import settings as settings_handler
 
@@ -381,5 +410,5 @@ async def more_callbacks(callback: types.CallbackQuery, db, state: FSMContext) -
 async def dmenu_plan_tomorrow(callback: types.CallbackQuery, state: FSMContext, db) -> None:
     from handlers import day_plan
     # Call the command handler logic directly
-    await day_plan.plan_tomorrow(callback.message, state, db)
+    await day_plan.plan_tomorrow(_cb_msg(callback), state, db)
     await callback.answer()
