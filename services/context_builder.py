@@ -370,13 +370,28 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
         trend = snapshot.get("body_trend") or {}
         latest_w = trend.get("latest") if isinstance(trend, dict) else None
         if isinstance(latest_w, dict) and latest_w.get("weight"):
-            w_bits = [f"{float(latest_w['weight']):.1f} кг"]
+            w_val = float(latest_w["weight"])
+            w_bits = [f"{w_val:.1f} кг"]
             if latest_w.get("body_fat_pct") is not None:
-                w_bits.append(f"жир {float(latest_w['body_fat_pct']):.1f}%")
+                bf_val = float(latest_w["body_fat_pct"])
+                w_bits.append(f"жир {bf_val:.1f}%")
+                if 5.0 <= bf_val <= 60.0:
+                    w_bits.append(f"сухая масса {round(w_val * (1.0 - bf_val / 100.0), 1)} кг")
             if latest_w.get("muscle_mass_kg") is not None:
                 w_bits.append(f"мышцы {float(latest_w['muscle_mass_kg']):.1f} кг")
+            if latest_w.get("water_pct") is not None:
+                w_bits.append(f"вода {float(latest_w['water_pct']):.1f}%")
+            if latest_w.get("visceral_fat") is not None:
+                w_bits.append(f"висц. жир {float(latest_w['visceral_fat']):g}")
+            if latest_w.get("bmi") is not None:
+                w_bits.append(f"ИМТ {float(latest_w['bmi']):.1f}")
             if trend.get("fat_delta") is not None:
                 w_bits.append(f"жир за {trend.get('days', 30)}д {float(trend['fat_delta']):+.1f}%")
+            raw_wc = _parse_iso(latest_w.get("created_at"))
+            if raw_wc is not None:
+                today_d = datetime.date.fromisoformat(snapshot["local_date"])
+                days_ago = max(0, (today_d - raw_wc.date()).days)
+                w_bits.append(f"замер {days_ago} дн. назад")
             lines.append("Тело/весы: " + ", ".join(w_bits) + ".")
         wk = snapshot.get("week_workouts") or {}
         eq = snapshot.get("equipment") or []

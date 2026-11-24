@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import base64
 import datetime
+import html as _html_mod
+import io
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from db import repositories as repo
 from llm_client import LLMClient, client as default_llm_client
-from services import karma_service, nutrition_web
+from services import coach_knowledge, karma_service, nutrition_web
 from utils.time import local_date_str
 
 EQUIPMENT_CATALOG: Tuple[Tuple[str, str, str], ...] = (
@@ -394,21 +396,56 @@ def calculate_daily_targets(
     if goal_raw not in GOAL_LABELS:
         goal_raw = "loss"
 
-    bmr = 10.0 * weight + 6.25 * h_val - 5.0 * age_val + sex_offset
+    bf_raw = (latest_weight or {}).get("body_fat_pct")
+    lean_mass_kg: Optional[float] = None
+    if weight > 0 and bf_raw is not None:
+        try:
+            bf_val = float(bf_raw)
+            if 5.0 <= bf_val <= 60.0:
+                lean_mass_kg = round(weight * (1.0 - bf_val / 100.0), 1)
+        except (TypeError, ValueError):
+            lean_mass_kg = None
+
+    if lean_mass_kg is not None and lean_mass_kg > 20.0:
+        bmr = 370.0 + 21.6 * lean_mass_kg
+        bmr_formula = "katch_mcardle"
+    else:
+        lean_mass_kg = None
+        bmr = 10.0 * weight + 6.25 * h_val - 5.0 * age_val + sex_offset
+        bmr_formula = "mifflin_st_jeor"
     tdee = bmr * mult
 
-    if goal_raw == "loss":
-        kcal = max(1350.0, tdee * 0.85)
-        protein_g = weight * 1.6
-    elif goal_raw == "recomp":
-        kcal = max(1450.0, tdee * 0.90)
-        protein_g = weight * 1.8
-    elif goal_raw == "gain":
-        kcal = tdee * 1.10
-        protein_g = weight * 1.7
+    if lean_mass_kg is not None:
+        if goal_raw == "loss":
+            kcal = max(1350.0, tdee * 0.85)
+            protein_g = lean_mass_kg * 1.9
+            fat_g = max(45.0, lean_mass_kg * 0.95)
+        elif goal_raw == "recomp":
+            kcal = max(1450.0, tdee * 0.90)
+            protein_g = lean_mass_kg * 2.1
+            fat_g = max(45.0, lean_mass_kg * 0.95)
+        elif goal_raw == "gain":
+            kcal = tdee * 1.10
+            protein_g = lean_mass_kg * 2.0
+            fat_g = max(50.0, lean_mass_kg * 1.0)
+        else:
+            kcal = tdee
+            protein_g = lean_mass_kg * 1.6
+            fat_g = max(45.0, lean_mass_kg * 0.95)
     else:
-        kcal = tdee
-        protein_g = weight * 1.3
+        if goal_raw == "loss":
+            kcal = max(1350.0, tdee * 0.85)
+            protein_g = weight * 1.6
+        elif goal_raw == "recomp":
+            kcal = max(1450.0, tdee * 0.90)
+            protein_g = weight * 1.8
+        elif goal_raw == "gain":
+            kcal = tdee * 1.10
+            protein_g = weight * 1.7
+        else:
+            kcal = tdee
+            protein_g = weight * 1.3
+        fat_g = max(40.0, weight * 0.85)
 
     try:
         custom_kcal = int(user.get("custom_kcal_target") or 0)
@@ -422,7 +459,6 @@ def calculate_daily_targets(
     kcal += workout_bonus_kcal
     protein_g += workout_bonus_protein
 
-    fat_g = max(40.0, weight * 0.85)
     carbs_g = max(80.0, (kcal - protein_g * 4.0 - fat_g * 9.0) / 4.0)
 
     return {
@@ -431,6 +467,9 @@ def calculate_daily_targets(
         "fat_g": int(round(fat_g)),
         "carbs_g": int(round(carbs_g)),
         "tdee": int(round(tdee)),
+        "bmr": int(round(bmr)),
+        "bmr_formula": bmr_formula,
+        "lean_mass_kg": lean_mass_kg,
         "goal": goal_raw,
         "goal_label": GOAL_LABELS[goal_raw],
         "activity_level": act_raw if act_raw in ACTIVITY_MULTIPLIERS else "light",
@@ -1354,13 +1393,28 @@ async def evaluate_meal_check(
     if client.is_configured():
         directive = get_coach_directive(user)
         pantry_line = ", ".join(pantry_names) if pantry_names else "холодильник не заполнен"
+        latest_w = await repo.get_latest_weight(db, int(user["id"]))
+        wellness_row = await repo.get_wellness(db, int(user["id"]))
+        meal_prof = str((dict(wellness_row) if wellness_row else {}).get("meal_profile") or "")
+        cards = coach_knowledge.select_coach_principles(
+            {
+                "latest": latest_w or {},
+                "nutrition_advice": {"targets": targets, "eaten": eaten},
+                "meal_profile": meal_prof,
+                "weight_goal": goal,
+            },
+            f"{dish.get('title', '')} {'перебор' if verdict == 'over' else ''}",
+            limit=1,
+        )
+        coach_hint = coach_knowledge.format_coach_knowledge_for_llm(cards)
         sys_p = (
             "Ты — коуч по питанию HiDL. Пользователь ещё НЕ съел блюдо, а примеряет его к своему дню. "
             "Ответь коротко (2–4 предложения, без ** и ## Markdown), опирайся ТОЛЬКО на точные цифры ниже и соблюдай стиль коуча."
         )
         usr_p = (
             f"{directive}\n"
-            f"Кандидат: {dish['title']} — ~{d_kcal} ккал (Б {d_p:g}г / Ж {d_f:g}г / У {d_c:g}г).\n"
+            + (f"{coach_hint}\n" if coach_hint else "")
+            + f"Кандидат: {dish['title']} — ~{d_kcal} ккал (Б {d_p:g}г / Ж {d_f:g}г / У {d_c:g}г).\n"
             f"Остаток дня ДО этого блюда: {rem['kcal']} ккал, белка добрать {rem['protein_g']} г, лимит жиров {rem['fat_g']} г.\n"
             f"До отбоя: {mins_left} мин.\n"
             f"Дома в холодильнике: {pantry_line}.\n"
@@ -1434,14 +1488,149 @@ async def evaluate_meal_check(
 
 
 _SCALE_PARSE_PROMPT = (
-    "Ты — парсер умных весов HiDL (Mi Fit, Zepp, Picooc, Huawei Health, Apple Health и др.). "
-    "Извлеки замеры с фото или из текста и верни строго JSON: "
-    "{\"weight\": float|null, \"body_fat_pct\": float|null, \"muscle_mass_kg\": float|null, "
-    "\"water_pct\": float|null, \"visceral_fat\": float|null, \"bmi\": float|null}."
+    "Ты — парсер умных весов HiDL (Xiaomi Mi Fitness, Zepp Life, Mi Fit, Picooc, Huawei Health, Apple Health). "
+    "Изображение может быть на русском ИЛИ английском языке, может быть длинным вертикальным отчётом, "
+    "нарезанным на несколько пересекающихся фрагментов (тогда объедини показатели со всех фрагментов), "
+    "или второй половиной экрана отчёта без цифры веса. "
+    "Верни строго JSON:\n"
+    "{\"is_scale_screen\": bool, \"weight\": float|null, \"body_fat_pct\": float|null, "
+    "\"muscle_mass_kg\": float|null, \"water_pct\": float|null, \"visceral_fat\": float|null, \"bmi\": float|null}.\n"
+    "Правила:\n"
+    "- is_scale_screen: true ТОЛЬКО если на фото экран/отчёт приложения умных весов или дисплей весов; "
+    "false для еды, чеков, этикеток, мемов и обычных фото.\n"
+    "- weight: текущий вес в кг (НЕ бери 'Стандартный вес'/'Контроль веса'/'Standard weight'/'Fat-free body weight'). "
+    "Если веса нет на экране, верни null.\n"
+    "- body_fat_pct: процент жира (%, 'Body fat percentage'/'Процент жировой массы тела'; НЕ путай с 'Fat mass' в кг и висцеральным жиром).\n"
+    "- muscle_mass_kg: мышцы строго в кг (предпочитай 'Muscle mass'/'Мышечная масса' в кг; если есть только 'Skeletal muscle mass'/'Масса скелетных мышц' в кг — бери её; "
+    "если есть только %, и виден weight — посчитай weight*pct/100; НЕ бери 'Fat-free body weight'/'Безжировая масса' и 'Protein mass').\n"
+    "- water_pct: % воды в организме ('Body water'/'Вода в организме' %; если указана только 'Body water mass' в кг и виден weight — посчитай water_kg/weight*100).\n"
+    "- visceral_fat: висцеральный жир ('Visceral fat rating'/'Уровень висцерального жира').\n"
+    "- bmi: ИМТ / BMI."
 )
 
 
-def _validate_scale_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _inspect_and_tile_scale_image(
+    image_bytes: bytes,
+    image_mime: str = "image/jpeg",
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Нарезать длинные вертикальные отчёты (например, Xiaomi 'Поделиться') с перекрытием и сохранить детали."""
+    b64_orig = base64.b64encode(image_bytes).decode("ascii")
+    fallback_urls = [f"data:{image_mime};base64,{b64_orig}"]
+    fallback_meta: Dict[str, Any] = {
+        "tiled": False,
+        "tile_count": 1,
+        "width": 0,
+        "height": 0,
+        "is_tall": False,
+        "is_low_res_tall": False,
+    }
+    try:
+        from PIL import Image
+    except Exception:
+        return fallback_urls, fallback_meta
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            w, h = img.size
+            if w <= 0 or h <= 0:
+                return fallback_urls, fallback_meta
+            aspect = h / float(w)
+            is_tall = aspect >= 2.1
+            is_low_res_tall = bool(is_tall and w < 350)
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+
+            if is_tall:
+                rgb = img.convert("RGB")
+                n_tiles = min(4, max(2, int(round(aspect / 1.5))))
+                base_step = h / float(n_tiles)
+                overlap = int(round(base_step * 0.14))
+                urls: List[str] = []
+                for idx in range(n_tiles):
+                    y0 = max(0, int(round(idx * base_step)) - (overlap if idx > 0 else 0))
+                    y1 = min(h, int(round((idx + 1) * base_step)) + (overlap if idx < n_tiles - 1 else 0))
+                    if y1 <= y0:
+                        continue
+                    crop = rgb.crop((0, y0, w, y1))
+                    tw, th = crop.size
+                    if w < 320:
+                        crop = crop.resize((tw * 2, th * 2), resample=resample)
+                    elif max(tw, th) > 1600:
+                        scale = 1600.0 / float(max(tw, th))
+                        crop = crop.resize(
+                            (max(1, int(round(tw * scale))), max(1, int(round(th * scale)))),
+                            resample=resample,
+                        )
+                    out_buf = io.BytesIO()
+                    if crop.width < 450:
+                        crop.save(out_buf, format="PNG", optimize=True)
+                        tile_mime = "image/png"
+                    else:
+                        crop.save(out_buf, format="JPEG", quality=92)
+                        tile_mime = "image/jpeg"
+                    urls.append(
+                        f"data:{tile_mime};base64,{base64.b64encode(out_buf.getvalue()).decode('ascii')}"
+                    )
+                if urls:
+                    return urls, {
+                        "tiled": len(urls) > 1,
+                        "tile_count": len(urls),
+                        "width": w,
+                        "height": h,
+                        "is_tall": True,
+                        "is_low_res_tall": is_low_res_tall,
+                    }
+
+            if max(w, h) > 2000:
+                rgb = img.convert("RGB")
+                scale = 2000.0 / float(max(w, h))
+                resized = rgb.resize(
+                    (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                    resample=resample,
+                )
+                out_buf = io.BytesIO()
+                resized.save(out_buf, format="JPEG", quality=92)
+                return [
+                    f"data:image/jpeg;base64,{base64.b64encode(out_buf.getvalue()).decode('ascii')}"
+                ], {
+                    "tiled": False,
+                    "tile_count": 1,
+                    "width": w,
+                    "height": h,
+                    "is_tall": False,
+                    "is_low_res_tall": False,
+                }
+
+            return fallback_urls, {
+                "tiled": False,
+                "tile_count": 1,
+                "width": w,
+                "height": h,
+                "is_tall": False,
+                "is_low_res_tall": False,
+            }
+    except Exception:
+        return fallback_urls, fallback_meta
+
+
+def is_tall_scale_like_image(image_bytes: bytes) -> bool:
+    """Вернуть True, если картинка похожа на длинный вертикальный экспорт приложения весов."""
+    if not image_bytes:
+        return False
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            w, h = img.size
+            return w > 0 and (h / float(w)) >= 2.1
+    except Exception:
+        return False
+
+
+def _validate_scale_payload(
+    raw: Dict[str, Any],
+    *,
+    allow_partial: bool = False,
+) -> Optional[Dict[str, Any]]:
     def _num(key: str, lo: float, hi: float) -> Optional[float]:
         val = raw.get(key)
         if val is None or val == "":
@@ -1455,15 +1644,18 @@ def _validate_scale_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
     weight = _num("weight", 25.0, 300.0)
-    if weight is None:
-        return None
     fat = _num("body_fat_pct", 3.0, 70.0)
     muscle = _num("muscle_mass_kg", 10.0, 120.0)
     water = _num("water_pct", 25.0, 80.0)
     visc = _num("visceral_fat", 1.0, 50.0)
     bmi = _num("bmi", 10.0, 70.0)
+    if weight is None:
+        if not allow_partial:
+            return None
+        if all(v is None for v in (fat, muscle, water, visc, bmi)):
+            return None
     return {
-        "weight": round(weight, 1),
+        "weight": round(weight, 1) if weight is not None else None,
         "body_fat_pct": fat,
         "muscle_mass_kg": muscle,
         "water_pct": water,
@@ -1510,73 +1702,197 @@ async def parse_smart_scale_input(
     image_bytes: Optional[bytes] = None,
     image_mime: str = "image/jpeg",
     llm_client_instance: Optional[LLMClient] = None,
+    require_scale_screen: bool = False,
+    allow_partial: bool = False,
 ) -> Dict[str, Any]:
-    """Распознать данные умных весов (вес, % жира, мышцы, вода) по скрину или тексту."""
+    """Распознать данные умных весов (вес, % жира, мышцы, вода, висц. жир, ИМТ) по фото/файлу или тексту."""
     client = llm_client_instance or default_llm_client
     clean_text = str(raw_text or "").strip()
 
     if image_bytes:
         if not client.is_configured():
             return {"ok": False, "error": "llm_not_configured"}
-        b64 = base64.b64encode(image_bytes).decode("ascii")
-        data_url = f"data:{image_mime};base64,{b64}"
+        data_urls, img_meta = _inspect_and_tile_scale_image(image_bytes, image_mime)
+        prompt_parts = ["Извлеки все доступные показатели состава тела с отчёта умных весов."]
+        if len(data_urls) > 1:
+            prompt_parts.append(
+                f"Это {len(data_urls)} перекрывающихся вертикальных фрагмента одного длинного отчёта (сверху вниз). Объедини все поля в один JSON."
+            )
+        if clean_text:
+            prompt_parts.append(f"Подпись пользователя: {clean_text}")
         res = await client.complete_json(
             _SCALE_PARSE_PROMPT,
-            "Извлеки все показатели с экрана умных весов.",
+            " ".join(prompt_parts),
             temperature=0.0,
-            max_tokens=400,
-            image_data_urls=[data_url],
+            max_tokens=500,
+            image_data_urls=data_urls,
         )
         if not res.ok or not isinstance(res.data, dict):
             return {"ok": False, "error": res.error or "vision_parse_failed"}
-        valid = _validate_scale_payload(res.data)
+        if require_scale_screen and res.data.get("is_scale_screen") is False:
+            return {"ok": False, "error": "not_scale_screen"}
+        valid = _validate_scale_payload(res.data, allow_partial=allow_partial)
         if not valid:
             return {"ok": False, "error": "no_scale_metrics"}
-        return {"ok": True, "used_llm": True, "source": "scale_photo", **valid}
+        extra_count = sum(
+            1
+            for k in ("body_fat_pct", "muscle_mass_kg", "water_pct", "visceral_fat", "bmi")
+            if valid.get(k) is not None
+        )
+        low_res_warning = bool(img_meta.get("is_low_res_tall") and extra_count < 2)
+        return {
+            "ok": True,
+            "used_llm": True,
+            "source": "scale_photo",
+            "partial": valid["weight"] is None,
+            "tiled": bool(img_meta.get("tiled")),
+            "tile_count": int(img_meta.get("tile_count") or 1),
+            "low_res_warning": low_res_warning,
+            **valid,
+        }
 
     if not clean_text:
         return {"ok": False, "error": "empty_input"}
 
     offline = _parse_scale_offline(clean_text)
     if offline:
-        has_extra = any(offline.get(k) is not None for k in ("body_fat_pct", "muscle_mass_kg", "water_pct"))
-        return {"ok": True, "used_llm": False, "source": "scale_text" if has_extra else "manual", **offline}
+        has_extra = any(offline.get(k) is not None for k in ("body_fat_pct", "muscle_mass_kg", "water_pct", "visceral_fat", "bmi"))
+        return {
+            "ok": True,
+            "used_llm": False,
+            "source": "scale_text" if has_extra else "manual",
+            "partial": False,
+            "tiled": False,
+            "tile_count": 1,
+            "low_res_warning": False,
+            **offline,
+        }
 
     if client.is_configured():
         res = await client.complete_json(
             _SCALE_PARSE_PROMPT,
             f"Извлеки замеры весов из текста:\n{clean_text}",
             temperature=0.0,
-            max_tokens=400,
+            max_tokens=450,
         )
         if res.ok and isinstance(res.data, dict):
-            valid = _validate_scale_payload(res.data)
+            valid = _validate_scale_payload(res.data, allow_partial=allow_partial)
             if valid:
-                return {"ok": True, "used_llm": True, "source": "scale_text", **valid}
+                return {
+                    "ok": True,
+                    "used_llm": True,
+                    "source": "scale_text",
+                    "partial": valid["weight"] is None,
+                    "tiled": False,
+                    "tile_count": 1,
+                    "low_res_warning": False,
+                    **valid,
+                }
 
     return {"ok": False, "error": "no_scale_metrics"}
 
 
 def format_body_trend_feedback(trend: Dict[str, Any], goal: str = "loss") -> str:
-    """Поддерживающий комментарий по тренду веса и состава тела без стыда."""
+    """Поддерживающий комментарий по тренду веса, воды, висц. жира и рекомпозиции."""
     w_d = trend.get("weight_delta")
     f_d = trend.get("fat_delta")
     m_d = trend.get("muscle_delta")
+    water_d = trend.get("water_delta")
+    visc_d = trend.get("visceral_delta")
+    latest = trend.get("latest") if isinstance(trend.get("latest"), dict) else {}
     count = int(trend.get("count") or 0)
+    visc_note = (
+        f" Висцеральный жир уже снизился на {visc_d:g}!"
+        if visc_d is not None and float(visc_d) <= -1.0
+        else ""
+    )
+
     if count < 2 or w_d is None:
+        visc_now = latest.get("visceral_fat")
+        if visc_now is not None and float(visc_now) >= 13.0:
+            return (
+                f"Точка отсчёта задана (висц. жир {float(visc_now):g} — отличный приоритет для снижения: "
+                "он уходит быстрее всего на шагах и умеренном дефиците)."
+            )
         return "Первые замеры задают точку отсчёта. Сравнивать будем спокойный тренд за 2–4 недели, а не разовые цифры."
 
     if f_d is not None and f_d <= -0.3 and w_d >= -0.4:
         muscle_note = f", а мышцы +{m_d:.1f} кг" if m_d is not None and m_d >= 0.2 else ""
         return (
             f"🔥 Отличная рекомпозиция: вес почти ровный ({w_d:+.1f} кг), "
-            f"но жир уже ушёл на {f_d:.1f}%{muscle_note}! Именно так тело подтягивается."
+            f"но жир уже ушёл на {f_d:.1f}%{muscle_note}! Именно так тело подтягивается.{visc_note}"
+        )
+    if w_d > 0.1 and ((water_d is not None and float(water_d) >= 0.3) or (f_d is not None and f_d <= 0.1)):
+        return (
+            f"💧 Плюс {w_d:+.1f} кг — это вода/гликоген или соль, а не жир (жир не вырос). "
+            "Не режь калории с паники, просто держи воду и режим сна."
         )
     if goal in {"loss", "recomp"} and w_d <= -0.4:
-        return f"📉 За {trend.get('days', 30)} дн. вес плавно снижается ({w_d:+.1f} кг) — здоровый темп без срывов."
+        return f"📉 За {trend.get('days', 30)} дн. вес плавно снижается ({w_d:+.1f} кг) — здоровый темп без срывов.{visc_note}"
     if goal == "loss" and 0.1 < w_d <= 1.0:
         return "💧 Небольшой плюс за короткий отрезок чаще всего даёт вода, соль или поздний ужин — смотрим на длинный тренд."
-    return f"📊 Тренд за {trend.get('days', 30)} дн.: {w_d:+.1f} кг. Держи ровный ритм без жёстких рамок."
+    return f"📊 Тренд за {trend.get('days', 30)} дн.: {w_d:+.1f} кг. Держи ровный ритм без жёстких рамок.{visc_note}"
+
+
+def format_scale_saved_summary(
+    row: Dict[str, Any],
+    trend: Dict[str, Any],
+    targets: Dict[str, Any],
+    goal: str = "loss",
+    *,
+    merged: bool = False,
+    low_res_warning: bool = False,
+    karma_note: str = "",
+    action_plan: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Собрать полный HTML-ответ после сохранения или дополнения замера весов."""
+    bits = [f"вес <b>{float(row['weight']):.1f} кг</b>"]
+    if row.get("body_fat_pct") is not None:
+        bits.append(f"жир <b>{float(row['body_fat_pct']):.1f}%</b>")
+    if row.get("muscle_mass_kg") is not None:
+        bits.append(f"мышцы <b>{float(row['muscle_mass_kg']):.1f} кг</b>")
+    if row.get("water_pct") is not None:
+        bits.append(f"вода {float(row['water_pct']):.1f}%")
+    if row.get("visceral_fat") is not None:
+        bits.append(f"висц. жир <b>{float(row['visceral_fat']):g}</b>")
+    if row.get("bmi") is not None:
+        bits.append(f"ИМТ {float(row['bmi']):.1f}")
+
+    head = "✅ <b>Дополнила свежий замер:</b>" if merged else "✅ <b>Записала замер:</b>"
+    lines = [f"{head} {', '.join(bits)}."]
+    if karma_note:
+        lines.append(_html_mod.escape(karma_note))
+    lines.append(_html_mod.escape(format_body_trend_feedback(trend, goal)))
+
+    lean_note = ""
+    if targets.get("lean_mass_kg") is not None and targets.get("bmr"):
+        lean_note = f"\n🧬 Сухая масса: <b>{targets['lean_mass_kg']} кг</b> · базовый обмен ~<b>{targets['bmr']} ккал</b>"
+
+    if not targets.get("mindful_mode"):
+        lines.append(
+            f"{lean_note}\n🔥 Ориентир КБЖУ: <b>{targets['kcal']} ккал</b> "
+            f"(Б {targets['protein_g']}г / Ж {targets['fat_g']}г / У {targets['carbs_g']}г)."
+        )
+
+    if isinstance(action_plan, dict) and (action_plan.get("diagnosis") or action_plan.get("action_today")):
+        lines.append("")
+        lines.append(f"🎯 <b>Тренер HiDL:</b> {_html_mod.escape(str(action_plan.get('diagnosis') or ''))}")
+        if action_plan.get("action_today"):
+            lines.append(f"👉 <b>Что делать сегодня:</b> {_html_mod.escape(str(action_plan['action_today']))}")
+        if action_plan.get("principle_title"):
+            src = f" ({action_plan['principle_source']})" if action_plan.get("principle_source") else ""
+            lines.append(f"<i>📚 {_html_mod.escape(str(action_plan['principle_title']) + src)}</i>")
+
+    if low_res_warning:
+        lines.append(
+            "\n💡 <i>Telegram сильно сжал длинный отчёт — мелкие цифры снизу могли размыться. "
+            "В следующий раз отправь «Поделиться» из Xiaomi <b>как файл (без сжатия)</b> или двумя обычными скринами.</i>"
+        )
+    elif not merged and any(row.get(k) is None for k in ("muscle_mass_kg", "water_pct", "visceral_fat")):
+        lines.append(
+            "\n💡 <i>Если мышцы, вода и висцеральный жир на втором экране — просто скинь второй скрин следом, я сама допишу их к этому замеру.</i>"
+        )
+    return "\n".join(lines).strip()
 
 
 _LAZY_WORKOUTS_BY_GEAR: Dict[str, List[Dict[str, Any]]] = {
@@ -1837,6 +2153,17 @@ async def generate_personal_workout(
     latest_weight = await repo.get_latest_weight(db, user_id)
     weight_txt = f"{latest_weight['weight']:.1f} кг" if latest_weight else "не указан"
     eq_human = format_equipment_labels(equipment)
+    cards = coach_knowledge.select_coach_principles(
+        {
+            "latest": latest_weight or {},
+            "week_workouts": week_stats,
+            "weight_goal": goal,
+            "activity_level": user.get("activity_level"),
+        },
+        "силовая тренировка новичок",
+        limit=1,
+    )
+    coach_hint = coach_knowledge.format_coach_knowledge_for_llm(cards)
     sys_prompt = (
         "Ты — бережный персональный тренер HiDL. Составь простую, безопасную домашнюю тренировку БЕЗ резкого хардкора. "
         "Ответь строго JSON-объектом вида: "
@@ -1848,6 +2175,7 @@ async def generate_personal_workout(
         f"Инвентарь дома: {eq_human}.\n"
         f"{get_coach_directive(user)} Вес: {weight_txt}.\n"
         f"Недавние акценты за неделю: {', '.join(recent_areas) or 'давно не тренировался'}."
+        + (f"\n{coach_hint}" if coach_hint else "")
     )
     res = await client.complete_json(sys_prompt, user_prompt, temperature=0.35, max_tokens=800)
     if res.ok and isinstance(res.data, dict):

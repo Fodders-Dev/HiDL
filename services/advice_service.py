@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from llm_client import LLMClient, client as default_llm_client
-from services import context_builder
+from services import coach_knowledge, context_builder
 
 ADVICE_PATH = Path(__file__).resolve().parents[1] / "data" / "knowledge" / "situational_advice.json"
 _CACHE: List[Dict[str, Any]] = []
@@ -211,16 +211,19 @@ async def build_situational_advice_reply(
     client = llm_client_instance or default_llm_client
     if is_rich_user_question and client.is_configured():
         ctx_block = context_builder.format_context_for_llm(snapshot)
+        principles = coach_knowledge.select_coach_principles(snapshot, clean_req, limit=2)
+        coach_block = coach_knowledge.format_coach_knowledge_for_llm(principles)
         sys_prompt = (
             "Ты — карманная помощница HiDL. Дай короткий, практичный, приземлённый совет по ситуации "
             "(3–5 предложений + 1 конкретный микро-шаг прямо сейчас). "
             "Пиши простым текстом без Markdown-разметки (без ** и ##). "
-            "Опирайся ТОЛЬКО на факты из снимка дня (время, отбой, задачи, холодильник, карма, цель/КБЖУ и стиль коуча) "
-            "и строго держи тон, указанный в режиме кармы и коуча. Не выдумывай несуществующие события или рецепты."
+            "Опирайся ТОЛЬКО на факты из снимка дня (время, отбой, задачи, холодильник, карма, замеры тела, цель/КБЖУ и стиль коуча) "
+            "и научно-практические принципы тренера ниже; строго держи тон режима кармы и коуча. Не выдумывай несуществующие события или рецепты."
         )
         usr_prompt = (
             f"{ctx_block}\n\n"
-            f"Ориентир-карточка: {card.get('title')} — {card.get('micro_step')}\n\n"
+            + (f"{coach_block}\n\n" if coach_block else "")
+            + f"Ориентир-карточка: {card.get('title')} — {card.get('micro_step')}\n\n"
             f"Запрос пользователя:\n{clean_req}"
         )
         res = await client.complete_text(sys_prompt, usr_prompt, temperature=0.35, max_tokens=280)

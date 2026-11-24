@@ -16,7 +16,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboar
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import advice_service, fitness_nutrition, inbox_service, pulse_service
+from services import advice_service, coach_knowledge, fitness_nutrition, inbox_service, karma_service, pulse_service
 from services.inbox_parser import resolve_temporal_expression
 from utils.menu_match import match_menu_label
 from utils.profile import is_student_mode
@@ -102,27 +102,179 @@ async def handle_voice_inbox(message: types.Message, state: FSMContext, db) -> N
     )
 
 
-@router.message(StateFilter(None), F.photo)
-async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db) -> None:
-    """Обработать фото тарелки, этикетки или умных весов прямо из общего чата."""
-    if await state.get_state():
-        return
-    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
-    if is_student_mode(user):
-        return
-    photo = message.photo[-1]
+_SCALE_CAPTION_KEYWORDS = (
+    "вес",
+    "весы",
+    "жир",
+    "мышц",
+    "scale",
+    "xiaomi",
+    "имт",
+    "bmi",
+    "mi fit",
+    "zepp",
+)
+
+
+def _is_image_document(doc: Any) -> tuple[bool, str]:
+    if doc is None:
+        return False, "image/jpeg"
+    fsize = getattr(doc, "file_size", None)
+    if fsize is not None and int(fsize) > 15 * 1024 * 1024:
+        return False, "image/jpeg"
+    mime = str(getattr(doc, "mime_type", "") or "").strip().lower()
+    fname = str(getattr(doc, "file_name", "") or "").strip().lower()
+    if mime.startswith("image/"):
+        return True, mime
+    if fname.endswith(".png"):
+        return True, "image/png"
+    if fname.endswith((".jpg", ".jpeg")):
+        return True, "image/jpeg"
+    if fname.endswith(".webp"):
+        return True, "image/webp"
+    return False, "image/jpeg"
+
+
+async def _download_telegram_file_bytes(bot, file_obj) -> bytes:
     buf = io.BytesIO()
-    dl = await message.bot.download(photo, destination=buf)
+    dl = await bot.download(file_obj, destination=buf)
     img_bytes = buf.getvalue()
     if not img_bytes and dl is not None:
         if hasattr(dl, "getvalue"):
             img_bytes = dl.getvalue()
         elif isinstance(dl, (bytes, bytearray)):
             img_bytes = bytes(dl)
-    if not img_bytes:
-        await message.answer("Не удалось загрузить фото — попробуй ещё раз или напиши текстом.")
-        return
+    return img_bytes
 
+
+async def _save_and_reply_scale(
+    message: types.Message,
+    db,
+    user: dict[str, Any],
+    scale_res: dict[str, Any],
+    now_utc: datetime.datetime,
+    *,
+    explicit_scale: bool = False,
+) -> bool:
+    uid = int(user["id"])
+    local_date = local_date_str(now_utc, user.get("timezone") or "UTC")
+    is_partial = bool(scale_res.get("partial") or scale_res.get("weight") is None)
+    merged = False
+    karma_note = ""
+
+    if is_partial:
+        merged_row = await repo.merge_recent_weight_metrics(
+            db,
+            uid,
+            body_fat_pct=scale_res.get("body_fat_pct"),
+            muscle_mass_kg=scale_res.get("muscle_mass_kg"),
+            water_pct=scale_res.get("water_pct"),
+            visceral_fat=scale_res.get("visceral_fat"),
+            bmi=scale_res.get("bmi"),
+            now_utc=now_utc,
+        )
+        if merged_row is None:
+            if explicit_scale:
+                await message.answer(
+                    "⚖ Вижу показатели состава тела, но не нашла недавний замер веса за последние 2 часа.\n"
+                    "Сначала скинь первый скрин с весом или напиши вес числом (например <code>99.2</code>).",
+                    parse_mode="HTML",
+                )
+                return True
+            return False
+        saved_row = merged_row
+        merged = True
+    else:
+        await repo.add_weight(
+            db,
+            uid,
+            float(scale_res["weight"]),
+            body_fat_pct=scale_res.get("body_fat_pct"),
+            muscle_mass_kg=scale_res.get("muscle_mass_kg"),
+            water_pct=scale_res.get("water_pct"),
+            visceral_fat=scale_res.get("visceral_fat"),
+            bmi=scale_res.get("bmi"),
+            source=str(scale_res.get("source") or "scale_photo"),
+        )
+        saved_row = {
+            "weight": float(scale_res["weight"]),
+            "body_fat_pct": scale_res.get("body_fat_pct"),
+            "muscle_mass_kg": scale_res.get("muscle_mass_kg"),
+            "water_pct": scale_res.get("water_pct"),
+            "visceral_fat": scale_res.get("visceral_fat"),
+            "bmi": scale_res.get("bmi"),
+        }
+        already_done = await repo.has_karma_event_today(db, uid, local_date, "weigh_in_done")
+        if not already_done:
+            await repo.add_points(db, uid, 3, local_date=local_date)
+            kres = await karma_service.record_karma_event(
+                db,
+                user,
+                domain="tasks",
+                event_type="weigh_in_done",
+                delta=3,
+                reason="Замер на умных весах",
+                now_utc=now_utc,
+            )
+            karma_note = f"✨ +3 кармы за дисциплину замера ({kres.get('score_after', 70)}/100)."
+
+    trend = await repo.body_metrics_trend(db, uid, days=30)
+    week_stats = await repo.workout_stats_week(db, uid, local_date)
+    targets = fitness_nutrition.calculate_daily_targets(
+        user,
+        trend.get("latest") or saved_row,
+        workout_kcal_today=int(week_stats.get("today_kcal_burned") or 0),
+    )
+    wellness_row = await repo.get_wellness(db, uid)
+    meal_profile = str((dict(wellness_row) if wellness_row else {}).get("meal_profile") or "")
+    nutrition_advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
+    action_plan = coach_knowledge.build_body_action_plan(
+        latest=trend.get("latest") or saved_row,
+        trend=trend,
+        week_workouts=week_stats,
+        nutrition_advice=nutrition_advice,
+        user=user,
+        meal_profile=meal_profile,
+    )
+
+    msg_text = fitness_nutrition.format_scale_saved_summary(
+        saved_row,
+        trend,
+        targets,
+        str(user.get("weight_goal") or "loss"),
+        merged=merged,
+        low_res_warning=bool(scale_res.get("low_res_warning")),
+        karma_note=karma_note,
+        action_plan=action_plan,
+    )
+
+    rows = [
+        [
+            InlineKeyboardButton(text="⚖ Тело и весы", callback_data="fit:body"),
+            InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+        ]
+    ]
+    row2 = []
+    if not merged and any(saved_row.get(k) is None for k in ("muscle_mass_kg", "water_pct", "visceral_fat")):
+        row2.append(InlineKeyboardButton(text="➕ Дополнить 2-м скрином", callback_data="fit:scale_add"))
+    if action_plan.get("suggest_lazy_workout"):
+        row2.append(InlineKeyboardButton(text="🫠 3 мин старт", callback_data="fit:lazy"))
+    else:
+        row2.append(InlineKeyboardButton(text="📚 База тренера", callback_data="fit:playbook"))
+    if row2:
+        rows.append(row2)
+    await message.answer(msg_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    return True
+
+
+async def _process_unsolicited_image(
+    message: types.Message,
+    state: FSMContext,
+    db,
+    user: dict[str, Any],
+    img_bytes: bytes,
+    image_mime: str,
+) -> None:
     uid = int(user["id"])
     caption = (message.caption or "").strip()
     low_cap = caption.lower()
@@ -135,7 +287,7 @@ async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db
         parsed = await fitness_nutrition.parse_meal_input(
             raw_text=combined_cap,
             image_bytes=img_bytes,
-            image_mime="image/jpeg",
+            image_mime=image_mime,
             db=db,
             user_id=uid,
             allow_clarification=False,
@@ -166,49 +318,105 @@ async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db
             )
             return
 
-    # 2. Если в подписи явно про весы/замер тела -> распознаём умные весы
-    if any(w in low_cap for w in ("вес", "весы", "жир", "мышц", "scale")):
+    # 2. Если в подписи явно про весы/замер тела -> распознаём умные весы (включая 2-й скрин)
+    if any(w in low_cap for w in _SCALE_CAPTION_KEYWORDS):
         scale_res = await fitness_nutrition.parse_smart_scale_input(
             raw_text=caption,
             image_bytes=img_bytes,
-            image_mime="image/jpeg",
+            image_mime=image_mime,
+            allow_partial=True,
         )
         if scale_res.get("ok"):
-            await repo.add_weight(
-                db,
-                uid,
-                float(scale_res["weight"]),
-                body_fat_pct=scale_res.get("body_fat_pct"),
-                muscle_mass_kg=scale_res.get("muscle_mass_kg"),
-                water_pct=scale_res.get("water_pct"),
-                visceral_fat=scale_res.get("visceral_fat"),
-                bmi=scale_res.get("bmi"),
-                source=str(scale_res.get("source") or "scale_photo"),
-            )
-            trend = await repo.body_metrics_trend(db, uid, days=30)
-            fb = fitness_nutrition.format_body_trend_feedback(trend, str(user.get("weight_goal") or "loss"))
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="⚖ Тело и весы", callback_data="fit:body")]]
-            )
-            await message.answer(
-                f"⚖ Записала замер с фото: <b>{float(scale_res['weight']):.1f} кг</b>.\n{_esc(fb)}",
-                reply_markup=kb,
-                parse_mode="HTML",
-            )
-            return
+            if await _save_and_reply_scale(message, db, user, scale_res, now_utc, explicit_scale=True):
+                return
+        await message.answer(
+            "⚖ Не смогла разобрать цифры с весов. Отправь отчёт Xiaomi <b>как файл (без сжатия)</b> или впиши вес текстом (например <code>99.2</code>).",
+            parse_mode="HTML",
+        )
+        return
 
-    # 3. Обычное фото еды или этикетки из чата -> показываем 1-тап превью КБЖУ
+    # 3. Быстрый путь для длинного вертикального экспорта Xiaomi без подписи -> сразу проверяем весы
+    checked_scale_first = False
+    if not caption and fitness_nutrition.is_tall_scale_like_image(img_bytes):
+        checked_scale_first = True
+        scale_res = await fitness_nutrition.parse_smart_scale_input(
+            raw_text="",
+            image_bytes=img_bytes,
+            image_mime=image_mime,
+            require_scale_screen=True,
+            allow_partial=True,
+        )
+        if scale_res.get("ok"):
+            if await _save_and_reply_scale(message, db, user, scale_res, now_utc, explicit_scale=True):
+                return
+
+    # 4. Обычное фото еды или этикетки из чата -> показываем 1-тап превью КБЖУ
     from handlers import nutrition
 
     parsed_meal = await fitness_nutrition.parse_meal_input(
         raw_text=caption,
         image_bytes=img_bytes,
-        image_mime="image/jpeg",
+        image_mime=image_mime,
         db=db,
         user_id=uid,
         allow_clarification=False,
     )
+    if parsed_meal.get("ok"):
+        await nutrition._show_meal_preview(message, state, parsed_meal)
+        return
+
+    # 5. Если еда не распознана и экран весов ещё не проверяли -> авто-проверка на скрин весов (1-й или 2-й экран)
+    if parsed_meal.get("error") == "no_meal_found" and not checked_scale_first:
+        scale_res = await fitness_nutrition.parse_smart_scale_input(
+            raw_text=caption,
+            image_bytes=img_bytes,
+            image_mime=image_mime,
+            require_scale_screen=True,
+            allow_partial=True,
+        )
+        if scale_res.get("ok"):
+            handled = await _save_and_reply_scale(message, db, user, scale_res, now_utc, explicit_scale=False)
+            if handled:
+                return
+            await message.answer(
+                "⚖ Вижу показатели состава тела, но на этом скрине нет веса — скинь сначала верхний экран с весом или напиши число.",
+            )
+            return
+
     await nutrition._show_meal_preview(message, state, parsed_meal)
+
+
+@router.message(StateFilter(None), F.photo)
+async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db) -> None:
+    """Обработать фото тарелки, этикетки или умных весов прямо из общего чата."""
+    if await state.get_state():
+        return
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    if is_student_mode(user):
+        return
+    img_bytes = await _download_telegram_file_bytes(message.bot, message.photo[-1])
+    if not img_bytes:
+        await message.answer("Не удалось загрузить фото — попробуй ещё раз или напиши текстом.")
+        return
+    await _process_unsolicited_image(message, state, db, user, img_bytes, "image/jpeg")
+
+
+@router.message(StateFilter(None), F.document)
+async def handle_unsolicited_image_document(message: types.Message, state: FSMContext, db) -> None:
+    """Обработать картинку, отправленную в общий чат как файл без сжатия (например, отчёт Xiaomi)."""
+    if await state.get_state():
+        return
+    is_img, mime = _is_image_document(getattr(message, "document", None))
+    if not is_img:
+        return
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    if is_student_mode(user):
+        return
+    img_bytes = await _download_telegram_file_bytes(message.bot, message.document)
+    if not img_bytes:
+        await message.answer("Не удалось скачать файл изображения — попробуй ещё раз.")
+        return
+    await _process_unsolicited_image(message, state, db, user, img_bytes, mime)
 
 
 def _build_edit_list_view(

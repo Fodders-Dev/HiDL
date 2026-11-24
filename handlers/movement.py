@@ -15,8 +15,9 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard, movement_menu_keyboard
-from services import fitness_nutrition
+from services import coach_knowledge, fitness_nutrition, karma_service
 from utils import texts
+from utils.profile import is_student_mode
 from utils.sender import safe_edit
 from utils.time import local_date_str
 from utils.user import ensure_user
@@ -99,6 +100,17 @@ async def _render_body_card(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboa
     daily_targets = fitness_nutrition.calculate_daily_targets(
         user, latest, workout_kcal_today=int(week_stats.get("today_kcal_burned") or 0)
     )
+    wellness_row = await repo.get_wellness(db, user_id)
+    meal_profile = str((dict(wellness_row) if wellness_row else {}).get("meal_profile") or "")
+    nutrition_advice = await fitness_nutrition.get_daily_nutrition_advice(db, user)
+    plan = coach_knowledge.build_body_action_plan(
+        latest=latest,
+        trend=trend,
+        week_workouts=week_stats,
+        nutrition_advice=nutrition_advice,
+        user=user,
+        meal_profile=meal_profile,
+    )
 
     lines = ["⚖ <b>Умные весы и параметры тела</b> (строго личное, партнёр не видит)"]
     if latest:
@@ -116,8 +128,12 @@ async def _render_body_card(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboa
             extra_bits.append(f"ИМТ {float(latest['bmi']):.1f}")
         if extra_bits:
             lines.append("• Состав: " + " · ".join(extra_bits))
+        if daily_targets.get("lean_mass_kg") is not None and daily_targets.get("bmr"):
+            lines.append(
+                f"• Сухая масса: <b>{daily_targets['lean_mass_kg']} кг</b> · базовый обмен ~{daily_targets['bmr']} ккал"
+            )
     else:
-        lines.append("• Замеров пока нет — можно вбить числом или скинуть скриншот с весов.")
+        lines.append("• Замеров пока нет — скинь скрин/файл из Xiaomi или вбей число.")
 
     profile_bits = []
     if height:
@@ -134,11 +150,18 @@ async def _render_body_card(db, user: Dict[str, Any]) -> tuple[str, InlineKeyboa
         f"(Б {daily_targets['protein_g']}г / Ж {daily_targets['fat_g']}г / У {daily_targets['carbs_g']}г)"
     )
     lines.append("\n" + _h(fitness_nutrition.format_body_trend_feedback(trend, goal)))
+    if plan.get("diagnosis"):
+        lines.append(f"\n🎯 <b>Тренер HiDL:</b> {_h(plan['diagnosis'])}")
+    if plan.get("action_today"):
+        lines.append(f"👉 <b>Сегодня:</b> {_h(plan['action_today'])}")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📸 Загрузить весы (фото / текст)", callback_data="fit:scale_add")],
-            [InlineKeyboardButton(text="⚙️ Анкета тела и цель", callback_data="fit:profile_setup")],
+            [InlineKeyboardButton(text="📸 Загрузить весы (файл / скрин / текст)", callback_data="fit:scale_add")],
+            [
+                InlineKeyboardButton(text="📚 База тренера", callback_data="fit:playbook"),
+                InlineKeyboardButton(text="⚙️ Анкета тела", callback_data="fit:profile_setup"),
+            ],
             [
                 InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
                 InlineKeyboardButton(text="🎯 Цель и коуч", callback_data="fit:coach_menu"),
@@ -482,11 +505,11 @@ async def fit_scale_add_start(callback: types.CallbackQuery, state: FSMContext) 
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="fit:scale_cancel")]]
     )
     await callback.message.answer(
-        "📸 <b>Умные весы</b>\n\n"
-        "Пришли <b>скриншот из приложения весов</b> (Mi Fit / Zepp / Picooc / Apple Health) "
-        "или напиши замер <b>текстом</b>, например:\n"
-        "• <code>84.2 жир 23.5% мышцы 58.1 вода 55%</code>\n"
-        "• или просто <code>84.2</code>",
+        "📸 <b>Умные весы (Xiaomi / Mi Fitness / Zepp / др.)</b>\n\n"
+        "Как удобнее загрузить:\n"
+        "• длинный отчёт «Поделиться» отправь <b>как файл (без сжатия)</b> — тогда я вытащу все показатели за один раз;\n"
+        "• либо пришли 1–2 обычных скрина (верх с весом, затем низ с мышцами/водой — я сама склею их в один замер);\n"
+        "• либо напиши текстом: <code>99.2 жир 29% мышцы 66.6</code> или просто <code>99.2</code>.",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -502,6 +525,52 @@ async def fit_scale_cancel(callback: types.CallbackQuery, state: FSMContext, db)
     await callback.answer("Отменено")
 
 
+@router.callback_query(lambda c: c.data == "fit:weigh_skip")
+async def fit_weigh_skip_cb(callback: types.CallbackQuery) -> None:
+    await safe_edit(
+        callback.message,
+        "⏭ Ок, зафиксировала. Напомню утром — главное не пропадай с весов на неделю!",
+    )
+    await callback.answer()
+
+
+def _scale_doc_mime(doc: Any) -> Optional[str]:
+    if doc is None:
+        return None
+    fsize = getattr(doc, "file_size", None)
+    if fsize is not None and int(fsize) > 15 * 1024 * 1024:
+        return None
+    mime = str(getattr(doc, "mime_type", "") or "").strip().lower()
+    fname = str(getattr(doc, "file_name", "") or "").strip().lower()
+    if mime.startswith("image/"):
+        return mime
+    if fname.endswith(".png"):
+        return "image/png"
+    if fname.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if fname.endswith(".webp"):
+        return "image/webp"
+    return None
+
+
+async def _download_scale_doc(message: types.Message) -> Optional[tuple[bytes, str]]:
+    doc = getattr(message, "document", None)
+    mime = _scale_doc_mime(doc)
+    if not mime:
+        return None
+    buf = io.BytesIO()
+    dl = await message.bot.download(doc, destination=buf)
+    img_bytes = buf.getvalue()
+    if not img_bytes and dl is not None:
+        if hasattr(dl, "getvalue"):
+            img_bytes = dl.getvalue()
+        elif isinstance(dl, (bytes, bytearray)):
+            img_bytes = bytes(dl)
+    if not img_bytes:
+        return None
+    return img_bytes, mime
+
+
 async def _commit_scale_parsed(message: types.Message, state: FSMContext, db, parsed: Dict[str, Any]) -> None:
     cancel_kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="fit:scale_cancel")]]
@@ -509,61 +578,125 @@ async def _commit_scale_parsed(message: types.Message, state: FSMContext, db, pa
     if not parsed.get("ok"):
         err = parsed.get("error") or ""
         hint = (
-            "ИИ-распознавание фото сейчас недоступно — введи вес и показатели текстом, например: <code>84.2 жир 23.5% мышцы 58.1</code>."
+            "ИИ-распознавание фото сейчас недоступно — введи вес и показатели текстом, например: <code>99.2 жир 29% мышцы 66.6</code>."
             if err in {"llm_not_configured", "vision_parse_failed"}
-            else "Не смогла прочитать вес. Напиши число (например <code>84.2</code> или <code>84.2 жир 23% мышцы 58</code>)."
+            else "Не смогла прочитать вес. Напиши число (например <code>99.2</code> или <code>99.2 жир 29% мышцы 66.6</code>) или скинь верхний скрин с весом."
         )
         await message.answer(hint, reply_markup=cancel_kb, parse_mode="HTML")
         return
 
     user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
     user_id = int(user["id"])
-    await repo.add_weight(
-        db,
-        user_id,
-        float(parsed["weight"]),
-        body_fat_pct=parsed.get("body_fat_pct"),
-        muscle_mass_kg=parsed.get("muscle_mass_kg"),
-        water_pct=parsed.get("water_pct"),
-        visceral_fat=parsed.get("visceral_fat"),
-        bmi=parsed.get("bmi"),
-        source=str(parsed.get("source") or "manual"),
-    )
+    now_utc = datetime.datetime.utcnow()
+    local_date = local_date_str(now_utc, user.get("timezone") or "UTC")
+    is_partial = bool(parsed.get("partial") or parsed.get("weight") is None)
+    merged = False
+    karma_note = ""
+
+    if is_partial:
+        merged_row = await repo.merge_recent_weight_metrics(
+            db,
+            user_id,
+            body_fat_pct=parsed.get("body_fat_pct"),
+            muscle_mass_kg=parsed.get("muscle_mass_kg"),
+            water_pct=parsed.get("water_pct"),
+            visceral_fat=parsed.get("visceral_fat"),
+            bmi=parsed.get("bmi"),
+            now_utc=now_utc,
+        )
+        if merged_row is None:
+            await message.answer(
+                "⚖ Вижу показатели состава тела, но не нашла недавний замер веса за последние 2 часа.\n"
+                "Сначала скинь первый скрин с весом или просто напиши вес числом (например <code>99.2</code>).",
+                reply_markup=cancel_kb,
+                parse_mode="HTML",
+            )
+            return
+        saved_row = merged_row
+        merged = True
+    else:
+        await repo.add_weight(
+            db,
+            user_id,
+            float(parsed["weight"]),
+            body_fat_pct=parsed.get("body_fat_pct"),
+            muscle_mass_kg=parsed.get("muscle_mass_kg"),
+            water_pct=parsed.get("water_pct"),
+            visceral_fat=parsed.get("visceral_fat"),
+            bmi=parsed.get("bmi"),
+            source=str(parsed.get("source") or "manual"),
+        )
+        saved_row = {
+            "weight": float(parsed["weight"]),
+            "body_fat_pct": parsed.get("body_fat_pct"),
+            "muscle_mass_kg": parsed.get("muscle_mass_kg"),
+            "water_pct": parsed.get("water_pct"),
+            "visceral_fat": parsed.get("visceral_fat"),
+            "bmi": parsed.get("bmi"),
+        }
+        if not is_student_mode(user):
+            already_done = await repo.has_karma_event_today(db, user_id, local_date, "weigh_in_done")
+            if not already_done:
+                await repo.add_points(db, user_id, 3, local_date=local_date)
+                kres = await karma_service.record_karma_event(
+                    db,
+                    user,
+                    domain="tasks",
+                    event_type="weigh_in_done",
+                    delta=3,
+                    reason="Замер на умных весах",
+                    now_utc=now_utc,
+                )
+                karma_note = f"✨ +3 кармы за дисциплину замера ({kres.get('score_after', 70)}/100)."
+
     await state.clear()
 
     trend = await repo.body_metrics_trend(db, user_id, days=30)
-    local_date = local_date_str(datetime.datetime.utcnow(), user.get("timezone") or "UTC")
     week_stats = await repo.workout_stats_week(db, user_id, local_date)
     targets = fitness_nutrition.calculate_daily_targets(
         user,
-        trend.get("latest"),
+        trend.get("latest") or saved_row,
         workout_kcal_today=int(week_stats.get("today_kcal_burned") or 0),
     )
+    wellness_row = await repo.get_wellness(db, user_id)
+    meal_profile = str((dict(wellness_row) if wellness_row else {}).get("meal_profile") or "")
+    nutrition_advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
+    action_plan = coach_knowledge.build_body_action_plan(
+        latest=trend.get("latest") or saved_row,
+        trend=trend,
+        week_workouts=week_stats,
+        nutrition_advice=nutrition_advice,
+        user=user,
+        meal_profile=meal_profile,
+    )
 
-    bits = [f"вес <b>{float(parsed['weight']):.1f} кг</b>"]
-    if parsed.get("body_fat_pct") is not None:
-        bits.append(f"жир {float(parsed['body_fat_pct']):.1f}%")
-    if parsed.get("muscle_mass_kg") is not None:
-        bits.append(f"мышцы {float(parsed['muscle_mass_kg']):.1f} кг")
-    if parsed.get("water_pct") is not None:
-        bits.append(f"вода {float(parsed['water_pct']):.1f}%")
+    msg_text = fitness_nutrition.format_scale_saved_summary(
+        saved_row,
+        trend,
+        targets,
+        str(user.get("weight_goal") or "loss"),
+        merged=merged,
+        low_res_warning=bool(parsed.get("low_res_warning")),
+        karma_note=karma_note,
+        action_plan=action_plan,
+    )
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⚖ К карте тела", callback_data="fit:body"),
-                InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
-            ]
+    rows = [
+        [
+            InlineKeyboardButton(text="⚖ К карте тела", callback_data="fit:body"),
+            InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
         ]
-    )
-    await message.answer(
-        f"✅ Записала замер: {', '.join(bits)}.\n"
-        f"{_h(fitness_nutrition.format_body_trend_feedback(trend, str(user.get('weight_goal') or 'loss')))}\n\n"
-        f"🔥 Обновлённый ориентир на день: <b>{targets['kcal']} ккал</b> "
-        f"(Б {targets['protein_g']}г / Ж {targets['fat_g']}г / У {targets['carbs_g']}г).",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    ]
+    row2 = []
+    if not merged and any(saved_row.get(k) is None for k in ("muscle_mass_kg", "water_pct", "visceral_fat")):
+        row2.append(InlineKeyboardButton(text="➕ Дополнить 2-м скрином", callback_data="fit:scale_add"))
+    if action_plan.get("suggest_lazy_workout"):
+        row2.append(InlineKeyboardButton(text="🫠 3 мин старт", callback_data="fit:lazy"))
+    else:
+        row2.append(InlineKeyboardButton(text="📚 База тренера", callback_data="fit:playbook"))
+    if row2:
+        rows.append(row2)
+    await message.answer(msg_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
 
 @router.message(ScaleImportState.waiting_input, F.photo)
@@ -581,8 +714,125 @@ async def fit_scale_photo(message: types.Message, state: FSMContext, db) -> None
         raw_text=message.caption or "",
         image_bytes=img_bytes,
         image_mime="image/jpeg",
+        allow_partial=True,
     )
     await _commit_scale_parsed(message, state, db, parsed)
+
+
+@router.message(ScaleImportState.waiting_input, F.document)
+async def fit_scale_document(message: types.Message, state: FSMContext, db) -> None:
+    loaded = await _download_scale_doc(message)
+    if loaded is None:
+        cancel_kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="fit:scale_cancel")]]
+        )
+        await message.answer(
+            "Нужна картинка (PNG/JPG/WEBP до 15 МБ) или скриншот из приложения весов.",
+            reply_markup=cancel_kb,
+        )
+        return
+    img_bytes, mime = loaded
+    parsed = await fitness_nutrition.parse_smart_scale_input(
+        raw_text=message.caption or "",
+        image_bytes=img_bytes,
+        image_mime=mime,
+        allow_partial=True,
+    )
+    await _commit_scale_parsed(message, state, db, parsed)
+
+
+@router.callback_query(lambda c: c.data == "fit:playbook")
+async def fit_playbook_home(callback: types.CallbackQuery, db) -> None:
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    user_id = int(user["id"])
+    local_date = local_date_str(datetime.datetime.utcnow(), user.get("timezone") or "UTC")
+    trend = await repo.body_metrics_trend(db, user_id, days=30)
+    week_stats = await repo.workout_stats_week(db, user_id, local_date)
+    wellness_row = await repo.get_wellness(db, user_id)
+    meal_profile = str((dict(wellness_row) if wellness_row else {}).get("meal_profile") or "")
+    n_adv = await fitness_nutrition.get_daily_nutrition_advice(db, user)
+
+    matched = coach_knowledge.select_coach_principles(
+        {
+            "trend": trend,
+            "latest": trend.get("latest") or {},
+            "week_workouts": week_stats,
+            "nutrition_advice": n_adv,
+            "meal_profile": meal_profile,
+            "weight_goal": user.get("weight_goal"),
+            "activity_level": user.get("activity_level"),
+        },
+        limit=2,
+    )
+    lines = ["📚 <b>База тренера и коуча HiDL</b>", "Научно-практические принципы без воды и экстремальных диет.\n"]
+    if matched:
+        lines.append("<b>Подобрано под тебя сейчас:</b>")
+        for c in matched:
+            lines.append(f"• <b>{_h(c['title'])}</b> — {_h(c['action_rule'])}")
+        lines.append("")
+    lines.append("Выбери раздел:")
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for c in matched:
+        rows.append([InlineKeyboardButton(text=f"⭐ {c['title'][:34]}", callback_data=f"fit:playbook_card:{c['id']}")])
+    topics = coach_knowledge.list_playbook_topics()
+    for i in range(0, len(topics), 2):
+        chunk = topics[i : i + 2]
+        rows.append(
+            [InlineKeyboardButton(text=f"{lbl} ({cnt})", callback_data=f"fit:playbook_topic:{t_key}") for t_key, lbl, cnt in chunk]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ К карте тела", callback_data="fit:body")])
+    await safe_edit(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("fit:playbook_topic:"))
+async def fit_playbook_topic(callback: types.CallbackQuery) -> None:
+    topic = callback.data.split("fit:playbook_topic:", 1)[1]
+    cards = coach_knowledge.get_topic_cards(topic)
+    if not cards:
+        await callback.answer("Карточек пока нет", show_alert=True)
+        return
+    label = str(cards[0].get("topic_label") or topic)
+    lines = [f"<b>{_h(label)}</b>\n"]
+    rows: list[list[InlineKeyboardButton]] = []
+    for c in cards:
+        lines.append(f"• <b>{_h(c['title'])}</b> — {_h(c['action_rule'])}")
+        rows.append([InlineKeyboardButton(text=f"📖 {c['title'][:36]}", callback_data=f"fit:playbook_card:{c['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Все разделы", callback_data="fit:playbook")])
+    await safe_edit(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("fit:playbook_card:"))
+async def fit_playbook_card(callback: types.CallbackQuery, db) -> None:
+    card_id = callback.data.split("fit:playbook_card:", 1)[1]
+    card = coach_knowledge.get_coach_card(card_id)
+    if not card:
+        await callback.answer("Карточка не найдена", show_alert=True)
+        return
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    coach_mode = str(user.get("coach_mode") or "balanced").strip().lower()
+    tone_line = card.get("strict_line") if coach_mode == "strict" else card.get("gentle_line")
+    lines = [
+        f"📖 <b>{_h(card['title'])}</b>",
+        f"<i>Источник: {_h(card.get('source') or '')}</i>\n",
+        _h(card.get("summary") or ""),
+        f"\n👉 <b>Что делать:</b> {_h(card.get('action_rule') or '')}",
+    ]
+    if tone_line:
+        lines.append(f"\n💬 <b>Коуч:</b> {_h(tone_line)}")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ К разделу", callback_data=f"fit:playbook_topic:{card.get('topic')}"),
+                InlineKeyboardButton(text="🫠 3 мин старт", callback_data="fit:lazy"),
+            ],
+            [InlineKeyboardButton(text="⚖ К карте тела", callback_data="fit:body")],
+        ]
+    )
+    await safe_edit(callback.message, "\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
 
 
 @router.message(ScaleImportState.waiting_input, lambda m: bool(m.text and not m.text.startswith("/")))

@@ -2234,6 +2234,74 @@ async def get_latest_weight(conn: aiosqlite.Connection, user_id: int) -> Optiona
     return row_to_dict(row) if row else None
 
 
+async def merge_recent_weight_metrics(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    *,
+    body_fat_pct: float | None = None,
+    muscle_mass_kg: float | None = None,
+    water_pct: float | None = None,
+    visceral_fat: float | None = None,
+    bmi: float | None = None,
+    within_minutes: int = 120,
+    now_utc: Optional[datetime.datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Дополнить свежий замер весов показателями со второго скрина (без перезаписи веса)."""
+    latest = await get_latest_weight(conn, user_id)
+    if not latest:
+        return None
+    raw_created = str(latest.get("created_at") or "").strip().rstrip("Z")
+    try:
+        created_dt = datetime.datetime.fromisoformat(raw_created)
+        if created_dt.tzinfo is not None:
+            created_dt = created_dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+    ref_now = now_utc or datetime.datetime.utcnow()
+    if ref_now.tzinfo is not None:
+        ref_now = ref_now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    if abs((ref_now - created_dt).total_seconds()) > max(1, int(within_minutes)) * 60:
+        return None
+
+    updates: Dict[str, Any] = {}
+    for col, val in (
+        ("body_fat_pct", body_fat_pct),
+        ("muscle_mass_kg", muscle_mass_kg),
+        ("water_pct", water_pct),
+        ("visceral_fat", visceral_fat),
+        ("bmi", bmi),
+    ):
+        if val is not None:
+            updates[col] = float(val)
+    if not updates:
+        return None
+
+    set_sql = ", ".join(f"{col} = ?" for col in updates)
+    params = [*updates.values(), int(latest["id"]), int(user_id)]
+    await conn.execute(
+        f"UPDATE weights SET {set_sql} WHERE id = ? AND user_id = ?",
+        tuple(params),
+    )
+    await conn.commit()
+    cur = await conn.execute("SELECT * FROM weights WHERE id = ?", (int(latest["id"]),))
+    refreshed = await cur.fetchone()
+    return row_to_dict(refreshed) if refreshed else None
+
+
+async def has_karma_event_today(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    local_date: str,
+    event_type: str,
+) -> bool:
+    """Проверить, фиксировалось ли сегодня событие кармы указанного типа."""
+    cur = await conn.execute(
+        "SELECT 1 FROM karma_events WHERE user_id = ? AND local_date = ? AND event_type = ? LIMIT 1",
+        (int(user_id), str(local_date), str(event_type)),
+    )
+    return (await cur.fetchone()) is not None
+
+
 async def weight_trend(conn: aiosqlite.Connection, user_id: int, days: int = 30) -> float:
     since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
     cursor = await conn.execute(
@@ -2276,6 +2344,7 @@ async def body_metrics_trend(
         "fat_delta": _delta("body_fat_pct"),
         "muscle_delta": _delta("muscle_mass_kg"),
         "water_delta": _delta("water_pct"),
+        "visceral_delta": _delta("visceral_fat"),
     }
 
 

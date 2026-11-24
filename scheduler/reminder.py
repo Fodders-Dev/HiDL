@@ -1,4 +1,5 @@
 import datetime
+import html as _html_mod
 import json
 import os
 import time
@@ -11,7 +12,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import repositories as repo
-from services import calendar_service, fitness_nutrition, inbox_service, pulse_service
+from services import calendar_service, coach_knowledge, fitness_nutrition, inbox_service, karma_service, pulse_service
 from utils.time import format_date_display, format_time_local, local_date_str, parse_hhmm, should_trigger, tzinfo_from_string
 from utils.gender import done_button_label, button_label, g
 from utils.logger import log_debug
@@ -111,7 +112,7 @@ class ReminderScheduler:
         self.scheduler.add_job(self._tick_weekly_finance, "cron", hour=9, minute=0, id="weekly_finance")
         self.scheduler.add_job(self._reset_points_month, "cron", day=1, hour=0, minute=5, id="points_reset")
         self.scheduler.add_job(self._tick_care, "cron", hour=9, minute=15, id="care_tick")
-        self.scheduler.add_job(self._tick_weight_prompt, "cron", hour=8, minute=30, id="weight_prompt")
+        self.scheduler.add_job(self._tick_weight_prompt, "interval", minutes=30, id="weight_prompt")
         self.scheduler.add_job(self._weekly_home_plan, "cron", day_of_week="sun", hour=10, minute=0, id="home_plan_weekly")
         self.scheduler.add_job(self._tick_day_plan, "interval", minutes=5, id="day_plan_morning")
         self.scheduler.add_job(self._tick_day_plan_evening, "interval", minutes=15, id="day_plan_evening")
@@ -961,44 +962,133 @@ class ReminderScheduler:
                         user, local_date, f"{text}\nДата сегодня: {note_date}", reply_markup=kb
                     )
 
-    async def _tick_weight_prompt(self) -> None:
-        """Раз в день напоминаем про вес, если не спрашивали 7 дней."""
-        now_utc = datetime.datetime.utcnow()
+    async def _tick_weight_prompt(self, now_utc: Optional[datetime.datetime] = None) -> int:
+        """Утренние умные напоминания взвеситься + контроль пропусков в локальном окне подъёма."""
+        now = now_utc or datetime.datetime.utcnow()
         users = await repo.list_users(self.conn)
-        for user in users:
-            user = dict(user)
+        sent_count = 0
+        for user_row in users:
+            user = dict(user_row)
             if is_student_mode(user):
                 continue
-            local_date = local_date_str(now_utc, user["timezone"])
+            goal = str(user.get("weight_goal") or "loss").strip().lower()
+            if goal == "mindful":
+                continue
+            tz = str(user.get("timezone") or "UTC")
+            local_date = local_date_str(now, tz)
             if user.get("pause_until") and local_date <= (user["pause_until"] or ""):
                 continue
             if user.get("quiet_mode"):
                 continue
-            if not self._legacy_pings_active(user):
+            if _sleep_window_active(user, now):
                 continue
-            if _sleep_window_active(user, now_utc):
+
+            last = str(user.get("last_weight_prompt") or "").strip()
+            if last == local_date:
                 continue
-            last = user.get("last_weight_prompt") or ""
-            due = True
-            if last:
+
+            local_hhmm = format_time_local(now, tz)
+            now_t = parse_hhmm(local_hhmm)
+            wake_t = parse_hhmm(str(user.get("wake_up_time") or "08:00")) or datetime.time(8, 0)
+            if now_t is None:
+                continue
+            now_m = now_t.hour * 60 + now_t.minute
+            wake_m = wake_t.hour * 60 + wake_t.minute
+            if not (0 <= ((now_m - wake_m) % (24 * 60)) <= 150):
+                continue
+
+            uid = int(user["id"])
+            today_d = datetime.date.fromisoformat(local_date)
+            latest = await repo.get_latest_weight(self.conn, uid)
+            days_since: Optional[int] = None
+            if latest is None:
+                eq = repo.get_user_equipment(user)
+                has_profile = ("smart_scales" in eq) or float(user.get("height_cm") or 0) > 0
+                if not has_profile:
+                    continue
+                if last:
+                    try:
+                        if (today_d - datetime.date.fromisoformat(last)).days < 7:
+                            continue
+                    except Exception:
+                        pass
+            else:
+                raw_c = str(latest.get("created_at") or "").strip().rstrip("Z")
                 try:
-                    last_dt = datetime.date.fromisoformat(last)
-                    today = datetime.date.fromisoformat(local_date)
-                    due = (today - last_dt).days >= 7
+                    c_dt = datetime.datetime.fromisoformat(raw_c)
+                    if c_dt.tzinfo is not None:
+                        c_dt = c_dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                    latest_local = local_date_str(c_dt, tz)
+                    days_since = (today_d - datetime.date.fromisoformat(latest_local)).days
                 except Exception:
-                    due = True
-            if due:
-                kb = InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="Обновить вес", callback_data="move:weight")]]
-                )
-                sent = await self._safe_send_message(
+                    days_since = 3
+                if days_since < 3:
+                    continue
+
+            coach = str(user.get("coach_mode") or "balanced").strip().lower()
+            cards = coach_knowledge.select_coach_principles(
+                {"missed_weigh_in": True, "weight_goal": goal},
+                "взвешивание весы",
+                limit=1,
+            )
+            tip_line = f"\n\n<i>💡 {_html_mod.escape(cards[0]['action_rule'])}</i>" if cards else ""
+
+            if days_since is not None and days_since >= 7 and coach != "gentle":
+                kres = await karma_service.record_karma_event(
+                    self.conn,
                     user,
-                    local_date,
-                    "⚖ Обновишь вес? Коротко и без оценок — только цифра.",
-                    reply_markup=kb,
+                    domain="tasks",
+                    event_type="weigh_in_missed",
+                    delta=-5,
+                    reason="Пропуск весов 7+ дней",
+                    now_utc=now,
                 )
-                if sent:
-                    await repo.update_weight_prompt(self.conn, user["id"], local_date)
+                k_delta = int(kres.get("delta") or 0)
+                karma_line = (
+                    f"<b>Карма {k_delta:+d} → {kres.get('score_after', 70)}/100.</b> "
+                    if k_delta != 0
+                    else "<b>(заморозка ЧП защитила карму)</b> "
+                )
+                msg = (
+                    f"⚖ <b>Неделя без весов ({days_since} дн.)!</b>\n"
+                    f"{karma_line}Когда прячешься от цифр, легко незаметно откатиться на пару кг.\n"
+                    "Встань на весы натощак и скинь скрин/файл Xiaomi прямо сюда в чат."
+                    f"{tip_line}"
+                )
+            elif days_since is None:
+                msg = (
+                    "⚖ <b>Утренний чекпоинт весов</b>\n"
+                    "Сделай первый замер натощак и пришли скрин/файл из Xiaomi (или число) — "
+                    "я пересчитаю КБЖУ под реальный состав тела."
+                    f"{tip_line}"
+                )
+            else:
+                msg = (
+                    f"⚖ <b>Утреннее взвешивание</b> (прошло {days_since} дн.)\n"
+                    "Утром натощак — самая честная цифра. Скинь отчёт/скрин Xiaomi прямо сюда, "
+                    "чтобы сверить тренд жира, воды и мышц."
+                    f"{tip_line}"
+                )
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="📸 Загрузить весы", callback_data="fit:scale_add"),
+                        InlineKeyboardButton(text="⏭ Позже", callback_data="fit:weigh_skip"),
+                    ]
+                ]
+            )
+            sent = await self._safe_send_message(
+                user,
+                local_date,
+                msg,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            if sent:
+                await repo.update_weight_prompt(self.conn, uid, local_date)
+                sent_count += 1
+        return sent_count
 
     async def _weekly_home_plan(self) -> None:
         """По воскресеньям присылать план по дому на неделю."""
@@ -1444,11 +1534,57 @@ class ReminderScheduler:
                 if kcal_burned_today > 0
                 else "Движение: ещё можно успеть 3-минутный микро-старт"
             )
+            karma_note = ""
+            if meals_cnt > 0 and float(eat.get("protein_g") or 0) >= float(tgt["protein_g"]) * 0.8 and int(eat["kcal"]) <= int(tgt["kcal"]) + 150:
+                if not await repo.has_karma_event_today(self.conn, uid, local_date, "nutrition_on_track"):
+                    await repo.add_points(self.conn, uid, 3, local_date=local_date)
+                    kres = await karma_service.record_karma_event(
+                        self.conn,
+                        user,
+                        domain="food",
+                        event_type="nutrition_on_track",
+                        delta=3,
+                        reason="Точный день по КБЖУ",
+                        now_utc=now,
+                    )
+                    karma_note = f"\n✨ <b>+3 кармы за точный день по КБЖУ</b> ({kres.get('score_after', 70)}/100)"
+            elif coach == "strict" and int(week.get("count") or 0) == 0 and (
+                int(eat["kcal"]) > int(tgt["kcal"]) + 250 or (meals_cnt == 0 and not tgt.get("is_estimated", True))
+            ):
+                kres = await karma_service.record_karma_event(
+                    self.conn,
+                    user,
+                    domain="tasks",
+                    event_type="fitness_discipline_miss",
+                    delta=-4,
+                    reason="Сбой режима питания/движения",
+                    now_utc=now,
+                )
+                k_delta = int(kres.get("delta") or 0)
+                if k_delta != 0:
+                    karma_note = (
+                        f"\n⚠️ <b>Карма {k_delta:+d} → {kres.get('score_after', 70)}/100:</b> "
+                        "завтра правило «Никогда не пропускай дважды» — начни с 3-мин старта и белковой еды."
+                    )
+
+            wellness_row = await repo.get_wellness(self.conn, uid)
+            meal_prof = str((dict(wellness_row) if wellness_row else {}).get("meal_profile") or "")
+            cards = coach_knowledge.select_coach_principles(
+                {
+                    "week_workouts": week,
+                    "nutrition_advice": advice,
+                    "meal_profile": meal_prof,
+                    "weight_goal": goal,
+                },
+                limit=1,
+            )
+            coach_tip = f"\n📚 <i>{_html_mod.escape(cards[0]['action_rule'])}</i>" if cards else ""
+
             msg = (
                 f"{head}\n"
                 f"🍽 КБЖУ: <b>{eat['kcal']}</b> / {tgt['kcal']} ккал (Б {eat['protein_g']:g}/{tgt['protein_g']}г)\n"
                 f"🏃 {mov_txt}\n"
-                f"💡 {tail}"
+                f"💡 {tail}{karma_note}{coach_tip}"
             )
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
