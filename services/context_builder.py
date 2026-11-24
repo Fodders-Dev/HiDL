@@ -362,7 +362,9 @@ def format_context_for_llm(snapshot: Dict[str, Any]) -> str:
             if not tgt.get("mindful_mode"):
                 lines.append(
                     f"КБЖУ сегодня: съедено {int(round(eat.get('kcal') or 0))}/{int(tgt.get('kcal') or 0)} ккал "
-                    f"(Б {eat.get('protein_g', 0):g}/{tgt.get('protein_g', 0)}г, "
+                    f"(ориентир под цель «{tgt.get('goal_label', '')}»; "
+                    f"расход поддержания TDEE ~{int(tgt.get('tdee') or 0)} ккал, базовый обмен BMR ~{int(tgt.get('bmr') or 0)} ккал; "
+                    f"Б {eat.get('protein_g', 0):g}/{tgt.get('protein_g', 0)}г, "
                     f"Ж {eat.get('fat_g', 0):g}/{tgt.get('fat_g', 0)}г, "
                     f"У {eat.get('carbs_g', 0):g}/{tgt.get('carbs_g', 0)}г). "
                     f"{n_adv.get('summary_line', '')}"

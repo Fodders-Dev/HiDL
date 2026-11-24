@@ -194,6 +194,7 @@ async def build_situational_advice_reply(
     user: Dict[str, Any],
     user_text: str = "",
     *,
+    reply_context: str = "",
     llm_client_instance: Optional[LLMClient] = None,
     exclude_ids: Optional[Set[str]] = None,
     now_utc: Optional[datetime.datetime] = None,
@@ -214,19 +215,20 @@ async def build_situational_advice_reply(
         principles = coach_knowledge.select_coach_principles(snapshot, clean_req, limit=2)
         coach_block = coach_knowledge.format_coach_knowledge_for_llm(principles)
         sys_prompt = (
-            "Ты — карманная помощница HiDL. Дай короткий, практичный, приземлённый совет по ситуации "
-            "(3–5 предложений + 1 конкретный микро-шаг прямо сейчас). "
-            "Пиши простым текстом без Markdown-разметки (без ** и ##). "
-            "Опирайся ТОЛЬКО на факты из снимка дня (время, отбой, задачи, холодильник, карма, замеры тела, цель/КБЖУ и стиль коуча) "
-            "и научно-практические принципы тренера ниже; строго держи тон режима кармы и коуча. Не выдумывай несуществующие события или рецепты."
+            "Ты — карманная помощница и коуч HiDL. Сначала дай прямой и понятный ответ на вопрос пользователя "
+            "(простым языком, без канцелярита и без Markdown-разметки ** и ##; 3–5 коротких предложений + 1 практичный вывод). "
+            "Если пользователь спрашивает про КБЖУ, дефицит, поддержание (TDEE), вес или жир — объясняй на реальных цифрах из снимка дня (ориентир КБЖУ vs TDEE/BMR). "
+            "Опирайся ТОЛЬКО на факты из снимка дня и научно-практические принципы тренера ниже; строго держи тон режима кармы и коуча. Не выдумывай несуществующие события или рецепты."
         )
+        reply_ctx_clean = str(reply_context or "").strip()[:400]
         usr_prompt = (
             f"{ctx_block}\n\n"
             + (f"{coach_block}\n\n" if coach_block else "")
+            + (f"Сообщение, на которое отвечает пользователь:\n{reply_ctx_clean}\n\n" if reply_ctx_clean else "")
             + f"Ориентир-карточка: {card.get('title')} — {card.get('micro_step')}\n\n"
             f"Запрос пользователя:\n{clean_req}"
         )
-        res = await client.complete_text(sys_prompt, usr_prompt, temperature=0.35, max_tokens=280)
+        res = await client.complete_text(sys_prompt, usr_prompt, temperature=0.35, max_tokens=380)
         if res.ok and res.text.strip():
             mode = snapshot["karma_mode"]
             header = f"💡 <b>Совет HiDL</b> ({mode['emoji']} {snapshot['karma_score']}/100)\n\n"

@@ -454,6 +454,62 @@ class SmartScaleUXTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(plan_night["suggest_lazy_workout"])
         self.assertIn("спать", plan_night["action_today"].lower())
 
+    async def test_7_kbju_coaching_question_and_reply_context(self) -> None:
+        from services import inbox_service
+
+        await repo.add_weight(self.db, self.u_id, 99.2, body_fat_pct=29.0, source="scale_photo")
+
+        class _CoachQuestionLLM:
+            def __init__(self) -> None:
+                self.json_calls: list[tuple[str, str]] = []
+                self.text_calls: list[tuple[str, str]] = []
+
+            def is_configured(self) -> bool:
+                return True
+
+            async def complete_json(self, system_prompt: str, user_prompt: str, **kwargs) -> LLMResult:
+                self.json_calls.append((system_prompt, user_prompt))
+                # Even if router tags a question as query_type="kbju", explanatory logic routes it to AI coach!
+                payload = {"intent": "query", "query_type": "kbju", "query_term": "", "reply": "", "items": []}
+                return LLMResult(ok=True, text=json.dumps(payload), data=payload)
+
+            async def complete_text(self, system_prompt: str, user_prompt: str, **kwargs) -> LLMResult:
+                self.text_calls.append((system_prompt, user_prompt))
+                return LLMResult(
+                    ok=True,
+                    text="2210 ккал — это комфортный дефицит, а твоё поддержание около 2600 ккал.",
+                    data=None,
+                )
+
+        llm = _CoachQuestionLLM()
+        out_q = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=101,
+            message_id=501,
+            text="2210 кл это надо есть или нельзя есть больше? Если будет больше, то буду толстеть?",
+            reply_context="Дополнила свежий замер: вес 99.2 кг, жир 29.0%. Ориентир КБЖУ: 2210 ккал",
+            llm_client_instance=llm,
+        )
+        self.assertEqual(len(llm.text_calls), 1)
+        coach_prompt = llm.text_calls[0][1]
+        self.assertIn("TDEE", coach_prompt)
+        self.assertIn("Сообщение, на которое отвечает пользователь", coach_prompt)
+        self.assertIn("комфортный дефицит", out_q.reply_text)
+        self.assertNotIn("Твой КБЖУ на сегодня", out_q.reply_text)
+
+        # Short status lookup STILL opens the KBJU card without calling complete_text
+        out_status = await inbox_service.capture_and_process_text(
+            self.db,
+            self.user,
+            chat_id=101,
+            message_id=502,
+            text="сколько калорий осталось",
+            llm_client_instance=llm,
+        )
+        self.assertEqual(len(llm.text_calls), 1)
+        self.assertIn("Твой КБЖУ на сегодня", out_status.reply_text)
+
         llm_adv = _QueuedLLM([])
         reply, meta = await advice_service.build_situational_advice_reply(
             self.db,

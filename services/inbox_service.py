@@ -1634,12 +1634,58 @@ def _latest_advice_ids(recent_context: Optional[list[dict[str, Any]]]) -> set[st
     return out
 
 
+_KBJU_STATUS_ONLY_RE = re.compile(
+    r"^\s*(?:покажи\s+)?(?:мой\s+|мои\s+)?(?:кбжу|калории|норм[уа]\s+кбжу)(?:\s+на\s+сегодня)?\s*[?!.]*\s*$"
+    r"|^\s*сколько\s+(?:у\s+меня\s+)?(?:калорий|ккал|белка|жиров|углеводов|кбжу)\s+осталось(?:\s+на\s+сегодня)?\s*[?!.]*\s*$"
+    r"|^\s*(?:что|сколько)\s+(?:мне\s+)?(?:можно\s+)?добрать\s+по\s+(?:белку|кбжу|калориям)\s*[?!.]*\s*$"
+)
+
+_KBJU_COACHING_KEYWORDS = (
+    "толсте",
+    "похуде",
+    "надо есть",
+    "нужно есть",
+    "нельзя",
+    "можно ли",
+    "если будет",
+    "если перее",
+    "почему",
+    "зачем",
+    "объясни",
+    "как работа",
+    "что значит",
+    "дефицит",
+    "профицит",
+    "поддержан",
+    "базовый обмен",
+    "минимум",
+    "максимум",
+    "или это",
+    "сжиг",
+)
+
+
+def _is_kbju_coaching_question(raw_text: str) -> bool:
+    """Отличить содержательный вопрос тренеру про калории/вес от короткого запроса карточки КБЖУ."""
+    clean = str(raw_text or "").strip().lower().replace("ё", "е")
+    if not clean:
+        return False
+    if _KBJU_STATUS_ONLY_RE.match(clean):
+        return False
+    if any(kw in clean for kw in _KBJU_COACHING_KEYWORDS):
+        return True
+    if "?" in clean and len(clean.split()) >= 6 and "сколько" not in clean:
+        return True
+    return False
+
+
 async def _build_query_response(
     db,
     user: dict[str, Any],
     parsed: InboxParseResult,
     raw_text: str,
     *,
+    reply_context: str = "",
     llm_client_instance: Optional[LLMClient] = None,
     now_utc: Optional[datetime.datetime] = None,
     recent_context: Optional[list[dict[str, Any]]] = None,
@@ -1743,6 +1789,7 @@ async def _build_query_response(
             db,
             user,
             user_text="" if is_more else raw_text,
+            reply_context="" if is_more else reply_context,
             llm_client_instance=llm_client_instance,
             exclude_ids=prev_ids,
             now_utc=now_utc,
@@ -1825,6 +1872,24 @@ async def _build_query_response(
                 None,
                 {"query_type": "kbju"},
             )
+        if _is_kbju_coaching_question(raw_text):
+            reply_html, meta = await advice_service.build_situational_advice_reply(
+                db,
+                user,
+                user_text=raw_text,
+                reply_context=reply_context,
+                llm_client_instance=llm_client_instance,
+                now_utc=now_utc,
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+                        InlineKeyboardButton(text="⚖ Тело и весы", callback_data="fit:body"),
+                    ]
+                ]
+            )
+            return reply_html, kb, {"query_type": "advice", "routed_from": "kbju"}
         from handlers import nutrition
 
         txt, kb = await nutrition.render_kbju_card(db, user, now_utc=now_utc)
@@ -1909,6 +1974,7 @@ async def _analyze_and_persist(
     raw_text: str,
     now_utc: datetime.datetime,
     llm_client_instance: Optional[LLMClient] = None,
+    reply_context: str = "",
 ) -> InboxProcessOutcome:
     tz = user.get("timezone") or "UTC"
     local_date = inbox_row.get("local_date") or local_date_str(now_utc, tz)
@@ -2024,6 +2090,9 @@ async def _analyze_and_persist(
             )
 
     recent_ctx = _get_recent_context(uid, now_utc)
+    ctx_for_parser = list(recent_ctx)
+    if str(reply_context or "").strip():
+        ctx_for_parser.append({"role": "assistant", "text": str(reply_context).strip()[:400]})
     snapshot = await context_builder.build_user_day_snapshot(db, user, now_utc=now_utc)
     ctx_for_llm = context_builder.format_context_for_llm(snapshot)
     parsed = await analyze_inbox_text(
@@ -2031,7 +2100,7 @@ async def _analyze_and_persist(
         now_utc=now_utc,
         tz_str=tz,
         llm_client_instance=llm_client_instance,
-        recent_context=recent_ctx,
+        recent_context=ctx_for_parser,
         user_context_block=ctx_for_llm,
     )
 
@@ -2051,6 +2120,7 @@ async def _analyze_and_persist(
             user,
             parsed,
             raw_text,
+            reply_context=reply_context,
             llm_client_instance=llm_client_instance,
             now_utc=now_utc,
             recent_context=recent_ctx,
@@ -2168,6 +2238,7 @@ async def capture_and_process_text(
     chat_id: int,
     message_id: Optional[int],
     text: str,
+    reply_context: str = "",
     now_utc: Optional[datetime.datetime] = None,
     llm_client_instance: Optional[LLMClient] = None,
 ) -> InboxProcessOutcome:
@@ -2197,7 +2268,13 @@ async def capture_and_process_text(
         )
 
     return await _analyze_and_persist(
-        db, user, row, clean_text, now, llm_client_instance=llm_client_instance
+        db,
+        user,
+        row,
+        clean_text,
+        now,
+        llm_client_instance=llm_client_instance,
+        reply_context=reply_context,
     )
 
 

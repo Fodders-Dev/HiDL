@@ -59,12 +59,17 @@ async def handle_free_text_inbox(message: types.Message, db) -> None:
     """Единая точка входа для произвольного текста из natural_handler."""
     user = await ensure_user(db, message.from_user.id, message.from_user.full_name)
     night_notice = await pulse_service.check_night_violation(db, user)
+    reply_msg = getattr(message, "reply_to_message", None)
+    reply_context = str(
+        getattr(reply_msg, "text", None) or getattr(reply_msg, "caption", None) or ""
+    ).strip()[:400]
     outcome = await inbox_service.capture_and_process_text(
         db,
         user,
         chat_id=message.chat.id,
         message_id=message.message_id,
         text=message.text or "",
+        reply_context=reply_context,
     )
     reply_text = f"{night_notice}\n\n{outcome.reply_text}" if night_notice else outcome.reply_text
     await message.answer(
