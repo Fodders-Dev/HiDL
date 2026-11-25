@@ -570,6 +570,88 @@ async def leave_household(conn: aiosqlite.Connection, user_id: int) -> int:
     return new_hid
 
 
+async def remove_household_member(
+    conn: aiosqlite.Connection, actor_user_id: int, target_user_id: int
+) -> Optional[Dict[str, Any]]:
+    """Открепить участника из общего дома в отдельный дом и обновить код приглашения."""
+    actor_id = int(actor_user_id)
+    target_id = int(target_user_id)
+    if actor_id == target_id:
+        return None
+    actor = await get_user(conn, actor_id)
+    target = await get_user(conn, target_id)
+    if not actor or not target:
+        return None
+    shared_hid = actor["household_id"]
+    if not shared_hid or int(shared_hid) != int(target["household_id"] or 0):
+        return None
+    new_hid = await leave_household(conn, target_id)
+    new_code = await regenerate_household_invite_code(conn, int(shared_hid))
+    return {
+        "target_user": dict(target),
+        "old_household_id": int(shared_hid),
+        "new_household_id": int(new_hid),
+        "new_invite_code": str(new_code),
+    }
+
+
+async def delete_user_account(conn: aiosqlite.Connection, user_id: int) -> bool:
+    """Полностью удалить данные пользователя, не затрагивая общие данные партнёра по дому."""
+    uid = int(user_id)
+    user_row = await get_user(conn, uid)
+    if not user_row:
+        return False
+    user = dict(user_row)
+
+    hid = user.get("household_id")
+    solo_hid: Optional[int] = None
+    if hid:
+        members = await list_household_members(conn, int(hid))
+        if len(members) > 1:
+            solo_hid = await leave_household(conn, uid)
+        else:
+            solo_hid = int(hid)
+
+    existing_tables_rows = await conn.execute_fetchall(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    )
+    existing_tables = [str(r["name"]) for r in existing_tables_rows]
+
+    # Clean up Desk link tokens keyed by desk_user_id before wiping desk_links
+    if "desk_links" in existing_tables and "desk_link_tokens" in existing_tables:
+        dl_row = await (
+            await conn.execute("SELECT desk_user_id FROM desk_links WHERE user_id = ?", (uid,))
+        ).fetchone()
+        if dl_row and dl_row["desk_user_id"]:
+            await conn.execute(
+                "DELETE FROM desk_link_tokens WHERE desk_user_id = ? OR consumed_by_user_id = ?",
+                (str(dl_row["desk_user_id"]), uid),
+            )
+        else:
+            await conn.execute("DELETE FROM desk_link_tokens WHERE consumed_by_user_id = ?", (uid,))
+
+    # Handle child tables before parents safely
+    for tbl in reversed(existing_tables):
+        if tbl in {"users", "households"}:
+            continue
+        cols_rows = await conn.execute_fetchall(f'PRAGMA table_info("{tbl}")')
+        col_names = {str(c["name"]) for c in cols_rows}
+        if "user_id" in col_names:
+            await conn.execute(f'DELETE FROM "{tbl}" WHERE user_id = ?', (uid,))
+        if solo_hid is not None and "household_id" in col_names:
+            await conn.execute(f'DELETE FROM "{tbl}" WHERE household_id = ?', (solo_hid,))
+        if "created_by_user_id" in col_names:
+            await conn.execute(f'DELETE FROM "{tbl}" WHERE created_by_user_id = ?', (uid,))
+        if "from_user_id" in col_names:
+            await conn.execute(f'DELETE FROM "{tbl}" WHERE from_user_id = ?', (uid,))
+
+    if solo_hid is not None and "households" in existing_tables:
+        await conn.execute("DELETE FROM households WHERE id = ?", (solo_hid,))
+    await conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+    await conn.commit()
+    return True
+
+
 # --- Day plans (evening / morning planning) ---
 
 

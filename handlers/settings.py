@@ -6,14 +6,14 @@ from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
 from db import repositories as repo
 from keyboards.common import main_menu_keyboard
-from services import household_service
+from services import household_service, inbox_service
 from utils import texts
 from utils.sender import safe_edit
-from utils.time import is_valid_timezone, parse_hhmm
+from utils.time import format_date_display, is_valid_timezone, local_date_str, parse_hhmm
 from utils.user import ensure_user
 
 router = Router()
@@ -97,6 +97,7 @@ async def _render_household_screen(db, user: dict) -> tuple[str, InlineKeyboardM
         ],
     ]
     if len(members) > 1:
+        rows.append([InlineKeyboardButton(text="👤 Убрать участника", callback_data="settings:household_kick_menu")])
         rows.append([InlineKeyboardButton(text="🚪 Выйти из дома", callback_data="settings:household_leave")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
@@ -150,13 +151,15 @@ def settings_keyboard(user: dict | None = None) -> InlineKeyboardMarkup:
         ])
     rows.extend([
             [InlineKeyboardButton(text="📚 Fodder's Desk", callback_data="desk:main")],
+            [InlineKeyboardButton(text="💬 Баг / идея автору", callback_data="fb:start")],
+            [InlineKeyboardButton(text="🗑 Удалить мои данные", callback_data="settings:delete_account")],
             [InlineKeyboardButton(text="⬅️ В меню", callback_data="main:menu")],
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _render_notifications_menu(callback: types.CallbackQuery, db) -> None:
-    user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
     wellness = await repo.get_wellness(db, user["id"])
     w = dict(wellness) if wellness else {}
 
@@ -164,11 +167,17 @@ async def _render_notifications_menu(callback: types.CallbackQuery, db) -> None:
     water_enabled = w.get("water_enabled", 0)
     affirm_enabled = w.get("affirm_enabled", 0)
     quiet_enabled = user.get("quiet_mode", 0)
+    pulse_enabled = user.get("pulse_enabled", 1)
+    today_local = local_date_str(datetime.datetime.utcnow(), str(user.get("timezone") or "UTC"))
+    pause_until = str(user.get("pause_until") or "").strip()
+    is_paused = bool(pause_until and today_local <= pause_until)
 
     meal_icon = "✅" if meal_enabled else "❌"
     water_icon = "✅" if water_enabled else "❌"
     affirm_icon = "✅" if affirm_enabled else "❌"
     quiet_icon = "✅" if quiet_enabled else "❌"
+    pulse_icon = "✅" if pulse_enabled else "❌"
+    pause_label = f"▶️ Снять паузу (до {format_date_display(pause_until)})" if is_paused else "🧘 Пауза на сегодня"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -177,7 +186,9 @@ async def _render_notifications_menu(callback: types.CallbackQuery, db) -> None:
             ]),
             [InlineKeyboardButton(text=f"💧 Вода {water_icon}", callback_data="settings:notify:water")],
             [InlineKeyboardButton(text=f"🌟 Аффирмации {affirm_icon}", callback_data="settings:notify:affirm_menu")],
+            [InlineKeyboardButton(text=f"⚡ Пульс и чек-ины сна {pulse_icon}", callback_data="settings:notify:pulse")],
             [InlineKeyboardButton(text=f"🔕 Тихий режим {quiet_icon}", callback_data="settings:quiet")],
+            [InlineKeyboardButton(text=pause_label, callback_data="settings:notify:pause_toggle")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:main")],
         ]
     )
@@ -423,6 +434,118 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
         await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
         await callback.answer("Ты вышел(-а) в свой личный дом.")
         return
+    elif action == "household_kick_menu":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        hid = await repo.get_or_create_household(db, user["id"])
+        members = [m for m in await repo.list_household_members(db, hid) if int(m["id"]) != int(user["id"])]
+        if not members:
+            await callback.answer("В доме сейчас только ты.", show_alert=True)
+            text, kb = await _render_household_screen(db, user)
+            await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+            return
+        kick_rows = [
+            [
+                InlineKeyboardButton(
+                    text="❌ Убрать " + str(m.get("name") or f"User {m['id']}"),
+                    callback_data=f"settings:household_kick_ask:{int(m['id'])}",
+                )
+            ]
+            for m in members
+        ]
+        kick_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:household")])
+        await safe_edit(
+            callback.message,
+            "👤 <b>Кого открепить от общего дома?</b>\n\n"
+            "Участник перейдёт в свой отдельный дом, а твой холодильник, покупки и инвайт-код будут защищены (код обновится).",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kick_rows),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    elif action == "household_kick_ask" and len(parts) >= 3 and parts[2].isdigit():
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        target_uid = int(parts[2])
+        hid = await repo.get_or_create_household(db, user["id"])
+        members = await repo.list_household_members(db, hid)
+        target = next((m for m in members if int(m["id"]) == target_uid and int(m["id"]) != int(user["id"])), None)
+        if not target:
+            await callback.answer("Участник не найден.", show_alert=True)
+            text, kb = await _render_household_screen(db, user)
+            await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+            return
+        t_name = html.escape(str(target.get("name") or f"User {target_uid}"))
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"✅ Да, убрать {str(target.get('name') or '')}".strip(), callback_data=f"settings:household_kick_do:{target_uid}")],
+                [InlineKeyboardButton(text="Отмена", callback_data="settings:household")],
+            ]
+        )
+        await safe_edit(
+            callback.message,
+            f"⚠️ <b>Открепить {t_name} от общего дома?</b>\n\n"
+            "• Холодильник и список покупок останутся у тебя.\n"
+            "• Код приглашения в дом обновится, чтобы по старой ссылке нельзя было зайти заново.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    elif action == "household_kick_do" and len(parts) >= 3 and parts[2].isdigit():
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        target_uid = int(parts[2])
+        res = await repo.remove_household_member(db, user["id"], target_uid)
+        if not res:
+            await callback.answer("Не удалось убрать участника.", show_alert=True)
+        else:
+            target_tg = (res.get("target_user") or {}).get("telegram_id")
+            bot = getattr(callback, "bot", None)
+            if target_tg and bot is not None:
+                try:
+                    await bot.send_message(
+                        int(target_tg),
+                        "🏠 Тебя открепили от общего дома — теперь у тебя свой отдельный дом в HiDL.",
+                    )
+                except Exception:
+                    pass
+            await callback.answer("Участник убран, код обновлён 🔄")
+        text, kb = await _render_household_screen(db, user)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+        return
+    elif action == "delete_account":
+        await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚠️ Да, удалить все мои данные", callback_data="settings:delete_account_confirm")],
+                [InlineKeyboardButton(text="⬅️ Отмена", callback_data="settings:main")],
+            ]
+        )
+        await safe_edit(
+            callback.message,
+            "🗑 <b>Удалить все мои данные из HiDL?</b>\n\n"
+            "Будут безвозвратно удалены твои задачи, дневник, записи КБЖУ, вес, напоминания, личный холодильник и настройки.\n"
+            "Если ты в общем доме, данные партнёра сохранятся.\n\n"
+            "Восстановить данные после удаления нельзя.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    elif action == "delete_account_confirm":
+        user = await ensure_user(db, callback.from_user.id, callback.from_user.full_name)
+        uid = int(user["id"])
+        await repo.delete_user_account(db, uid)
+        inbox_service.clear_dialog_history(uid)
+        await state.clear()
+        await safe_edit(
+            callback.message,
+            "Готово — все твои данные удалены из HiDL.\nЕсли захочешь вернуться, просто нажми /start.",
+        )
+        await callback.message.answer(
+            "Профиль удалён. Спасибо, что попробовал(-а) HiDL 👋",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await callback.answer("Данные удалены")
+        return
     elif action == "household_join":
         await state.set_state(SettingsState.household_join)
         await callback.message.answer(
@@ -520,6 +643,19 @@ async def settings_select(callback: types.CallbackQuery, state: FSMContext, db, 
             new_val = 0 if w.get("water_enabled", 0) else 1
             await repo.upsert_wellness(db, user["id"], water_enabled=new_val)
             await callback.answer("Вода: " + ("вкл" if new_val else "выкл"))
+        elif notify_type == "pulse":
+            new_val = not bool(user.get("pulse_enabled", 1))
+            await repo.update_user_pulse_flags(db, int(user["id"]), pulse_enabled=new_val)
+            await callback.answer("Пульс и чек-ины: " + ("вкл" if new_val else "выкл"))
+        elif notify_type == "pause_toggle":
+            today_local = local_date_str(datetime.datetime.utcnow(), str(user.get("timezone") or "UTC"))
+            pause_until = str(user.get("pause_until") or "").strip()
+            if pause_until and today_local <= pause_until:
+                await repo.clear_user_pause(db, user["id"])
+                await callback.answer("Пауза снята ▶️")
+            else:
+                await repo.set_user_pause(db, user["id"], today_local)
+                await callback.answer("Пауза на сегодня включена 🧘")
         elif notify_type == "affirm_menu":
             affirm_enabled = w.get("affirm_enabled", 0)
             affirm_hours_raw = w.get("affirm_hours", "[9]")

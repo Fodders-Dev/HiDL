@@ -352,7 +352,10 @@ async def _render_shoplist(callback: types.CallbackQuery, db, scope: str, page: 
     text = "<b>🛒 Список покупок</b>\n"
     scope_label = "👥 общий" if scope != "personal" else "👤 личный"
     if not items:
-        text += "Пока пусто. Можно добавить продукты вручную или из рецептов."
+        text += (
+            "Пока пусто.\n"
+            "Напиши в чат <code>купить молоко и хлеб</code> или добавь продукты кнопками ниже."
+        )
     else:
         bought_cnt = sum(1 for i in items if i["is_bought"])
         text += f"{scope_label}\nВсего: {len(items)}, отмечено: {bought_cnt}"
@@ -378,7 +381,10 @@ async def send_shoplist(message: types.Message, db) -> None:
     items = rows_to_dicts(rows)
     text = "<b>🛒 Список покупок</b>\n"
     if not items:
-        text += "Пока пусто. Можно добавить продукты вручную или из рецептов."
+        text += (
+            "Пока пусто.\n"
+            "Напиши в чат <code>купить молоко и хлеб</code> или добавь продукты кнопками ниже."
+        )
     else:
         bought_cnt = sum(1 for i in items if i["is_bought"])
         text += f"👥 общий\nВсего: {len(items)}, отмечено: {bought_cnt}"
@@ -1415,8 +1421,9 @@ async def _build_fridge_payload(db, tg_user_id: int, tg_full_name: str) -> Tuple
     text = "<b>❄️ Мой холодильник</b>\n"
     if not items:
         text += (
-            "Пока пусто.\n\n"
-            "Если не хочется думать — я могу собрать базовый минимум в список покупок."
+            "Пока пусто.\n"
+            "Просто напиши или надиктуй в чат: <code>купил яйца, молоко, овсянку</code> — я сама разложу по полкам.\n"
+            "Или собери базовый минимум в покупки кнопкой ниже."
         )
     else:
         cats = {}
@@ -1889,9 +1896,14 @@ async def ai_chef_suggest(callback: types.CallbackQuery, state: FSMContext, db):
             [InlineKeyboardButton(text="🍳 Подбор из базы", callback_data="kitchen:quick_pick")],
             [InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main")],
         ])
-        msg = (
-            "Не получилось связаться с ИИ-шефом прямо сейчас — можно воспользоваться мгновенным подбором из базы рецептов."
-        )
+        if res.get("error") == "daily_quota_exceeded":
+            msg = (
+                "На сегодня дневной лимит ИИ-запросов исчерпан — попробуй завтра или воспользуйся мгновенным подбором из базы рецептов."
+            )
+        else:
+            msg = (
+                "Не получилось связаться с ИИ-шефом прямо сейчас — можно воспользоваться мгновенным подбором из базы рецептов."
+            )
         await safe_edit(callback.message, msg, reply_markup=kb)
         return
 

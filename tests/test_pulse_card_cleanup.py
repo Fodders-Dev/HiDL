@@ -237,13 +237,18 @@ class PulseCardCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await repo.get_pulse_checkin_by_id(self.db, checkin["id"]))["status"], "ignored")
         bot.delete_message.assert_awaited_once_with(chat_id=7001, message_id=501)
 
-        local_date = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        now_utc = dt.datetime.now(dt.timezone.utc)
         for slot, callback_data, mid in (
             ("wake", "pulse:manual_wake", 511),
             ("bedtime", "pulse:manual_bedtime", 512),
         ):
+            slot_date = (
+                (now_utc.date() - dt.timedelta(days=1)).isoformat()
+                if (slot == "bedtime" and now_utc.hour < 6)
+                else now_utc.date().isoformat()
+            )
             row = await repo.upsert_pulse_checkin(
-                self.db, self.user_id, local_date, slot, "sleep",
+                self.db, self.user_id, slot_date, slot, "sleep",
                 self.now.isoformat(), self.now.isoformat(),
             )
             await repo.update_pulse_checkin(

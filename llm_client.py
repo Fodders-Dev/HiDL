@@ -8,6 +8,8 @@ OpenAI-совместимый `/chat/completions`, прокси, ретраи н
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import datetime as dt
 import json
 import re
 from dataclasses import dataclass
@@ -15,12 +17,50 @@ from typing import Any, Optional
 
 import aiohttp
 
-from config import LLMRouteSettings, LLMSettings, get_llm_settings
+from config import LLMRouteSettings, LLMSettings, get_llm_daily_limit, get_llm_settings, get_owner_telegram_id
 from utils.logger import log_error, log_info
 
 ATTEMPTS = 3
 RETRY_BACKOFF_SEC = (0.3, 0.8)
 _JSON_OPEN_TO_CLOSE = {"{": "}", "[": "]"}
+
+_CURRENT_LLM_TG_USER_ID: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "hidl_llm_tg_user_id",
+    default=None,
+)
+_DAILY_USER_COUNTS: dict[tuple[str, int], int] = {}
+
+
+def set_current_llm_user(tg_user_id: Optional[int]) -> contextvars.Token:
+    """Bind current Telegram user ID to async context for per-user LLM quota tracking."""
+    val = int(tg_user_id) if tg_user_id is not None else None
+    return _CURRENT_LLM_TG_USER_ID.set(val)
+
+
+def reset_current_llm_user(token: contextvars.Token) -> None:
+    """Restore previous Telegram user ID context."""
+    _CURRENT_LLM_TG_USER_ID.reset(token)
+
+
+def _today_utc_str() -> str:
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+
+def get_user_daily_llm_usage(tg_user_id: int, utc_date: Optional[str] = None) -> int:
+    """Return counted LLM calls for tg_user_id on utc_date (defaults to today UTC)."""
+    day = utc_date or _today_utc_str()
+    return int(_DAILY_USER_COUNTS.get((day, int(tg_user_id)), 0))
+
+
+def reset_daily_quota_counters() -> None:
+    """Clear in-memory daily LLM counters (intended for unit tests)."""
+    _DAILY_USER_COUNTS.clear()
+
+
+def _prune_old_quota_days(today_utc: str) -> None:
+    stale = [key for key in _DAILY_USER_COUNTS if key[0] != today_utc]
+    for key in stale:
+        _DAILY_USER_COUNTS.pop(key, None)
 
 
 @dataclass(frozen=True)
@@ -398,6 +438,21 @@ class LLMClient:
         enabled, routes, timeout_sec, default_max_tokens = self._resolve_routes()
         if not enabled or not routes:
             return LLMResult(ok=False, error="llm_not_configured")
+
+        if self._explicit_route is None:
+            tg_uid = _CURRENT_LLM_TG_USER_ID.get()
+            if tg_uid is not None:
+                limit = get_llm_daily_limit()
+                owner_id = get_owner_telegram_id()
+                if limit > 0 and (not owner_id or int(tg_uid) != owner_id):
+                    today_utc = _today_utc_str()
+                    _prune_old_quota_days(today_utc)
+                    key = (today_utc, int(tg_uid))
+                    used = _DAILY_USER_COUNTS.get(key, 0)
+                    if used >= limit:
+                        log_info(f"[llm] daily quota exceeded tg_user_id={tg_uid} limit={limit}")
+                        return LLMResult(ok=False, error="daily_quota_exceeded")
+                    _DAILY_USER_COUNTS[key] = used + 1
 
         effective_tokens = max_tokens or default_max_tokens
         last_result = LLMResult(ok=False, error="llm_not_configured")

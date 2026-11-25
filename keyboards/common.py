@@ -48,8 +48,9 @@ def more_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="⚙ Настройки", callback_data="settings:main"),
-                InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu"),
+                InlineKeyboardButton(text="💬 Баг / идея автору", callback_data="fb:start"),
             ],
+            [InlineKeyboardButton(text="🆘 Помощь сейчас", callback_data="help:menu")],
         ]
     )
 

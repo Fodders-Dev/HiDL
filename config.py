@@ -386,6 +386,19 @@ _DEFAULT_GCAL_SCOPES = (
 )
 
 
+def get_owner_telegram_id() -> int:
+    """Return configured owner Telegram ID (OWNER_TELEGRAM_ID or MCP_OWNER_TELEGRAM_ID)."""
+    raw = _env_int("OWNER_TELEGRAM_ID", 0)
+    if raw > 0:
+        return raw
+    return max(0, _env_int("MCP_OWNER_TELEGRAM_ID", 0))
+
+
+def get_llm_daily_limit() -> int:
+    """Return daily per-user LLM request limit for non-owner users (0 disables limit)."""
+    return max(0, _env_int("LLM_DAILY_LIMIT_PER_USER", 40))
+
+
 def get_gcal_settings() -> GoogleCalendarSettings:
     """Build GoogleCalendarSettings from environment variables."""
     client_id = _env_str("GCAL_CLIENT_ID")

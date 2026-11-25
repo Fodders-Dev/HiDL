@@ -1,6 +1,8 @@
 import asyncio
 import logging
 
+from aiogram.types import BotCommand
+
 from config import get_llm_settings, get_settings, get_stt_settings
 from hidl.app import create_app
 from scheduler.reminder import ReminderScheduler
@@ -36,6 +38,26 @@ def _log_startup_summary() -> None:
     )
 
 
+async def _register_bot_commands(bot) -> None:
+    """Register clean Russian Telegram command menu."""
+    commands = [
+        BotCommand(command="today", description="План дня и прогресс"),
+        BotCommand(command="menu", description="Главное меню"),
+        BotCommand(command="house", description="Общий дом и покупки"),
+        BotCommand(command="diary", description="Дневник и заметки"),
+        BotCommand(command="pantry", description="Мой холодильник"),
+        BotCommand(command="reminders", description="Мои напоминания"),
+        BotCommand(command="sleep", description="Режим сна и пауза"),
+        BotCommand(command="settings", description="Настройки и профиль"),
+        BotCommand(command="feedback", description="Написать автору / баг"),
+        BotCommand(command="help", description="Справка и примеры"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to set bot commands: %s", exc)
+
+
 async def main() -> None:
     """
     Точка входа «боевого» бота HiDL.
@@ -48,6 +70,7 @@ async def main() -> None:
 
     scheduler = ReminderScheduler(ctx.bot, ctx.db_conn)
     scheduler.start()
+    await _register_bot_commands(ctx.bot)
 
     try:
         await ctx.dp.start_polling(ctx.bot)

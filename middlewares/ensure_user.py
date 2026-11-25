@@ -1,6 +1,7 @@
 from aiogram import BaseMiddleware
 
 from db import repositories as repo
+from llm_client import reset_current_llm_user, set_current_llm_user
 from utils.profile import is_student_mode
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from utils.menu_match import match_menu_label
@@ -29,9 +30,12 @@ STUDENT_BLOCKED_LABELS = {
 
 def _student_blocked(event, message) -> bool:
     callback_data = getattr(event, "data", "") or ""
-    if callback_data.startswith(STUDENT_BLOCKED_CALLBACKS) or callback_data in {
+    if callback_data.startswith(STUDENT_BLOCKED_CALLBACKS) or callback_data.startswith((
+        "settings:household_kick_ask:", "settings:household_kick_do:",
+    )) or callback_data in {
         "settings:expiry", "settings:household", "settings:household_create",
-        "settings:household_join", "settings:mealprof", "settings:notify:meal",
+        "settings:household_join", "settings:household_kick_menu",
+        "settings:mealprof", "settings:notify:meal",
         "help:mess", "help:food",
     } or callback_data.startswith("settings:mealprof:set:"):
         return True
@@ -59,24 +63,29 @@ class EnsureUserMiddleware(BaseMiddleware):
         message = getattr(effective_event, "message", None) if getattr(effective_event, "data", None) is not None else effective_event
         text = getattr(effective_event, "text", None) or getattr(message, "text", None)
         if from_user:
-            # /start должен запускать регистрацию как "нового" пользователя.
-            if effective_event is not getattr(event, "callback_query", None) and text and text.startswith("/start"):
+            tok = set_current_llm_user(int(from_user.id))
+            try:
+                # /start должен запускать регистрацию как "нового" пользователя.
+                if effective_event is not getattr(event, "callback_query", None) and text and text.startswith("/start"):
+                    return await handler(event, data)
+                # Если юзер уже существует — ничего не делаем (хендлеры сами дергают ensure_user при необходимости).
+                # Если юзера нет — тоже ничего не делаем: пусть /start проведёт регистрацию.
+                user_row = await repo.get_user_by_telegram_id(self.conn, from_user.id)
+                if user_row:
+                    user = dict(user_row)
+                    data["user"] = user
+                    if is_student_mode(user) and _student_blocked(effective_event, message):
+                        target = message
+                        if target:
+                            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                                InlineKeyboardButton(text="⚙ Настройки", callback_data="settings:main")
+                            ]])
+                            await target.answer("Этот раздел скрыт в режиме «Ученик». Его можно вернуть в настройках профиля.", reply_markup=kb)
+                        if getattr(effective_event, "data", None) is not None and hasattr(effective_event, "answer"):
+                            await effective_event.answer()
+                        return None
+                    return await handler(event, data)
                 return await handler(event, data)
-            # Если юзер уже существует — ничего не делаем (хендлеры сами дергают ensure_user при необходимости).
-            # Если юзера нет — тоже ничего не делаем: пусть /start проведёт регистрацию.
-            user_row = await repo.get_user_by_telegram_id(self.conn, from_user.id)
-            if user_row:
-                user = dict(user_row)
-                data["user"] = user
-                if is_student_mode(user) and _student_blocked(effective_event, message):
-                    target = message
-                    if target:
-                        kb = InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="⚙ Настройки", callback_data="settings:main")
-                        ]])
-                        await target.answer("Этот раздел скрыт в режиме «Ученик». Его можно вернуть в настройках профиля.", reply_markup=kb)
-                    if getattr(effective_event, "data", None) is not None and hasattr(effective_event, "answer"):
-                        await effective_event.answer()
-                    return None
-                return await handler(event, data)
+            finally:
+                reset_current_llm_user(tok)
         return await handler(event, data)
