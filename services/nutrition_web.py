@@ -205,12 +205,14 @@ def scale_lookup_record(record: Dict[str, Any], raw_text: str) -> Optional[Dict[
     if not isinstance(record, dict):
         return None
     per_100 = record.get("per_100g") if isinstance(record.get("per_100g"), dict) else {}
+    has_p100 = "kcal" in per_100 and per_100.get("kcal") is not None
     p100_k = float(per_100.get("kcal") or 0)
     p100_p = float(per_100.get("protein_g") or 0)
     p100_f = float(per_100.get("fat_g") or 0)
     p100_c = float(per_100.get("carbs_g") or 0)
 
     serving_g = float(record.get("serving_g") or 0)
+    has_srv = record.get("kcal_serving") is not None
     kcal_srv = float(record.get("kcal_serving") or 0)
     p_srv = float(record.get("protein_g") or 0)
     f_srv = float(record.get("fat_g") or 0)
@@ -218,21 +220,21 @@ def scale_lookup_record(record: Dict[str, Any], raw_text: str) -> Optional[Dict[
 
     explicit_grams, mult = extract_requested_grams_and_mult(raw_text, default_serving_g=serving_g)
 
-    if explicit_grams is not None and p100_k > 0:
+    if explicit_grams is not None and has_p100:
         factor = explicit_grams / 100.0
         kcal = p100_k * factor
         prot = p100_p * factor
         fat = p100_f * factor
         carbs = p100_c * factor
         portion_note = f"{int(round(explicit_grams))} г"
-    elif explicit_grams is not None and kcal_srv > 0 and serving_g > 0:
+    elif explicit_grams is not None and has_srv and serving_g > 0:
         factor = explicit_grams / serving_g
         kcal = kcal_srv * factor
         prot = p_srv * factor
         fat = f_srv * factor
         carbs = c_srv * factor
         portion_note = f"{int(round(explicit_grams))} г"
-    elif kcal_srv > 0:
+    elif has_srv:
         kcal = kcal_srv * mult
         prot = p_srv * mult
         fat = f_srv * mult
@@ -242,7 +244,7 @@ def scale_lookup_record(record: Dict[str, Any], raw_text: str) -> Optional[Dict[
             if mult != 1.0
             else (f"~{int(round(serving_g))} г" if serving_g > 0 else "1 порция")
         )
-    elif p100_k > 0:
+    elif has_p100:
         base_g = serving_g if serving_g > 0 else 100.0
         factor = (base_g / 100.0) * mult
         kcal = p100_k * factor
@@ -253,7 +255,7 @@ def scale_lookup_record(record: Dict[str, Any], raw_text: str) -> Optional[Dict[
     else:
         return None
 
-    if not (5.0 <= kcal <= 4500.0):
+    if not (0.0 <= kcal <= 4500.0):
         return None
     title = str(record.get("title") or "").strip()
     if mult != 1.0 and explicit_grams is None and title and f"{mult:g}" not in title:
@@ -292,11 +294,16 @@ def _extract_off_record(hit: Dict[str, Any], code: str = "") -> Optional[Dict[st
     nutr = hit.get("nutriments") or {}
     if not isinstance(nutr, dict):
         return None
+    raw_kcal_100 = nutr.get("energy-kcal_100g")
+    if raw_kcal_100 is None:
+        raw_kcal_100 = nutr.get("energy-kcal")
+    if raw_kcal_100 is None:
+        return None
     try:
-        kcal_100 = float(nutr.get("energy-kcal_100g") or nutr.get("energy-kcal") or 0.0)
+        kcal_100 = float(raw_kcal_100)
     except (TypeError, ValueError):
-        kcal_100 = 0.0
-    if not (5.0 <= kcal_100 <= 950.0):
+        return None
+    if not (0.0 <= kcal_100 <= 950.0):
         return None
 
     def _f(key: str) -> float:
@@ -434,6 +441,7 @@ async def search_web_nutrition(
             return 0.0
 
     per_100_raw = data.get("per_100g") if isinstance(data.get("per_100g"), dict) else {}
+    has_p100 = per_100_raw.get("kcal") is not None
     per_100 = {
         "kcal": _f(per_100_raw.get("kcal")),
         "protein_g": _f(per_100_raw.get("protein_g")),
@@ -441,8 +449,9 @@ async def search_web_nutrition(
         "carbs_g": _f(per_100_raw.get("carbs_g")),
     }
     serving_g = _f(data.get("serving_g"))
+    has_srv = data.get("kcal_serving") is not None
     kcal_srv = _f(data.get("kcal_serving"))
-    if not (5.0 <= kcal_srv <= 4000.0) and not (5.0 <= per_100["kcal"] <= 950.0):
+    if not ((has_srv and 0.0 <= kcal_srv <= 4000.0) or (has_p100 and 0.0 <= per_100["kcal"] <= 950.0)):
         return None
 
     citations = data.get("_citations") if isinstance(data.get("_citations"), list) else []

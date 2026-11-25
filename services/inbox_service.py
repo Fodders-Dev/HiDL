@@ -583,6 +583,11 @@ async def _persist_meal_item(
         }
 
     meal_title = str(parsed_meal.get("title") or title_hint or "Приём пищи").strip()
+    if len(th) >= 3 and (
+        meal_title.startswith(f"{th}.")
+        or (len(raw_for_parse) > 70 and meal_title == raw_for_parse[:70])
+    ):
+        meal_title = th[:70]
     meal_slot = str(parsed_meal.get("meal_slot") or "snack")
     if allow_clarification and parsed_meal.get("needs_clarification") and parsed_meal.get("clarification_question"):
         pending_id = await repo.create_pending_meal_clarification(

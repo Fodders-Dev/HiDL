@@ -270,6 +270,9 @@ _NUTRITION_DB: Dict[str, Tuple[float, float, float, float]] = {
     "батончик": (365, 18.0, 12.0, 42.0),
     "йогурт": (72, 4.5, 2.5, 7.8),
     "кефир": (51, 3.0, 2.5, 4.0),
+    "чай": (1, 0.0, 0.0, 0.2),
+    "кола": (42, 0.0, 0.0, 10.6),
+    "лимонад": (40, 0.0, 0.0, 10.0),
 }
 
 _PIECE_WEIGHTS_G: Dict[str, float] = {
@@ -318,6 +321,10 @@ _PIECE_WEIGHTS_G: Dict[str, float] = {
     "батончик": 55.0,
     "йогурт": 150.0,
     "кефир": 250.0,
+    "вода": 250.0,
+    "чай": 250.0,
+    "кола": 250.0,
+    "лимонад": 250.0,
 }
 
 _SORTED_NUTRITION_KEYS = sorted(_NUTRITION_DB.keys(), key=len, reverse=True)
@@ -484,6 +491,18 @@ def calculate_daily_targets(
     }
 
 
+_NEGATED_MODIFIER_RE = re.compile(
+    r"(?iu)\bбез\s+(?:добавленн\w+\s+|добавления\s+)?[а-яёa-z]+(?:\s+и\s+[а-яёa-z]+)?\b"
+)
+
+
+def _strip_negated_modifiers(text: str) -> str:
+    """Убрать отрицательные уточнения вида 'без сахара', 'без масла и соли' до поиска ингредиентов."""
+    low = str(text or "").casefold().replace("ё", "е")
+    stripped = _NEGATED_MODIFIER_RE.sub(" ", low)
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
 def _food_stem(key: str) -> str:
     k = str(key or "").casefold().replace("ё", "е").strip()
     if len(k) >= 5 and k.endswith(("а", "я", "о", "е", "ь", "ы", "и")):
@@ -492,7 +511,7 @@ def _food_stem(key: str) -> str:
 
 
 def _match_nutrition_key(name: str) -> Optional[str]:
-    low = str(name or "").casefold().replace("ё", "е").strip()
+    low = _strip_negated_modifiers(name)
     if not low:
         return None
     for key in _SORTED_NUTRITION_KEYS:
@@ -504,6 +523,10 @@ def _match_nutrition_key(name: str) -> Optional[str]:
             return key
     if "яиц" in low or "яич" in low or "яйц" in low:
         return "яйцо"
+    if re.search(r"\bкол[аеуыо]й?\b", low):
+        return "кола"
+    if re.search(r"\bча[йюяе]\b", low):
+        return "чай"
     return None
 
 
@@ -538,17 +561,26 @@ def _ingredient_grams(name: str, qty: float, unit: str) -> float:
     return q * 60.0
 
 
-def _normalize_nutrition_dict(raw: Any, *, estimated: bool = False) -> Optional[Dict[str, Any]]:
+def _normalize_nutrition_dict(
+    raw: Any, *, estimated: bool = False, allow_zero: bool = False
+) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
+    if allow_zero and ("kcal" not in raw or raw.get("kcal") is None):
+        return None
     try:
-        kcal = float(raw.get("kcal") or 0)
+        kcal = float(raw.get("kcal") if raw.get("kcal") is not None else 0)
         p = float(raw.get("protein_g") if raw.get("protein_g") is not None else raw.get("protein") or 0)
         f = float(raw.get("fat_g") if raw.get("fat_g") is not None else raw.get("fat") or 0)
         c = float(raw.get("carbs_g") if raw.get("carbs_g") is not None else raw.get("carbs") or 0)
     except (TypeError, ValueError):
         return None
-    if kcal <= 0:
+    if allow_zero:
+        if not (0.0 <= kcal <= 6000.0):
+            return None
+        if kcal == 0 and not str(raw.get("title") or "").strip():
+            return None
+    elif kcal <= 0:
         return None
     return {
         "kcal": int(round(kcal)),
@@ -740,9 +772,15 @@ _MEAL_PARSE_PROMPT = (
     "Правила:\n"
     "1. Если на фото таблица пищевой ценности (КБЖУ на 100 г/мл): поставь is_nutrition_label=true, заполни точные per_100g, "
     "вытащи название продукта и в kcal/protein_g/fat_g/carbs_g посчитай порцию (из комментария пользователя или стандартной упаковки serving_g).\n"
-    "2. Если описание достаточно понятное (\"банан\", \"овсянка 80 г\", \"латте 300 мл\", \"гречка с тофу\", \"блин с ветчиной и сыром в теремке\"): "
+    "2. Напитки без калорий и сахара (кола зеро / без сахара / без калорий, вода, чай или чёрный кофе без сахара и молока): "
+    "ставь kcal=0, protein_g=0, fat_g=0, carbs_g=0, needs_clarification=false.\n"
+    "3. Учитывай профиль питания пользователя из контекста: если профиль vegan/vegetarian, считай блюда растительными "
+    "(например, 'фарш', 'котлета', 'молоко', 'сыр' — растительные/веганские, типа Hi!) и не спрашивай, какое мясо использовалось.\n"
+    "4. Если пользователь ссылается на вчерашний или недавний приём пищи ('то, что ел вчера', 'как вчера', 'доел вчерашнее') "
+    "и он есть в списке недавних приёмов пищи в контексте — используй и при необходимости отмасштабируй его КБЖУ, не задавай лишних вопросов.\n"
+    "5. Если описание достаточно понятное (\"банан\", \"овсянка 80 г\", \"латте 300 мл\", \"гречка с тофу\", \"блин с ветчиной и сыром в теремке\"): "
     "needs_clarification=false, clarification_question=\"\". Не мучай лишними вопросами.\n"
-    "3. Ставь needs_clarification=true и короткий вопрос (1 фраза по-русски, например \"Какие блины и сколько штук?\") "
+    "6. Ставь needs_clarification=true и короткий вопрос (1 фраза по-русски, например \"Какие блины и сколько штук?\") "
     "ТОЛЬКО если совсем непонятен размер/начинка/состав (\"поел суп\", \"блины в теремке\", \"кофе с булочкой\", \"съел торт\", \"пообедал в кафе\"), "
     "но при этом всё равно заполни лучшую примерную оценку kcal/БЖУ."
 )
@@ -1061,6 +1099,82 @@ def _parse_label_math_offline(raw_text: str, title_hint: str = "") -> Optional[D
     }
 
 
+_ZERO_CAL_EXPLICIT_RE = re.compile(
+    r"(?iu)(?:\bбез\s+калор\w*|\bноль\s+калор\w*|\b0\s*(?:ккал|kcal|калор\w*)|\bzero\s*kcal\b)"
+)
+_ZERO_SUGAR_QUALIFIER_RE = re.compile(
+    r"(?iu)(?:\bбез\s+(?:добавленн\w+\s+)?сахар\w*|\bзеро\b|\bzero\b|\bлайт\b|\blight\b|"
+    r"\bsugar[\s-]*free\b|\bno[\s-]*sugar\b|\bпепси\s+макс\b|\bpepsi\s+max\b)"
+)
+_ZERO_CAL_DRINK_RE = re.compile(
+    r"(?iu)\b(?:кол[аеуыо]й?|кок[аеу]-?кол\w*|coca[\s-]*cola|пепси|pepsi|спрайт|sprite|"
+    r"фанта|fanta|газировк\w*|лимонад\w*|энергетик\w*|напит\w*|ча[йюяе]|кофе|вод[аыу]|"
+    r"минералк\w*|американо|эспрессо|тоник\w*|айс[\s-]*ти|icetea)\b"
+)
+_PURE_ZERO_DRINK_RE = re.compile(
+    r"(?iu)\b(?:вод[аыу]|минералк\w*|минеральн\w+\s+вод\w*|боржоми|ессентуки|"
+    r"американо|эспрессо|ч[её]рн\w+\s+кофе)\b"
+)
+_CALORIC_DRINK_ADDIN_RE = re.compile(
+    r"(?iu)(?:\bсо?\s+(?:молок\w*|сливк\w*|сгущ\w*|сироп\w*|м[её]д\w*|сахар\w*|пенк\w*|морожен\w*|пломбир\w*)|"
+    r"\b(?:латте|капучино|раф|смузи|коктейл\w*|горяч\w+\s+шоколад\w*|какао|матча)\b)"
+)
+_ZERO_DRINK_KEY_ALLOWLIST = {None, "вода", "кипяток", "чай", "кофе", "кола", "лимонад", "лимон"}
+
+
+def _clean_drink_title(raw_text: str, title_hint: str = "") -> str:
+    hint = str(title_hint or "").strip()
+    if len(hint) >= 3:
+        return hint[:70]
+    cleaned = re.sub(
+        r"(?iu)^(?:я\s+|только\s+что\s+|ещ[её]\s+)*"
+        r"(?:запивал[аи]?\s+(?:это|всё|все)?|выпил[аи]?|попил[аи]?|пью|съел[аи]?)\s*",
+        "",
+        str(raw_text or "").strip(),
+    ).strip(" .,-:")
+    return (cleaned or str(raw_text or "").strip())[:70]
+
+
+def _parse_zero_calorie_drink(raw_text: str, title_hint: str = "") -> Optional[Dict[str, Any]]:
+    """Распознать напиток без калорий/сахара (кола зеро, вода, чай/американо без сахара и т.п.)."""
+    text = re.sub(r"\s+", " ", str(raw_text or "").strip())
+    if not text:
+        return None
+    low = text.casefold().replace("ё", "е")
+    stripped = _strip_negated_modifiers(low)
+    if _CALORIC_DRINK_ADDIN_RE.search(stripped):
+        return None
+
+    parts = [p.strip() for p in re.split(r"[,;\n]+|\s+\+\s+|\s+и\s+", stripped) if p.strip()]
+    for part in parts or [stripped]:
+        if _match_nutrition_key(part) not in _ZERO_DRINK_KEY_ALLOWLIST:
+            return None
+
+    has_explicit_zero = bool(_ZERO_CAL_EXPLICIT_RE.search(low))
+    has_drink_word = bool(_ZERO_CAL_DRINK_RE.search(low))
+    has_zero_sugar = bool(_ZERO_SUGAR_QUALIFIER_RE.search(low))
+    has_pure_zero_drink = bool(_PURE_ZERO_DRINK_RE.search(low))
+
+    if not (
+        (has_explicit_zero and (has_drink_word or bool(parts)))
+        or (has_drink_word and has_zero_sugar)
+        or has_pure_zero_drink
+    ):
+        return None
+
+    return {
+        "title": _clean_drink_title(text, title_hint=title_hint),
+        "meal_slot": "snack",
+        "kcal": 0,
+        "protein_g": 0.0,
+        "fat_g": 0.0,
+        "carbs_g": 0.0,
+        "estimated": False,
+        "needs_clarification": False,
+        "clarification_question": "",
+    }
+
+
 def _parse_meal_offline(raw_text: str, title_hint: str = "") -> Optional[Dict[str, Any]]:
     text = re.sub(r"\s+", " ", str(raw_text or "").strip())
     if not text:
@@ -1068,6 +1182,9 @@ def _parse_meal_offline(raw_text: str, title_hint: str = "") -> Optional[Dict[st
     label_res = _parse_label_math_offline(text, title_hint=title_hint)
     if label_res is not None:
         return label_res
+    zero_res = _parse_zero_calorie_drink(text, title_hint=title_hint)
+    if zero_res is not None:
+        return zero_res
 
     low = text.casefold().replace("ё", "е")
 
@@ -1081,7 +1198,11 @@ def _parse_meal_offline(raw_text: str, title_hint: str = "") -> Optional[Dict[st
         p = float(p_m.group(1).replace(",", ".")) if p_m else round(kcal * 0.20 / 4.0, 1)
         f = float(f_m.group(1).replace(",", ".")) if f_m else round(kcal * 0.28 / 9.0, 1)
         c = float(c_m.group(1).replace(",", ".")) if c_m else round(kcal * 0.52 / 4.0, 1)
-        clean_title = re.sub(r"\d+.*$", "", text).strip(" -:,.") or text[:50]
+        clean_title = (
+            title_hint.strip()[:70]
+            if len(str(title_hint or "").strip()) >= 3
+            else (re.sub(r"\d+.*$", "", text).strip(" -:,.") or text[:50])
+        )
         return {
             "title": clean_title,
             "meal_slot": "snack",
@@ -1096,30 +1217,34 @@ def _parse_meal_offline(raw_text: str, title_hint: str = "") -> Optional[Dict[st
     matched_any = False
     for part in parts:
         key = _match_nutrition_key(part)
-        qty_m = re.search(r"(\d+(?:[.,]\d+)?)\s*(кг|kg|г|гр|g|мл|ml|л|l|шт)?", part.lower())
+        if key is None:
+            continue
+        qty_m = re.search(
+            r"(\d+(?:[.,]\d+)?)\s*(кг|kg|г|гр|g|мл|ml|л|l|шт|стакан\w*|круж\w*|порц\w*)?",
+            part.lower(),
+        )
         qty = float(qty_m.group(1).replace(",", ".")) if qty_m and qty_m.group(1) else 1.0
         unit = (qty_m.group(2) or "шт") if qty_m else "шт"
         if qty_m and qty >= 15 and not qty_m.group(2):
             unit = "г"
         grams = _ingredient_grams(part, qty, unit)
-        if key is not None:
-            k100, p100, f100, c100 = _NUTRITION_DB[key]
-            matched_any = True
-        else:
-            k100, p100, f100, c100 = (150.0, 5.0, 5.0, 20.0)
-            grams = max(grams, 100.0)
+        k100, p100, f100, c100 = _NUTRITION_DB[key]
+        matched_any = True
         factor = grams / 100.0
         total_k += k100 * factor
         total_p += p100 * factor
         total_f += f100 * factor
         total_c += c100 * factor
 
-    if not matched_any and total_k <= 0:
-        return None
+    if not matched_any:
+        # Одно консервативное оценочное значение, а не 150 * число запятых
+        total_k, total_p, total_f, total_c = 150.0, 5.0, 5.0, 20.0
+    clean_hint = str(title_hint or "").strip()
+    out_title = clean_hint[:70] if len(clean_hint) >= 3 else text[:70]
     return {
-        "title": text[:70],
+        "title": out_title,
         "meal_slot": "snack",
-        "kcal": int(round(max(10.0, total_k))),
+        "kcal": int(round(max(0.0, total_k) if matched_any else max(10.0, total_k))),
         "protein_g": round(total_p, 1),
         "fat_g": round(total_f, 1),
         "carbs_g": round(total_c, 1),
@@ -1195,7 +1320,9 @@ async def parse_meal_input(
         )
         if not res.ok or not isinstance(res.data, dict):
             return {"ok": False, "error": res.error or "vision_parse_failed"}
-        norm = _normalize_nutrition_dict(res.data, estimated=not bool(res.data.get("is_nutrition_label")))
+        norm = _normalize_nutrition_dict(
+            res.data, estimated=not bool(res.data.get("is_nutrition_label")), allow_zero=True
+        )
         if not norm:
             return {"ok": False, "error": "no_meal_found"}
         slot = str(res.data.get("meal_slot") or "snack").strip().lower()
@@ -1259,6 +1386,11 @@ async def parse_meal_input(
         )
         return {"ok": True, "used_llm": False, "estimated": False, **label_hit}
 
+    # 1b. Напитки без калорий (кола зеро / без сахара, вода, чай/американо без сахара)
+    zero_hit = _parse_zero_calorie_drink(clean_text, title_hint=title_hint)
+    if zero_hit is not None:
+        return {"ok": True, "used_llm": False, **zero_hit}
+
     # 2. Многоуровневый справочник: личные этикетки -> SQLite кэш -> OpenFoodFacts / Web Search
     allow_net_now = bool(
         allow_web_lookup
@@ -1294,11 +1426,51 @@ async def parse_meal_input(
 
     # 3. Умный LLM-разбор (если настроен)
     if client.is_configured():
+        llm_prompt = f"Оцени КБЖУ съеденного:\n{clean_text}"
+        if db is not None and user_id is not None:
+            ctx_lines: List[str] = []
+            try:
+                wellness = await repo.get_wellness(db, int(user_id)) or {}
+                meal_profile = str(wellness.get("meal_profile") or "").strip().lower()
+                if meal_profile and meal_profile != "omnivore":
+                    ctx_lines.append(f"Профиль питания пользователя: {meal_profile}")
+                if re.search(
+                    r"(?iu)\b(?:вчера|позавчера|вчерашн\w*|прошл\w*|то\s*,?\s*что\s+ел|"
+                    r"как\s+вчера|то\s+же|такой\s+же|такую\s+же|доел\w*|осталось)\b",
+                    clean_text,
+                ):
+                    cur = await db.execute(
+                        """
+                        SELECT local_date, meal_slot, title, kcal, protein_g, fat_g, carbs_g
+                        FROM meal_logs
+                        WHERE user_id = ?
+                        ORDER BY id DESC
+                        LIMIT 6
+                        """,
+                        (int(user_id),),
+                    )
+                    recent_rows = await cur.fetchall()
+                    if recent_rows:
+                        ctx_lines.append("Недавние приёмы пищи пользователя:")
+                        for mr in recent_rows:
+                            r = dict(mr)
+                            ctx_lines.append(
+                                f"- {r.get('local_date')} ({r.get('meal_slot')}): {r.get('title')} — "
+                                f"{int(round(float(r.get('kcal') or 0)))} ккал "
+                                f"(Б{round(float(r.get('protein_g') or 0), 1)}/"
+                                f"Ж{round(float(r.get('fat_g') or 0), 1)}/"
+                                f"У{round(float(r.get('carbs_g') or 0), 1)})"
+                            )
+            except Exception:
+                pass
+            if ctx_lines:
+                llm_prompt += "\n\nКонтекст:\n" + "\n".join(ctx_lines)
+
         res = await client.complete_json(
-            _MEAL_PARSE_PROMPT, f"Оцени КБЖУ съеденного:\n{clean_text}", temperature=0.1, max_tokens=550
+            _MEAL_PARSE_PROMPT, llm_prompt, temperature=0.1, max_tokens=550
         )
         if res.ok and isinstance(res.data, dict):
-            norm = _normalize_nutrition_dict(res.data, estimated=True)
+            norm = _normalize_nutrition_dict(res.data, estimated=True, allow_zero=True)
             if norm:
                 slot = str(res.data.get("meal_slot") or "snack").strip().lower()
                 clar_q = str(res.data.get("clarification_question") or "").strip() if allow_clarification else ""
