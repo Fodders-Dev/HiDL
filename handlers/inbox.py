@@ -344,8 +344,14 @@ async def _process_unsolicited_image(
             if not committed["advice"]["targets"].get("mindful_mode"):
                 rem = committed["advice"]["remaining"]
                 rem_line = f"\nОстаток на сегодня: <b>{rem['kcal']} ккал</b> · белок +{rem['protein_g']} г"
+            from handlers import nutrition
+
+            deduct_rows = await nutrition._pantry_deduct_rows_for_meal(  # noqa: SLF001
+                db, user, f"{combined_cap} {committed['title']}"
+            )
             kb = InlineKeyboardMarkup(
-                inline_keyboard=[
+                inline_keyboard=deduct_rows
+                + [
                     [
                         InlineKeyboardButton(text="✏️ Поправить", callback_data=f"kbju:refine:{committed['meal_id']}"),
                         InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
@@ -373,6 +379,8 @@ async def _process_unsolicited_image(
         allow_clarification=False,
     )
     if parsed_meal.get("ok"):
+        if caption and not parsed_meal.get("raw_input"):
+            parsed_meal["raw_input"] = caption
         await nutrition._show_meal_preview(message, state, parsed_meal)
         return
 

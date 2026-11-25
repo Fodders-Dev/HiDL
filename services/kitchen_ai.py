@@ -1010,6 +1010,296 @@ async def commit_cooked_recipe(
     }
 
 
+_COUNT_WORDS_MAP: Dict[str, float] = {
+    "пол": 0.5,
+    "половина": 0.5,
+    "половину": 0.5,
+    "половинка": 0.5,
+    "половинку": 0.5,
+    "один": 1.0,
+    "одно": 1.0,
+    "одна": 1.0,
+    "одну": 1.0,
+    "пару": 2.0,
+    "пара": 2.0,
+    "два": 2.0,
+    "две": 2.0,
+    "три": 3.0,
+    "четыре": 4.0,
+    "пять": 5.0,
+    "шесть": 6.0,
+}
+
+_PIECE_WEIGHT_G: Dict[str, float] = {
+    "яблок": 180.0,
+    "банан": 120.0,
+    "апельсин": 200.0,
+    "груш": 170.0,
+    "авокад": 180.0,
+    "помидор": 120.0,
+    "томат": 120.0,
+    "огур": 120.0,
+    "картоф": 130.0,
+    "картош": 130.0,
+    "лук": 100.0,
+    "морков": 100.0,
+    "яйц": 60.0,
+    "перец": 150.0,
+    "киви": 80.0,
+    "мандарин": 80.0,
+    "лимон": 100.0,
+    "персик": 140.0,
+    "блинчик": 70.0,
+    "тост": 35.0,
+    "хлеб": 35.0,
+    "лаваш": 90.0,
+}
+
+_UNIT_ALIAS_RX = (
+    r"(?:кг|kg|гр?\.?|грамм\w*|мл|ml|л|l|шт\.?|штук\w*|ст\.?\s*л\.?|ч\.?\s*л\.?|"
+    r"столов\w*\s+лож\w*|чайн\w*\s+лож\w*|лож(?:ка|ки|ку|ек))"
+)
+_NUM_OR_WORD_RX = (
+    r"(?:(?P<num>\d+(?:[.,]\d+)?)|"
+    r"(?P<word>половинка|половинку|половина|половину|пол|один|одно|одна|одну|"
+    r"пару|пара|два|две|три|четыре|пять|шесть))"
+)
+_QTY_EXTRACT_RE = re.compile(
+    rf"(?iu)(?<![a-zа-я0-9]){_NUM_OR_WORD_RX}(?:\s+(?P<unit>{_UNIT_ALIAS_RX}))?(?![a-zа-я0-9])"
+)
+
+
+def _norm_deduct_unit(raw_unit: str) -> str:
+    u = re.sub(r"\s+", " ", (raw_unit or "").strip().lower()).rstrip(".")
+    if not u:
+        return ""
+    if u in {"кг", "kg"}:
+        return "kg"
+    if u in {"г", "гр", "g"} or u.startswith("грамм"):
+        return "g"
+    if u in {"мл", "ml"}:
+        return "ml"
+    if u in {"л", "l"}:
+        return "l"
+    if u in {"ч л", "ч.л", "ч. л"} or "чайн" in u:
+        return "ч. л."
+    if u in {"ст л", "ст.л", "ст. л"} or "столов" in u or u.startswith("лож"):
+        return "ст. л."
+    if u == "шт" or u.startswith("штук"):
+        return "шт"
+    return u
+
+
+def parse_requested_deduct_qty(raw_text: str) -> Tuple[Optional[float], str]:
+    """Извлечь явно запрошенное количество и единицу списания; (None, '') если не указано."""
+    txt = (raw_text or "").strip().casefold().replace("ё", "е")
+    if not txt:
+        return None, ""
+    best: Optional[Tuple[float, str]] = None
+    for m in _QTY_EXTRACT_RE.finditer(txt):
+        raw_num = m.group("num")
+        raw_word = m.group("word")
+        unit_raw = m.group("unit") or ""
+        if raw_num:
+            try:
+                qty = float(raw_num.replace(",", "."))
+            except ValueError:
+                continue
+        else:
+            qty = _COUNT_WORDS_MAP.get((raw_word or "").lower(), 0.0)
+        if qty <= 0:
+            continue
+        unit = _norm_deduct_unit(unit_raw)
+        if unit or best is None:
+            best = (qty, unit)
+            if unit:
+                return best
+    return best or (None, "")
+
+
+def _estimate_piece_weight_g(name: str) -> float:
+    low = (name or "").strip().casefold().replace("ё", "е")
+    for stem, grams in _PIECE_WEIGHT_G.items():
+        if stem in low:
+            return grams
+    return 150.0
+
+
+def compute_pantry_deduct_amount(
+    pantry_item: Dict[str, Any],
+    req_qty: Optional[float],
+    req_unit: str,
+    *,
+    default_single: bool = False,
+) -> Optional[float]:
+    """Пересчитать запрошенное количество списания в единицы хранения в холодильнике.
+
+    Возвращает None, если нужно удалить позицию целиком (когда количество не задано и default_single=False).
+    """
+    cur_amt = float(pantry_item.get("amount") or 0.0)
+    p_unit = str(pantry_item.get("unit") or "шт").strip()
+    p_name = str(pantry_item.get("name") or "")
+    _, kind_p = to_base(cur_amt, p_unit)
+
+    if req_qty is None:
+        if not default_single:
+            return None
+        if kind_p == "count":
+            deduct = 1.0
+        elif kind_p == "weight":
+            deduct = from_base(_estimate_piece_weight_g(p_name), p_unit)
+        elif kind_p == "volume":
+            deduct = from_base(200.0, p_unit)
+        else:
+            deduct = 0.2
+    else:
+        u = _norm_deduct_unit(req_unit)
+        if u == "ст. л.":
+            if kind_p == "weight":
+                deduct = from_base(15.0 * req_qty, p_unit)
+            elif kind_p == "volume":
+                deduct = from_base(15.0 * req_qty, p_unit)
+            else:
+                deduct = min(0.5, round(0.08 * req_qty, 2))
+        elif u == "ч. л.":
+            if kind_p in {"weight", "volume"}:
+                deduct = from_base(5.0 * req_qty, p_unit)
+            else:
+                deduct = min(0.3, round(0.04 * req_qty, 2))
+        else:
+            eff_u = u or ("шт" if kind_p in {"count", "weight"} else "")
+            req_base, kind_r = to_base(req_qty, eff_u)
+            if kind_r == kind_p and kind_p != "other":
+                deduct = from_base(req_base, p_unit)
+            elif kind_r == "count" and kind_p == "weight":
+                deduct = from_base(_estimate_piece_weight_g(p_name) * req_qty, p_unit)
+            elif kind_r == "count" and kind_p == "volume":
+                deduct = from_base(200.0 * req_qty, p_unit)
+            elif kind_p == "other":
+                deduct = min(0.5, max(0.1, round(0.1 * req_qty, 2)))
+            else:
+                deduct = req_qty
+
+    deduct = max(0.0, round(float(deduct), 2))
+    if deduct <= 0:
+        deduct = 0.1 if cur_amt >= 0.1 else cur_amt
+    if cur_amt > 0:
+        deduct = min(cur_amt, deduct)
+    return round(deduct, 2)
+
+
+def _strip_qty_words_for_match(segment: str) -> str:
+    txt = _QTY_EXTRACT_RE.sub(" ", (segment or "").strip())
+    txt = re.sub(r"[()]", " ", txt)
+    txt = re.sub(r"\s+", " ", txt).strip(" ,.-")
+    return txt
+
+
+def find_pantry_matches_for_meal_text(
+    pantry_items: List[Dict[str, Any]],
+    meal_text: str,
+    *,
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """Найти продукты из холодильника, упомянутые в съеденном блюде, для 1-тап списания."""
+    raw = (meal_text or "").strip()
+    if not raw or not pantry_items:
+        return []
+
+    segments = [
+        s.strip()
+        for s in re.split(r"\s*(?:,|;|\+|\n|\s+и\s+|\s+с\s+|\s+со\s+|\s+на\s+)\s*", raw, flags=re.IGNORECASE)
+        if s and s.strip()
+    ]
+    if not segments:
+        segments = [raw]
+
+    matches: List[Dict[str, Any]] = []
+    seen_pids: Set[int] = set()
+    for seg in segments:
+        req_qty, req_unit = parse_requested_deduct_qty(seg)
+        seg_clean = _strip_qty_words_for_match(seg) or seg
+        seg_low = seg_clean.casefold().replace("ё", "е")
+        for p in pantry_items:
+            pid = int(p.get("id") or 0)
+            cur_amt = float(p.get("amount") or 0)
+            p_name = str(p.get("name") or "").strip()
+            if not pid or cur_amt <= 0 or not p_name or pid in seen_pids:
+                continue
+            if is_staple_ingredient(p_name):
+                continue
+            p_low = p_name.casefold().replace("ё", "е")
+            if "сгущ" in seg_low and "сгущ" not in p_low:
+                continue
+            if "молок" in p_low and "кофе" in seg_low and "молок" not in seg_low:
+                continue
+            if not ingredients_match(seg_clean, p_name):
+                continue
+            deduct_qty = compute_pantry_deduct_amount(p, req_qty, req_unit, default_single=True)
+            if deduct_qty is None or deduct_qty <= 0:
+                continue
+            p_unit = str(p.get("unit") or "шт").strip()
+            matches.append(
+                {
+                    "pantry_id": pid,
+                    "name": p_name,
+                    "unit": p_unit,
+                    "deduct_qty": deduct_qty,
+                    "btn_label": f"❄️ Списать: {p_name[:20]} (−{format_quantity(deduct_qty, p_unit)})",
+                }
+            )
+            seen_pids.add(pid)
+            if len(matches) >= limit:
+                return matches
+    return matches
+
+
+async def deduct_pantry_entry(
+    db,
+    user_id: int,
+    pantry_id: int,
+    deduct_qty: Optional[float],
+) -> Dict[str, Any]:
+    """Списать указанное количество продукта из холодильника (или удалить, если осталось <= 0.01)."""
+    uid = int(user_id)
+    pid = int(pantry_id)
+    pantry = rows_to_dicts(await repo.list_pantry_items(db, uid))
+    target = next((p for p in pantry if int(p.get("id") or 0) == pid), None)
+    if not target:
+        return {"ok": False, "error": "not_found"}
+
+    cur_amt = float(target.get("amount") or 0.0)
+    p_unit = str(target.get("unit") or "шт").strip()
+    p_name = str(target.get("name") or "Продукт").strip()
+
+    if deduct_qty is None or cur_amt - float(deduct_qty) <= 0.01:
+        await repo.delete_pantry_item(db, uid, pid)
+        return {
+            "ok": True,
+            "pantry_id": pid,
+            "name": p_name,
+            "unit": p_unit,
+            "deducted": round(cur_amt, 2),
+            "remaining": 0.0,
+            "deleted": True,
+            "prev_item": dict(target),
+        }
+
+    eff_deduct = round(max(0.0, float(deduct_qty)), 2)
+    new_amt = round(max(0.0, cur_amt - eff_deduct), 2)
+    await repo.update_pantry_item(db, uid, pid, amount=new_amt)
+    return {
+        "ok": True,
+        "pantry_id": pid,
+        "name": p_name,
+        "unit": p_unit,
+        "deducted": eff_deduct,
+        "remaining": new_amt,
+        "deleted": False,
+        "prev_item": dict(target),
+    }
+
+
 _SLOT_MACRO_SHARES: Dict[str, float] = {
     "breakfast": 0.25,
     "lunch": 0.40,

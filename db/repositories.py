@@ -5198,37 +5198,55 @@ async def list_pulse_checkins_since(
     return rows_to_dicts(await cur.fetchall())
 
 
+async def find_pantry_item_by_name(
+    conn: aiosqlite.Connection,
+    user_id: int,
+    query: str,
+) -> Optional[Dict[str, Any]]:
+    """Найти активный продукт в холодильнике по названию/основе без удаления."""
+    raw = (query or "").strip().casefold().replace("ё", "е")
+    if not raw:
+        return None
+    stripped = re.sub(
+        r"^(?:один|одно|одна|одну|два|две|три|четыре|пять|шесть|пол|половину|половинку|\d+(?:[.,]\d+)?)\s*(?:шт\.?|штук[аи]?|г|гр|грамм\w*|кг|мл|л|ст\.?\s*л\.?|ч\.?\s*л\.?|лож\w*)?\s+",
+        "",
+        raw,
+    ).strip()
+    needles = [raw] + ([stripped] if stripped and stripped != raw else [])
+    rows = [row_to_dict(r) for r in await list_pantry_items(conn, user_id)]
+    if not rows:
+        return None
+
+    for needle in needles:
+        for row in rows:
+            name_norm = str(row.get("name") or "").strip().casefold().replace("ё", "е")
+            if name_norm == needle:
+                return row
+
+    for needle in needles:
+        needle_tokens = re.findall(r"[a-zа-я0-9]+", needle)
+        for row in rows:
+            name_norm = str(row.get("name") or "").strip().casefold().replace("ё", "е")
+            if _haystack_matches_query(name_norm, needle):
+                return row
+            if needle_tokens:
+                name_stems = {_ru_stem(w) for w in re.findall(r"[a-zа-я0-9]+", name_norm)}
+                if all(_ru_stem(tok) in name_stems for tok in needle_tokens):
+                    return row
+    return None
+
+
 async def find_and_delete_pantry_item_by_name(
     conn: aiosqlite.Connection,
     user_id: int,
     query: str,
 ) -> Optional[Dict[str, Any]]:
     """Найти активный продукт в холодильнике по названию/основе, мягко удалить и вернуть данные."""
-    needle = (query or "").strip().casefold().replace("ё", "е")
-    if not needle:
+    row = await find_pantry_item_by_name(conn, user_id, query)
+    if not row:
         return None
-    rows = [row_to_dict(r) for r in await list_pantry_items(conn, user_id)]
-    if not rows:
-        return None
-
-    for row in rows:
-        name_norm = str(row.get("name") or "").strip().casefold().replace("ё", "е")
-        if name_norm == needle:
-            await delete_pantry_item(conn, user_id, int(row["id"]))
-            return row
-
-    needle_tokens = re.findall(r"[a-zа-я0-9]+", needle)
-    for row in rows:
-        name_norm = str(row.get("name") or "").strip().casefold().replace("ё", "е")
-        if _haystack_matches_query(name_norm, needle):
-            await delete_pantry_item(conn, user_id, int(row["id"]))
-            return row
-        if needle_tokens:
-            name_stems = {_ru_stem(w) for w in re.findall(r"[a-zа-я0-9]+", name_norm)}
-            if all(_ru_stem(tok) in name_stems for tok in needle_tokens):
-                await delete_pantry_item(conn, user_id, int(row["id"]))
-                return row
-    return None
+    await delete_pantry_item(conn, user_id, int(row["id"]))
+    return row
 
 
 async def restore_pantry_item(
@@ -5246,10 +5264,16 @@ async def restore_pantry_item(
             (int(item_id), household_id),
         )
         if await cur.fetchone():
-            await conn.execute(
-                "UPDATE pantry_items SET is_active = 1, updated_at = ? WHERE id = ? AND household_id = ?",
-                (now, int(item_id), household_id),
-            )
+            if item_data.get("amount") is not None:
+                await conn.execute(
+                    "UPDATE pantry_items SET is_active = 1, amount = ?, updated_at = ? WHERE id = ? AND household_id = ?",
+                    (float(item_data["amount"]), now, int(item_id), household_id),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE pantry_items SET is_active = 1, updated_at = ? WHERE id = ? AND household_id = ?",
+                    (now, int(item_id), household_id),
+                )
             await conn.commit()
             return int(item_id)
     return await create_pantry_item(

@@ -142,6 +142,11 @@ def _format_action_line(action: dict[str, Any]) -> str:
     if kind == "pantry_remove":
         if action.get("status") == "skipped" or payload.get("not_found"):
             return f"ℹ️ Не нашла «{title}» в холодильнике"
+        if payload.get("partial") and payload.get("deducted") is not None:
+            unit = str(payload.get("unit") or "шт")
+            ded_txt = _esc(format_quantity(float(payload["deducted"]), unit))
+            rem_txt = _esc(format_quantity(float(payload.get("remaining") or 0), unit))
+            return f"🍽 Списала из холодильника: {title} (−{ded_txt}, осталось {rem_txt})"
         return f"🍽 Убрала из холодильника: {title}"
     if kind == "pulse_log":
         delta = int(payload.get("delta") or 0)
@@ -320,6 +325,17 @@ def build_inbox_keyboard(
             )
         )
     elif len(active_or_clar) == 1 and active_or_clar[0].get("item_kind") == "meal_log" and not awaiting:
+        act_payload = _load_payload(active_or_clar[0])
+        for pm in act_payload.get("pantry_matches") or []:
+            if isinstance(pm, dict) and pm.get("pantry_id") and pm.get("btn_label"):
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=str(pm["btn_label"]),
+                            callback_data=f"kbju:pantry_deduct:{int(pm['pantry_id'])}:{float(pm.get('deduct_qty') or 1):g}",
+                        )
+                    ]
+                )
         meal_tid = int(active_or_clar[0].get("target_id") or 0)
         if meal_tid:
             ctrl_row.append(InlineKeyboardButton(text="✏️ Уточнить", callback_data=f"kbju:refine:{meal_tid}"))
@@ -623,6 +639,12 @@ async def _persist_meal_item(
     if not advice["targets"].get("mindful_mode"):
         rem = advice["remaining"]
         rem_line = f"Остаток: {rem['kcal']} ккал · Б +{rem['protein_g']} г"
+    pantry_matches = []
+    if str(user.get("profile_mode") or "adult") != "student":
+        pantry_rows = rows_to_dicts(await repo.list_pantry_items(db, uid))
+        pantry_matches = kitchen_ai.find_pantry_matches_for_meal_text(
+            pantry_rows, f"{raw_for_parse} {meal_title}", limit=3
+        )
     return await repo.create_inbox_action(
         db,
         user_id=uid,
@@ -640,6 +662,7 @@ async def _persist_meal_item(
             "lookup_source": parsed_meal.get("lookup_source") or "",
             "source": eff_src,
             "remaining_line": rem_line,
+            "pantry_matches": pantry_matches,
         },
         status="active",
     )
@@ -860,10 +883,20 @@ async def _persist_parsed_items(
                 status="active",
             )
         elif kind == "pantry_remove":
-            removed_p = await repo.find_and_delete_pantry_item_by_name(
+            matched_p = await repo.find_pantry_item_by_name(
                 db, user["id"], item.title or item.source_quote
             )
-            if removed_p:
+            if matched_p:
+                req_qty, req_unit = kitchen_ai.parse_requested_deduct_qty(
+                    item.source_quote or item.title or ""
+                )
+                deduct_amt = kitchen_ai.compute_pantry_deduct_amount(
+                    matched_p, req_qty, req_unit, default_single=False
+                )
+                dres = await kitchen_ai.deduct_pantry_entry(
+                    db, user["id"], int(matched_p["id"]), deduct_amt
+                )
+                removed_p = dres.get("prev_item") or matched_p
                 removed_name = str(removed_p.get("name") or item.title)
                 action_id = await repo.create_inbox_action(
                     db,
@@ -874,7 +907,14 @@ async def _persist_parsed_items(
                     target_id=int(removed_p["id"]) if removed_p.get("id") else None,
                     title=removed_name,
                     source_quote=item.source_quote,
-                    payload={"removed_item": dict(removed_p), "model_note": item.model_note},
+                    payload={
+                        "removed_item": dict(removed_p),
+                        "partial": not bool(dres.get("deleted", True)),
+                        "deducted": dres.get("deducted"),
+                        "remaining": dres.get("remaining"),
+                        "unit": dres.get("unit"),
+                        "model_note": item.model_note,
+                    },
                     status="active",
                 )
             elif re.match(
@@ -2650,6 +2690,13 @@ async def _delete_action_target(db, user_id: int, action: dict[str, Any]) -> Non
             return
         removed = payload.get("removed_item")
         if isinstance(removed, dict) and removed.get("name"):
+            if payload.get("partial") and action.get("target_id") and removed.get("amount") is not None:
+                pantry_rows = rows_to_dicts(await repo.list_pantry_items(db, user_id))
+                if any(int(r["id"]) == int(action["target_id"]) for r in pantry_rows):
+                    await repo.update_pantry_item(
+                        db, user_id, int(action["target_id"]), amount=float(removed["amount"])
+                    )
+                    return
             await repo.restore_pantry_item(db, user_id, removed)
         return
     if table == "day_plan_removed":

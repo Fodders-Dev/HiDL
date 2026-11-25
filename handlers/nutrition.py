@@ -18,11 +18,36 @@ from db import repositories as repo
 from keyboards.common import main_menu_keyboard
 from services import fitness_nutrition, inbox_service, kitchen_ai, pulse_service, stt
 from utils.menu_match import match_menu_label
+from utils.pantry import format_quantity
+from utils.profile import is_student_mode
+from utils.rows import rows_to_dicts
 from utils.sender import safe_edit
 from utils.time import local_date_str
 from utils.user import ensure_user
 
 router = Router()
+
+
+async def _pantry_deduct_rows_for_meal(
+    db, user: dict, meal_text: str
+) -> List[List[InlineKeyboardButton]]:
+    """Построить строки inline-кнопок 1-тап списания из холодильника для записанной еды."""
+    if is_student_mode(user):
+        return []
+    txt = (meal_text or "").strip()
+    if not txt:
+        return []
+    pantry = rows_to_dicts(await repo.list_pantry_items(db, int(user["id"])))
+    matches = kitchen_ai.find_pantry_matches_for_meal_text(pantry, txt, limit=3)
+    return [
+        [
+            InlineKeyboardButton(
+                text=str(m["btn_label"]),
+                callback_data=f"kbju:pantry_deduct:{int(m['pantry_id'])}:{float(m['deduct_qty']):g}",
+            )
+        ]
+        for m in matches
+    ]
 
 
 class MealAddState(StatesGroup):
@@ -184,6 +209,8 @@ async def cmd_eat(message: types.Message, state: FSMContext, db) -> None:
         user_id=int(user["id"]),
         allow_clarification=False,
     )
+    if isinstance(parsed, dict) and not parsed.get("raw_input"):
+        parsed["raw_input"] = meal_text
     await _show_meal_preview(message, state, parsed)
 
 
@@ -267,6 +294,8 @@ async def kbju_add_photo(message: types.Message, state: FSMContext, db) -> None:
         user_id=int(user["id"]),
         allow_clarification=False,
     )
+    if isinstance(parsed, dict) and (message.caption or "") and not parsed.get("raw_input"):
+        parsed["raw_input"] = message.caption or ""
     await _show_meal_preview(message, state, parsed)
 
 
@@ -284,6 +313,8 @@ async def kbju_add_text(message: types.Message, state: FSMContext, db) -> None:
         user_id=int(user["id"]),
         allow_clarification=False,
     )
+    if isinstance(parsed, dict) and not parsed.get("raw_input"):
+        parsed["raw_input"] = raw
     await _show_meal_preview(message, state, parsed)
 
 
@@ -319,6 +350,10 @@ async def kbju_confirm_cb(callback: types.CallbackQuery, state: FSMContext, db) 
     )
     await state.clear()
     text, kb = await render_kbju_card(db, user, now_utc=now_utc)
+    meal_desc = f"{preview.get('raw_input') or ''} {preview.get('title') or ''}".strip()
+    deduct_rows = await _pantry_deduct_rows_for_meal(db, user, meal_desc)
+    if deduct_rows and kb is not None:
+        kb = InlineKeyboardMarkup(inline_keyboard=deduct_rows + list(kb.inline_keyboard))
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("Записала в КБЖУ ✅")
 
@@ -361,8 +396,10 @@ async def kbju_confirm_text(message: types.Message, state: FSMContext, db) -> No
             db, user, str(preview.get("meal_slot") or ""), now_utc=now_utc
         )
         await state.clear()
+        meal_desc = f"{preview.get('raw_input') or ''} {preview.get('title') or ''}".strip()
+        deduct_rows = await _pantry_deduct_rows_for_meal(db, user, meal_desc)
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today")]]
+            inline_keyboard=deduct_rows + [[InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today")]]
         )
         await message.answer(
             f"✅ Записала в КБЖУ: <b>{_h(preview.get('title') or 'Приём пищи')}</b> "
@@ -503,8 +540,11 @@ async def kbju_pending_commit_cb(callback: types.CallbackQuery, state: FSMContex
     if not res["advice"]["targets"].get("mindful_mode"):
         rem = res["advice"]["remaining"]
         rem_line = f"\nОстаток на сегодня: <b>{rem['kcal']} ккал</b> · белок +{rem['protein_g']} г"
+    meal_desc = f"{pending.get('raw_text') or ''} {res.get('title') or ''}".strip()
+    deduct_rows = await _pantry_deduct_rows_for_meal(db, user, meal_desc)
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+        inline_keyboard=deduct_rows
+        + [
             [
                 InlineKeyboardButton(text="✏️ Уточнить", callback_data=f"kbju:refine:{res['meal_id']}"),
                 InlineKeyboardButton(text="🗑 Удалить", callback_data=f"kbju:del:{res['meal_id']}"),
@@ -522,6 +562,48 @@ async def kbju_pending_commit_cb(callback: types.CallbackQuery, state: FSMContex
         parse_mode="HTML",
     )
     await callback.answer("Записала ✅")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kbju:pantry_deduct:"))
+async def kbju_pantry_deduct_cb(callback: types.CallbackQuery, db) -> None:
+    parts = (callback.data or "").split(":")
+    try:
+        pantry_id = int(parts[2])
+        qty = float(parts[3]) if len(parts) > 3 else None
+    except (IndexError, ValueError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    res = await kitchen_ai.deduct_pantry_entry(db, int(user["id"]), pantry_id, qty)
+
+    # Remove the clicked deduct row so it cannot be double-tapped
+    markup = getattr(callback.message, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None) or []
+    prefix = f"kbju:pantry_deduct:{pantry_id}:"
+    filtered = [
+        row
+        for row in rows
+        if not any(str(getattr(btn, "callback_data", "") or "").startswith(prefix) for btn in row)
+    ]
+    if len(filtered) != len(rows):
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=filtered) if filtered else None
+            )
+        except Exception:
+            pass
+
+    if not res.get("ok"):
+        await callback.answer("Уже списано или нет в холодильнике.")
+        return
+    name = str(res["name"])
+    unit = str(res["unit"])
+    if res.get("deleted"):
+        await callback.answer(f"❄️ Списала: {name} (закончилось в холодильнике)")
+    else:
+        ded_txt = format_quantity(res["deducted"], unit)
+        rem_txt = format_quantity(res["remaining"], unit)
+        await callback.answer(f"❄️ Списала: {name} (−{ded_txt}, осталось {rem_txt})")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("kbju:pdrop:"))
