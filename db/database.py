@@ -2187,6 +2187,11 @@ async def seed_knowledge(conn: aiosqlite.Connection) -> None:
     if sched_ev_info and "pre_alert_sent" not in sched_ev_cols:
         await conn.execute("ALTER TABLE schedule_events ADD COLUMN pre_alert_sent INTEGER DEFAULT 0;")
 
+    dp_info = await conn.execute_fetchall("PRAGMA table_info(day_plans);")
+    dp_cols = {row["name"] for row in dp_info}
+    if dp_info and "morning_sent" not in dp_cols:
+        await conn.execute("ALTER TABLE day_plans ADD COLUMN morning_sent TEXT;")
+
     hh_req_info = await conn.execute_fetchall("PRAGMA table_info(household_requests);")
     hh_req_cols = {row["name"] for row in hh_req_info}
     if hh_req_info and "snooze_until_utc" not in hh_req_cols:

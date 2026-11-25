@@ -282,6 +282,56 @@ class FriendsReadyTests(unittest.IsolatedAsyncioTestCase):
         u_resumed = dict(await repo.get_user(self.db, uid))
         self.assertFalse(bool(u_resumed.get("pause_until")))
 
+    async def test_8_legacy_day_plans_morning_sent_migration_and_dedup(self) -> None:
+        import datetime as dt
+        from scheduler.reminder import ReminderScheduler
+
+        legacy_db = await connect(":memory:")
+        try:
+            await legacy_db.executescript(
+                """
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER UNIQUE NOT NULL,
+                    name TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    wake_up_time TEXT NOT NULL,
+                    sleep_time TEXT NOT NULL,
+                    strictness TEXT DEFAULT 'neutral',
+                    goals TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE day_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    plan_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    UNIQUE(user_id, plan_date)
+                );
+                """
+            )
+            await init_db(legacy_db)
+            cols = {r["name"] for r in await legacy_db.execute_fetchall("PRAGMA table_info(day_plans);")}
+            self.assertIn("morning_sent", cols)
+
+            uid = await repo.create_user(legacy_db, 950081, "Федор", "Europe/Moscow", "08:00", "23:30")
+            await repo.add_day_plan_item(legacy_db, uid, "2026-11-25", "Искупаться")
+            bot = SimpleNamespace(send_message=AsyncMock())
+            sched = ReminderScheduler(bot, legacy_db)
+            now_utc = dt.datetime(2026, 11, 25, 5, 10, 0)  # 08:10 Europe/Moscow
+            c1 = await sched._tick_day_plan(now_utc=now_utc)
+            c2 = await sched._tick_day_plan(now_utc=now_utc + dt.timedelta(minutes=5))
+            self.assertEqual(c1, 1)
+            self.assertEqual(c2, 0)
+            bot.send_message.assert_awaited_once()
+            plan = dict(await repo.get_day_plan(legacy_db, uid, "2026-11-25"))
+            self.assertEqual(plan["morning_sent"], "2026-11-25")
+        finally:
+            await legacy_db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

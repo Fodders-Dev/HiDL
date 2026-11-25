@@ -68,6 +68,7 @@ class ReminderScheduler:
         self.conn = db_conn
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self._db_file_path: Optional[str] = None
+        self._day_plan_sent_today: set[tuple[int, str]] = set()
 
     async def _resolve_db_file_path(self) -> str:
         if self._db_file_path is None:
@@ -467,8 +468,11 @@ class ReminderScheduler:
                 continue
 
             uid = int(user["id"])
+            if (uid, local_date) in self._day_plan_sent_today:
+                continue
             existing_plan = await repo.get_day_plan(self.conn, uid, local_date)
             if existing_plan and dict(existing_plan).get("morning_sent") == local_date:
+                self._day_plan_sent_today.add((uid, local_date))
                 continue
 
             await repo.sync_overdue_day_plan_items(self.conn, uid, local_date)
@@ -512,6 +516,10 @@ class ReminderScheduler:
                 parse_mode="HTML",
             )
             if sent:
+                self._day_plan_sent_today = {
+                    k for k in self._day_plan_sent_today if k[1] == local_date
+                }
+                self._day_plan_sent_today.add((uid, local_date))
                 await repo.mark_day_plan_morning_sent(self.conn, plan["id"], local_date)
                 sent_count += 1
                 log_debug(f"[day_plan] sent user={uid} items={len(open_items)} date={local_date}")
