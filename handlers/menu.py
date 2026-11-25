@@ -73,12 +73,13 @@ async def settings_info(message: types.Message, state: FSMContext, db) -> None:
 
 
 @router.message(lambda m: match_menu_label(m.text, {"еда", "еда и покупки"}))
-async def food_menu(message: types.Message, state: FSMContext) -> None:
+async def food_menu(message: types.Message, state: FSMContext, db) -> None:
+    from handlers import kitchen
+
     await state.clear()
-    await message.answer(
-        "Еда — это топливо и радость. Я помогу не ломать голову над вопросом «что приготовить» и следить за запасами.",
-        reply_markup=food_menu_keyboard(),
-    )
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    text, kb = await kitchen.build_kitchen_home_payload(db, user)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.message(StateFilter(None), lambda m: match_menu_label(m.text, {"ещё", "еще"}))

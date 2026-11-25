@@ -78,6 +78,16 @@ _IDEA_GUARDRAIL_RE = re.compile(
     r"\bможно\s+было\s+бы\b|\bхотелось\s+бы\s+как-?нибудь\b)"
 )
 
+_LONG_HORIZON_IDEA_RE = re.compile(
+    r"(?iu)(?:\bдо\s+конца\s+(?:этого\s+)?года\b|\bв\s+этом\s+году\b|"
+    r"\bв\s+ближайшие\s+месяц\w*\b|\bв\s+этом\s+месяце\b|\bкак-?нибудь\b|\bна\s+будущее\b)"
+)
+
+_IMMEDIATE_TASK_TIME_RE = re.compile(
+    r"(?iu)(?:\bсегодня\b|\bзавтра\b|\bпослезавтра\b|\bутром\b|\bвечером\b|"
+    r"\bчерез\s+\d+\s*(?:мин|час)\w*|\b\d{1,2}:\d{2}\b)"
+)
+
 _DIARY_FEELING_RE = re.compile(
     r"(?iu)(?:\bустал[аи]?\b|\bвыжат[аы]?\b|\bвыгорел[аи]?\b|\bтревож\w*|\bтревог\w*|"
     r"\bне\s+могу\s+заснуть\b|\bбессонниц\w*|\bплохо\s+спал[аи]?\b|\bтяжело\b|"
@@ -178,7 +188,7 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "kbju": ТОЛЬКО короткий запрос показать сводку/остаток калорий и БЖУ за сегодня ("сколько калорий осталось", "что мне добрать по белку", "мой кбжу", "покажи кбжу"). Если человек спрашивает ЗАЧЕМ/ПОЧЕМУ/МОЖНО ЛИ больше/буду ли толстеть — это "advice", а НЕ "kbju"!
 
 Допустимые типы элементов (kind):
-- "task": конкретное дело/задача с явным намерением сделать.
+- "task": конкретное дело/задача на сегодня, завтра или ближайшие дни с явным намерением сделать.
 - "reminder": поручение напомнить к дате/времени ("напомни выпить таблетку").
 - "calendar_event": встреча/событие для записи в Google Calendar ("запиши в календарь завтра в 15:00 стоматолог на час", "поставь встречу..."). Передай "date_hint", "time_hint", "duration_minutes" (по умолчанию 60) и "location".
 - "shopping": что нужно купить или что закончилось дома.
@@ -196,7 +206,7 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "reminder_delete": удалить/отменить существующее напоминание ("удали напоминание про ...", "отмени напоминание ...").
 - "expense": денежная трата ("потратил 450 на кофе" -> amount=450, category="кофе", title="Кофе").
 - "diary": мысли, переживания, усталость, самочувствие, события дня без поручения.
-- "idea": задумки, мечты, "хочу когда-нибудь...", проекты на будущее.
+- "idea": задумки, мечты и долгосрочные дела без срока на сегодня ("хочу когда-нибудь...", "до конца года починить ванну", "в этом месяце...", "как-нибудь разобрать балкон").
 - "done": то, что пользователь уже сделал или просит отметить/закрыть выполненную задачу ("закрой задачу ...", "отметь задачу ...", "я уже купил билеты").
 
 Строгие правила:
@@ -204,7 +214,7 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 2. Вопросы о плане на сегодня / списке покупок / что приготовить / карме / холодильнике / совете / заметках / КБЖУ / примерке еды ("думаю съесть...") -> intent="query", соответствующий query_type (и query_term), items=[] (НЕ создавай пустую запись в дневнике или meal_log!).
 3. Тревога / бессонница / усталость без явной задачи или напоминания -> intent="support", практичный и тёплый/деловой reply с учётом «Снимка дня» И один элемент kind="diary".
 4. Если передан «Снимок дня пользователя» (время, карма, отбой, задачи, холодильник, диета, цель и остаток КБЖУ), строго соблюдай директиву тона и стиля коуча и не выдумывай отсутствующие факты.
-5. Чистые мечты и задумки ("хочу когда-нибудь...") -> только kind="idea", НИКОГДА "task" или "reminder".
+5. Чистые мечты, задумки и долгосрочные дела без ближнего срока ("до конца года", "в этом месяце", "когда-нибудь", "как-нибудь") -> только kind="idea", НИКОГДА "task" или "reminder".
 6. Сохраняй "source_quote" дословным фрагментом исходного текста. В "model_note" пиши только пометку-гипотезу, не выдумывай факты.
 7. Для "shopping", "shopping_remove", "pantry_add", "pantry_remove", "task_delete", "reminder_delete" в "title" пиши чистое название объекта.
 8. Для "task", "reminder", "calendar_event", "shift_bedtime" и "shift_wake" передай "date_hint" ("сегодня", "завтра", "послезавтра", "19.11.2026") и "time_hint" ("12:00", "00:30", "в 8", "утром") без вычисления дат.
@@ -936,10 +946,17 @@ def _apply_guardrails(
     quote = (item.source_quote or item.title or "").strip()
     kind = item.kind if item.kind in VALID_KINDS else "diary"
 
-    # Guardrail 1: wishes / future dreams / ideas are NEVER tasks or reminders
+    # Guardrail 1: wishes / future dreams / long-horizon items are NEVER today's tasks or reminders
     if (
         kind not in {"shopping_remove", "expense"}
-        and _IDEA_GUARDRAIL_RE.search(quote)
+        and (
+            _IDEA_GUARDRAIL_RE.search(quote)
+            or (
+                kind == "task"
+                and _LONG_HORIZON_IDEA_RE.search(quote)
+                and not _IMMEDIATE_TASK_TIME_RE.search(quote)
+            )
+        )
         and not _REMINDER_TRIGGER_RE.search(quote)
     ):
         kind = "idea"
@@ -1331,11 +1348,18 @@ def parse_inbox_fallback(
                 source_quote=clause,
             )
         elif _TASK_TRIGGER_RE.search(clause) or _TASK_ACTION_START_RE.match(clause):
-            item = ParsedInboxItem(
-                kind="task",
-                title=_clean_task_title(clause),
-                source_quote=clause,
-            )
+            if _LONG_HORIZON_IDEA_RE.search(clause) and not _IMMEDIATE_TASK_TIME_RE.search(clause):
+                item = ParsedInboxItem(
+                    kind="idea",
+                    title=_clean_task_title(clause) or _clean_idea_title(clause),
+                    source_quote=clause,
+                )
+            else:
+                item = ParsedInboxItem(
+                    kind="task",
+                    title=_clean_task_title(clause),
+                    source_quote=clause,
+                )
         else:
             item = ParsedInboxItem(
                 kind="diary",

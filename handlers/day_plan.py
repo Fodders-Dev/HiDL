@@ -143,6 +143,8 @@ def _render_day_plan_list_view(items: List[Dict], page: int = 0) -> tuple[str, t
     else:
         for item in items:
             lines.append(_plan_item_line(item))
+        if any(not item.get("done") for item in items):
+            lines.append("\n<i>Долгосрочное (не на сегодня) перенеси в «⏳ На потом» — сохранится в «💡 Идеи и на потом».</i>")
 
     kb_rows = []
     for item in page_items:
@@ -172,6 +174,10 @@ def _render_day_plan_list_view(items: List[Dict], page: int = 0) -> tuple[str, t
 
     kb_rows.append([
         types.InlineKeyboardButton(text="➕ Добавить", callback_data="dplan:add"),
+        types.InlineKeyboardButton(text="⏳ На потом", callback_data="dplan:defermenu"),
+    ])
+    kb_rows.append([
+        types.InlineKeyboardButton(text="💡 Идеи и на потом", callback_data="diary:tab:idea"),
         types.InlineKeyboardButton(text="🗑 Удалить", callback_data="dplan:delmenu"),
     ])
     kb_rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="today:menu")])
@@ -226,6 +232,53 @@ async def day_plan_callbacks(callback: types.CallbackQuery, state: FSMContext, d
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+        return
+    if action == "defermenu":
+        open_items = [it for it in items if not it.get("done")]
+        if not open_items:
+            await callback.answer("Открытых дел в плане нет.", show_alert=True)
+            return
+        kb_rows = [
+            [types.InlineKeyboardButton(text=f"⏳ {it['title'][:30]}", callback_data=f"dplan:defer:{it['id']}")]
+            for it in open_items
+        ]
+        kb_rows.append([types.InlineKeyboardButton(text="⬅️ Отмена", callback_data="dplan:list")])
+        await safe_edit(
+            callback.message,
+            "⏳ <b>Перенести на потом</b>\n"
+            "Выбери дело — уберу из сегодняшнего списка и сохраню в «💡 Идеи и на потом» (сможешь вернуть в 1 тап).",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb_rows),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    if action == "defer" and len(parts) > 2:
+        try:
+            item_id = int(parts[2])
+        except ValueError:
+            await callback.answer()
+            return
+        item = next((it for it in items if int(it.get("id") or 0) == item_id), None)
+        if not item:
+            await callback.answer("Дело уже убрано.", show_alert=True)
+            return
+        title = str(item.get("title") or "").strip() or "Отложенное дело"
+        await repo.create_journal_entry(
+            db,
+            user_id=int(user["id"]),
+            entry_type="idea",
+            entry_date=local_date,
+            source="chat",
+            user_text=title,
+            title=title,
+            model_note="Отложено из плана дня",
+            tags=["backlog"],
+        )
+        await repo.delete_day_plan_item(db, user["id"], item_id)
+        items = rows_to_dicts(await repo.list_day_plan_items(db, user["id"], local_date))
+        text, kb = _render_day_plan_list_view(items, page=0)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer("Перенесла в 💡 Идеи и на потом ⏳")
         return
     if action == "delmenu":
         if not items:

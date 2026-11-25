@@ -885,7 +885,7 @@ async def inbox_clarify_when_input(message: types.Message, state: FSMContext, db
 
 _DIARY_TABS = [
     ("diary", "📓 Дневник"),
-    ("idea", "💡 Идеи"),
+    ("idea", "💡 На потом"),
     ("done", "✔ Сделано"),
     ("raw", "📥 Сырые"),
 ]
@@ -939,7 +939,7 @@ async def _render_diary_view(
                 )
     else:
         entry_type = tab if tab in {"diary", "idea", "done"} else "diary"
-        title_map = {"diary": "📓 Дневник", "idea": "💡 Идеи", "done": "✔ Сделано"}
+        title_map = {"diary": "📓 Дневник", "idea": "💡 Идеи и на потом", "done": "✔ Сделано"}
         entries = await repo.list_journal_entries(db, user["id"], entry_type=entry_type, limit=10)
         lines = [f"<b>{title_map[entry_type]} (последние):</b>"]
         if not entries:
@@ -1033,7 +1033,7 @@ async def diary_callbacks(callback: types.CallbackQuery, state: FSMContext, db) 
             inline_keyboard=[
                 [
                     InlineKeyboardButton(text="📋 План на день", callback_data="dplan:list"),
-                    InlineKeyboardButton(text="💡 К идеям", callback_data="diary:tab:idea"),
+                    InlineKeyboardButton(text="💡 Идеи и на потом", callback_data="diary:tab:idea"),
                 ]
             ]
         )

@@ -20,7 +20,7 @@ from keyboards.common import food_menu_keyboard, main_menu_keyboard
 from services import fitness_nutrition, household_service, kitchen_ai
 from utils.profile import is_student_mode
 from utils.rows import rows_to_dicts
-from utils.time import format_date_display, local_date_str
+from utils.time import format_date_display, format_time_local, local_date_str
 from utils.texts import error
 from utils.user import ensure_user
 from utils.pantry import format_quantity, is_low
@@ -335,14 +335,66 @@ async def _safe_answer_callback(
 
 
 # --- HANDLERS: MAIN ---
+async def build_kitchen_home_payload(db, user: dict) -> Tuple[str, InlineKeyboardMarkup]:
+    """Собрать главный экран кухни с кнопкой быстрого перехода к текущему приёму пищи по меню."""
+    tz = str(user.get("timezone") or "UTC")
+    now = datetime.datetime.utcnow()
+    local_date = local_date_str(now, tz)
+    try:
+        local_hour = int(format_time_local(now, tz).split(":")[0])
+    except Exception:
+        local_hour = 12
+    slot = kitchen_ai.infer_meal_slot(local_hour)
+
+    planned_rows = rows_to_dicts(await repo.list_meal_plans_range(db, int(user["id"]), local_date, local_date))
+    uncooked = [r for r in planned_rows if r.get("status") != "cooked" and r.get("recipe_id")]
+    pick = next((r for r in uncooked if r.get("meal_slot") == slot), uncooked[0] if uncooked else None)
+
+    base_kb = food_menu_keyboard()
+    rows = [list(r) for r in base_kb.inline_keyboard]
+    if pick:
+        p_slot = str(pick.get("meal_slot") or slot)
+        slot_acc = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин"}.get(p_slot, "приём пищи")
+        slot_prep = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин"}.get(p_slot, "сегодня")
+        slot_icon = {"breakfast": "🥣", "lunch": "🍲", "dinner": "🍽"}.get(p_slot, "🍳")
+        title = str(pick.get("title") or "Блюдо").strip()
+        t_min = int(pick.get("time_minutes") or 15)
+        rows.insert(
+            0,
+            [
+                InlineKeyboardButton(
+                    text=f"{slot_icon} Мой {slot_acc}: {title[:22]}",
+                    callback_data=f"kitchen:cook_view:{pick['recipe_id']}:1:plan:0",
+                )
+            ],
+        )
+        text = (
+            "🍽 <b>Умная кухня</b>\n"
+            f"📅 <b>По твоему меню на {slot_prep} сегодня:</b> {_h(title)} · {t_min} мин\n"
+            "<i>Нажми на кнопку с блюдом ниже, чтобы открыть рецепт, или выбери 1 из вариантов в «Что приготовить» / «ИИ-шефе».</i>"
+        )
+    else:
+        text = (
+            "🍽 <b>Умная кухня</b>\n"
+            "• <b>📅 Меню на 3 дня</b> — твой готовый план завтрака, обеда и ужина\n"
+            "• <b>🍳 Что приготовить сейчас? / ✨ ИИ-шеф</b> — подберут 3 варианта на выбор (выбираешь один)"
+        )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.message(Command("kitchen"))
-async def kitchen_cmd(message: types.Message):
-    await message.answer("🍽 <b>Умная кухня</b>\nВыбери раздел:", reply_markup=kitchen_main_keyboard(), parse_mode="HTML")
+async def kitchen_cmd(message: types.Message, db):
+    user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
+    text, kb = await build_kitchen_home_payload(db, user)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
 
 @router.callback_query(lambda c: c.data == "kitchen:main")
-async def kitchen_home(callback: types.CallbackQuery):
+async def kitchen_home(callback: types.CallbackQuery, db):
     await _safe_answer_callback(callback)
-    await safe_edit(callback.message, "🍽 <b>Умная кухня</b>", reply_markup=kitchen_main_keyboard(), parse_mode="HTML")
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    text, kb = await build_kitchen_home_payload(db, user)
+    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
 
 # --- HANDLERS: SHOPPING LIST ---
 async def _render_shoplist(callback: types.CallbackQuery, db, scope: str, page: int = 0) -> None:
@@ -618,6 +670,7 @@ async def quick_pick_recipes(callback: types.CallbackQuery, db):
     ]
 
     if chunk:
+        lines.append(f"<i>Выбери 1 из {len(chunk)} вариантов — нажми на название, чтобы открыть рецепт:</i>")
         for idx, item in enumerate(chunk, 1):
             lines.append(_format_suggestion_line(idx, item))
             rows.append(_suggestion_action_row(item))
@@ -1858,6 +1911,8 @@ def _render_ai_recipes_list(
     lines.append("")
 
     rows: list[list[InlineKeyboardButton]] = []
+    if recipes:
+        lines.append(f"<i>Выбери 1 из {len(recipes)} вариантов — нажми на блюдо, чтобы открыть рецепт:</i>")
     for idx, rec in enumerate(recipes, 1):
         title = str(rec.get("title") or f"Блюдо {idx}")
         t_min = int(rec.get("time_minutes") or 20)
