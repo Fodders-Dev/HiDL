@@ -78,7 +78,7 @@ async def connect(database_url: str) -> aiosqlite.Connection:
     conn = await aiosqlite.connect(path)
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys=ON;")
-    await conn.execute("PRAGMA busy_timeout=5000;")
+    await conn.execute("PRAGMA busy_timeout=30000;")
     is_memory = path == ":memory:" or path.startswith("file::memory:")
     if not is_memory:
         await conn.execute("PRAGMA journal_mode=WAL;")

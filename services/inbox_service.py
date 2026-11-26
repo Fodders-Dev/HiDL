@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import html
 import json
@@ -393,6 +394,17 @@ def render_inbox_summary(
                 for act in active:
                     lines.append(_format_action_line(act))
     elif active or skipped:
+        if intent == "capture" and support_reply.strip():
+            lines.append(_esc(support_reply.strip()))
+        elif intent == "capture" and any(
+            a.get("item_kind") == "diary"
+            and re.search(
+                r"(?iu)\b(?:устал\w*|выжат\w*|выгорел\w*|нет\s+сил|мало\s+сил|не\s+до\s+слежки\s+за\s+собой)\b",
+                f"{a.get('source_quote') or ''} {a.get('title') or ''}",
+            )
+            for a in active
+        ):
+            lines.append("Слышу, что вымотался — без давления, просто бережно всё зафиксировала.")
         if (
             len(active) == 1
             and active[0].get("item_kind") in {"pulse_log", "meal_log", "weight_log", "workout_log"}
@@ -533,6 +545,25 @@ async def commit_pending_meal(
     }
 
 
+def _build_meal_raw_for_parse(
+    inbox_row: dict[str, Any],
+    *,
+    source_quote: str,
+    title_hint: str,
+    is_single_item: bool,
+) -> tuple[str, str, str]:
+    sq = (source_quote or "").strip()
+    th = (title_hint or "").strip()
+    full_raw = str(inbox_row.get("raw_text") or "").strip()
+    if is_single_item and full_raw and len(full_raw) > len(sq):
+        raw_for_parse = full_raw
+    elif sq and th and th.casefold() not in sq.casefold() and sq.casefold() not in th.casefold():
+        raw_for_parse = f"{th}. {sq}"
+    else:
+        raw_for_parse = (sq or th or full_raw).strip()
+    return raw_for_parse, sq, th
+
+
 async def _persist_meal_item(
     db,
     user: dict[str, Any],
@@ -545,35 +576,35 @@ async def _persist_meal_item(
     llm_client_instance: Optional[LLMClient] = None,
     allow_clarification: bool = True,
     is_single_item: bool = False,
+    meal_slot_hint: str = "",
+    pre_parsed_meal: Optional[dict[str, Any]] = None,
 ) -> int:
     uid = int(user["id"])
     inbox_id = int(inbox_row["id"])
     source = str(inbox_row.get("source") or "text")
     chat_id = int(inbox_row.get("chat_id") or 0)
-    sq = (source_quote or "").strip()
-    th = (title_hint or "").strip()
-    full_raw = str(inbox_row.get("raw_text") or "").strip()
-    if is_single_item and full_raw and len(full_raw) > len(sq):
-        raw_for_parse = full_raw
-    elif sq and th and th.casefold() not in sq.casefold() and sq.casefold() not in th.casefold():
-        raw_for_parse = f"{th}. {sq}"
-    else:
-        raw_for_parse = (sq or th or full_raw).strip()
-
-    parsed_meal = await fitness_nutrition.parse_meal_input(
-        raw_text=raw_for_parse,
-        llm_client_instance=llm_client_instance,
-        db=db,
-        user_id=uid,
-        allow_clarification=allow_clarification,
-        allow_web_lookup=True,
-        title_hint=th,
+    raw_for_parse, sq, th = _build_meal_raw_for_parse(
+        inbox_row, source_quote=source_quote, title_hint=title_hint, is_single_item=is_single_item
     )
+
+    if isinstance(pre_parsed_meal, dict):
+        parsed_meal = pre_parsed_meal
+    else:
+        parsed_meal = await fitness_nutrition.parse_meal_input(
+            raw_text=raw_for_parse,
+            llm_client_instance=llm_client_instance,
+            db=db,
+            user_id=uid,
+            allow_clarification=allow_clarification,
+            allow_web_lookup=True,
+            title_hint=th,
+            meal_slot_hint=meal_slot_hint,
+        )
     if not parsed_meal.get("ok"):
         parsed_meal = {
             "ok": True,
             "title": title_hint or raw_for_parse[:60] or "Приём пищи",
-            "meal_slot": "snack",
+            "meal_slot": fitness_nutrition.infer_meal_slot(raw_for_parse, category_hint=meal_slot_hint),
             "kcal": 250,
             "protein_g": 10.0,
             "fat_g": 9.0,
@@ -589,6 +620,8 @@ async def _persist_meal_item(
     ):
         meal_title = th[:70]
     meal_slot = str(parsed_meal.get("meal_slot") or "snack")
+    if meal_slot == "snack":
+        meal_slot = fitness_nutrition.infer_meal_slot(raw_for_parse, category_hint=meal_slot_hint, default="snack")
     if allow_clarification and parsed_meal.get("needs_clarification") and parsed_meal.get("clarification_question"):
         pending_id = await repo.create_pending_meal_clarification(
             db,
@@ -639,6 +672,7 @@ async def _persist_meal_item(
         carbs_g=float(parsed_meal.get("carbs_g") or 0),
         source=eff_src,
     )
+    await pulse_service.close_open_food_pulse_slot(db, user, meal_slot, now_utc=now_utc)
     advice = await fitness_nutrition.get_daily_nutrition_advice(db, user, now_utc=now_utc)
     rem_line = ""
     if not advice["targets"].get("mindful_mode"):
@@ -716,8 +750,37 @@ async def _persist_parsed_items(
     inbox_id = int(inbox_row["id"])
     now = now_utc or datetime.datetime.utcnow()
     is_single_item = len(parsed.items) == 1
+    pre_parsed_meals: dict[int, dict[str, Any]] = {}
+    if not is_student_mode(user):
+        meal_indices = [idx for idx, it in enumerate(parsed.items) if it.kind == "meal_log"]
+        if len(meal_indices) >= 2:
+            async def _pre_parse(it: ParsedInboxItem) -> dict[str, Any]:
+                raw_q, _, th_q = _build_meal_raw_for_parse(
+                    inbox_row,
+                    source_quote=it.source_quote,
+                    title_hint=it.title,
+                    is_single_item=is_single_item,
+                )
+                return await fitness_nutrition.parse_meal_input(
+                    raw_text=raw_q,
+                    llm_client_instance=llm_client_instance,
+                    db=db,
+                    user_id=int(user["id"]),
+                    allow_clarification=True,
+                    allow_web_lookup=True,
+                    title_hint=th_q,
+                    meal_slot_hint=it.category,
+                )
 
-    for item in parsed.items:
+            results = await asyncio.gather(
+                *(_pre_parse(parsed.items[idx]) for idx in meal_indices),
+                return_exceptions=True,
+            )
+            for idx, res in zip(meal_indices, results):
+                if isinstance(res, dict):
+                    pre_parsed_meals[idx] = res
+
+    for idx, item in enumerate(parsed.items):
         kind = item.kind
         if is_student_mode(user) and kind in {
             "shopping",
@@ -961,6 +1024,8 @@ async def _persist_parsed_items(
                 now_utc=now,
                 llm_client_instance=llm_client_instance,
                 is_single_item=is_single_item,
+                meal_slot_hint=item.category,
+                pre_parsed_meal=pre_parsed_meals.get(idx),
             )
         elif kind == "weight_log":
             scale_res = await fitness_nutrition.parse_smart_scale_input(

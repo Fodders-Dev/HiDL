@@ -165,17 +165,32 @@ def _is_cafe_or_menu_query(text: str) -> bool:
     return bool(_CAFE_QUERY_HINT_RE.search(low))
 
 
+_MASS_VOL_UNIT = r"(?:кг|kg|грамм(?:ов|а)?|гр|г|g|миллилитр(?:ов|а)?|мл|ml|литр(?:ов|а)?|л|l)"
+_MASS_VOL_RE = re.compile(
+    rf"(?iu)(?:\b(\d+(?:[.,]\d+)?)\s*({_MASS_VOL_UNIT})\b|\b({_MASS_VOL_UNIT})\s*(\d+(?:[.,]\d+)?)\b)"
+)
+_SMALL_PORTION_ADDIN_FOLLOW = (
+    r"(?!\s+(?:ложк\w*|ст\.?\s*л\.?|ч\.?\s*л\.?|кубик\w*|дольк\w*|щепот\w*|ломтик\w*|пакетик\w*|кусоч\w*\s+сахар\w*|капл\w*)\b)"
+)
+
+
 def extract_requested_grams_and_mult(
     raw_text: str, default_serving_g: float = 0.0
 ) -> Tuple[Optional[float], float]:
     """Извлечь явные граммы/мл или множитель порции (например '2 шт', 'полпорции', '250 мл')."""
     low = str(raw_text or "").strip().casefold().replace("ё", "е")
-    # Не путаем числа в названиях вроде "Цех 85" или "8 14-значный штрихкод"
-    m_mass = re.search(r"(\d+(?:[.,]\d+)?)\s*(кг|kg|г|гр|g|мл|ml|л|l)\b", low)
-    if m_mass:
-        val = float(m_mass.group(1).replace(",", "."))
-        unit = m_mass.group(2)
-        grams = val * 1000.0 if unit in {"кг", "kg", "л", "l"} else val
+    # Не путаем числа в названиях вроде "Цех 85" или штрихкоды. Поддерживаем '300 грамм' и 'мл 300'.
+    mass_matches = list(_MASS_VOL_RE.finditer(low))
+    if len(mass_matches) >= 2:
+        # Несколько разных граммовок в одном комбо ("мл 300 ... 300 грамм") не должны масштабировать всё блюдо.
+        return None, 1.0
+    if len(mass_matches) == 1:
+        m_mass = mass_matches[0]
+        val_s = m_mass.group(1) or m_mass.group(4) or "0"
+        unit = (m_mass.group(2) or m_mass.group(3) or "").lower()
+        val = float(val_s.replace(",", "."))
+        is_kilo_or_liter = unit in {"кг", "kg", "л", "l"} or unit.startswith("литр")
+        grams = val * 1000.0 if is_kilo_or_liter else val
         grams = max(1.0, min(5000.0, grams))
         mult = (grams / default_serving_g) if default_serving_g > 0 else 1.0
         return round(grams, 1), round(mult, 3)
@@ -193,9 +208,9 @@ def extract_requested_grams_and_mult(
         cnt = max(0.25, min(10.0, float(m_cnt.group(1).replace(",", "."))))
         return None, cnt
 
-    if re.search(r"\b(?:два|две|пару|парочку)\b", low):
+    if re.search(rf"(?iu)\b(?:два|две|пару|парочку)\b{_SMALL_PORTION_ADDIN_FOLLOW}", low):
         return None, 2.0
-    if re.search(r"\bтри\b", low):
+    if re.search(rf"(?iu)\bтри\b{_SMALL_PORTION_ADDIN_FOLLOW}", low):
         return None, 3.0
     return None, 1.0
 
@@ -218,7 +233,10 @@ def scale_lookup_record(record: Dict[str, Any], raw_text: str) -> Optional[Dict[
     f_srv = float(record.get("fat_g") or 0)
     c_srv = float(record.get("carbs_g") or 0)
 
-    explicit_grams, mult = extract_requested_grams_and_mult(raw_text, default_serving_g=serving_g)
+    if record.get("_fresh_web_for_query") and has_srv and kcal_srv >= 0:
+        explicit_grams, mult = None, 1.0
+    else:
+        explicit_grams, mult = extract_requested_grams_and_mult(raw_text, default_serving_g=serving_g)
 
     if explicit_grams is not None and has_p100:
         factor = explicit_grams / 100.0
@@ -520,8 +538,17 @@ async def lookup_food_nutrition(
             found = await web_fn(query)
         else:
             found = await search_web_nutrition(query, llm_client_instance=client)
+        if isinstance(found, dict):
+            found = {**found, "_fresh_web_for_query": True}
 
-    if found and db is not None:
+    is_bloated_combo_cache = bool(
+        found
+        and (
+            len(clean_key) > 95
+            or ("+" in str(found.get("title") or "") and float(found.get("serving_g") or 0) >= 450)
+        )
+    )
+    if found and db is not None and not is_bloated_combo_cache:
         await repo.upsert_nutrition_cache(
             db,
             clean_key,

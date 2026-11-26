@@ -66,7 +66,10 @@ class ReminderScheduler:
     def __init__(self, bot: Bot, db_conn):
         self.bot = bot
         self.conn = db_conn
-        self.scheduler = AsyncIOScheduler(timezone="UTC")
+        self.scheduler = AsyncIOScheduler(
+            timezone="UTC",
+            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 30},
+        )
         self._db_file_path: Optional[str] = None
         self._day_plan_sent_today: set[tuple[int, str]] = set()
 
@@ -99,35 +102,37 @@ class ReminderScheduler:
             log_debug(f"[heartbeat] write failed: {exc}")
 
     def start(self) -> None:
+        base = datetime.datetime.now(datetime.timezone.utc)
+        stagger = lambda sec: base + datetime.timedelta(seconds=sec)  # noqa: E731
         self.scheduler.add_job(
             self._tick_bot_heartbeat,
             "interval",
             seconds=60,
             id="bot_heartbeat_tick",
-            next_run_time=datetime.datetime.now(datetime.timezone.utc),
+            next_run_time=base,
         )
-        self.scheduler.add_job(self._tick_desk_outbox, "interval", seconds=20, id="desk_outbox_tick")
-        self.scheduler.add_job(self._tick, "interval", seconds=60, id="routine_tick")
-        self.scheduler.add_job(self._tick_wellness, "interval", seconds=60, id="wellness_tick")
+        self.scheduler.add_job(self._tick_desk_outbox, "interval", seconds=20, id="desk_outbox_tick", next_run_time=stagger(3))
+        self.scheduler.add_job(self._tick, "interval", seconds=60, id="routine_tick", next_run_time=stagger(6))
+        self.scheduler.add_job(self._tick_wellness, "interval", seconds=60, id="wellness_tick", next_run_time=stagger(10))
         self.scheduler.add_job(self._tick_bills, "cron", hour=9, minute=0, id="bills_ping")
         self.scheduler.add_job(self._tick_weekly_finance, "cron", hour=9, minute=0, id="weekly_finance")
         self.scheduler.add_job(self._reset_points_month, "cron", day=1, hour=0, minute=5, id="points_reset")
         self.scheduler.add_job(self._tick_care, "cron", hour=9, minute=15, id="care_tick")
-        self.scheduler.add_job(self._tick_weight_prompt, "interval", minutes=30, id="weight_prompt")
+        self.scheduler.add_job(self._tick_weight_prompt, "interval", minutes=30, id="weight_prompt", next_run_time=stagger(34))
         self.scheduler.add_job(self._weekly_home_plan, "cron", day_of_week="sun", hour=10, minute=0, id="home_plan_weekly")
-        self.scheduler.add_job(self._tick_day_plan, "interval", minutes=5, id="day_plan_morning")
-        self.scheduler.add_job(self._tick_day_plan_evening, "interval", minutes=15, id="day_plan_evening")
-        self.scheduler.add_job(self._tick_meds, "interval", seconds=60, id="meds_tick")
-        self.scheduler.add_job(self._tick_affirmations, "interval", minutes=5, id="affirmations_tick")
-        self.scheduler.add_job(self._tick_focus, "interval", seconds=60, id="focus_tick")
-        self.scheduler.add_job(self._tick_sleep_mode, "interval", minutes=5, id="sleep_mode_tick")
-        self.scheduler.add_job(self._tick_daily_brief, "interval", minutes=5, id="daily_brief_tick")
-        self.scheduler.add_job(self._tick_pulse, "interval", seconds=60, id="pulse_tick")
-        self.scheduler.add_job(self._tick_calendar_sync, "interval", minutes=15, id="calendar_sync_tick")
-        self.scheduler.add_job(self._tick_calendar_alerts, "interval", seconds=60, id="calendar_alerts_tick")
-        self.scheduler.add_job(self._tick_pending_meals, "interval", minutes=2, id="pending_meals_autocommit")
-        self.scheduler.add_job(self._tick_nutrition_evening, "interval", minutes=15, id="nutrition_evening_checkin")
-        self.scheduler.add_job(self._tick_household_snoozes, "interval", seconds=60, id="household_snooze_tick")
+        self.scheduler.add_job(self._tick_day_plan, "interval", minutes=5, id="day_plan_morning", next_run_time=stagger(14))
+        self.scheduler.add_job(self._tick_day_plan_evening, "interval", minutes=15, id="day_plan_evening", next_run_time=stagger(38))
+        self.scheduler.add_job(self._tick_meds, "interval", seconds=60, id="meds_tick", next_run_time=stagger(18))
+        self.scheduler.add_job(self._tick_affirmations, "interval", minutes=5, id="affirmations_tick", next_run_time=stagger(42))
+        self.scheduler.add_job(self._tick_focus, "interval", seconds=60, id="focus_tick", next_run_time=stagger(22))
+        self.scheduler.add_job(self._tick_sleep_mode, "interval", minutes=5, id="sleep_mode_tick", next_run_time=stagger(46))
+        self.scheduler.add_job(self._tick_daily_brief, "interval", minutes=5, id="daily_brief_tick", next_run_time=stagger(50))
+        self.scheduler.add_job(self._tick_pulse, "interval", seconds=60, id="pulse_tick", next_run_time=stagger(26))
+        self.scheduler.add_job(self._tick_calendar_sync, "interval", minutes=15, id="calendar_sync_tick", next_run_time=stagger(54))
+        self.scheduler.add_job(self._tick_calendar_alerts, "interval", seconds=60, id="calendar_alerts_tick", next_run_time=stagger(30))
+        self.scheduler.add_job(self._tick_pending_meals, "interval", minutes=2, id="pending_meals_autocommit", next_run_time=stagger(57))
+        self.scheduler.add_job(self._tick_nutrition_evening, "interval", minutes=15, id="nutrition_evening_checkin", next_run_time=stagger(40))
+        self.scheduler.add_job(self._tick_household_snoozes, "interval", seconds=60, id="household_snooze_tick", next_run_time=stagger(48))
         self.scheduler.start()
 
     @staticmethod

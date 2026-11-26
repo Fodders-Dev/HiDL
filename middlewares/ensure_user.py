@@ -63,6 +63,8 @@ class EnsureUserMiddleware(BaseMiddleware):
         message = getattr(effective_event, "message", None) if getattr(effective_event, "data", None) is not None else effective_event
         text = getattr(effective_event, "text", None) or getattr(message, "text", None)
         if from_user:
+            if getattr(from_user, "is_bot", False):
+                return None
             tok = set_current_llm_user(int(from_user.id))
             try:
                 # /start должен запускать регистрацию как "нового" пользователя.

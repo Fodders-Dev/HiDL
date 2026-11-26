@@ -417,7 +417,10 @@ async def _process_unsolicited_image(
 @router.message(StateFilter(None), F.photo)
 async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db) -> None:
     """Обработать фото тарелки, этикетки или умных весов прямо из общего чата."""
-    if await state.get_state():
+    from handlers.nutrition import MealAddState
+
+    cur_state = await state.get_state()
+    if cur_state and cur_state != MealAddState.confirm.state:
         return
     user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
     if is_student_mode(user):
@@ -432,7 +435,10 @@ async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db
 @router.message(StateFilter(None), F.document)
 async def handle_unsolicited_image_document(message: types.Message, state: FSMContext, db) -> None:
     """Обработать картинку, отправленную в общий чат как файл без сжатия (например, отчёт Xiaomi)."""
-    if await state.get_state():
+    from handlers.nutrition import MealAddState
+
+    cur_state = await state.get_state()
+    if cur_state and cur_state != MealAddState.confirm.state:
         return
     is_img, mime = _is_image_document(getattr(message, "document", None))
     if not is_img:

@@ -80,14 +80,24 @@ async def main() -> None:
             scheduler.scheduler.shutdown(wait=False)
         except Exception:
             pass
+        current = asyncio.current_task()
+        pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=3.0)
+            except Exception:
+                pass
         try:
-            await ctx.db_conn.close()
+            await asyncio.wait_for(ctx.db_conn.close(), timeout=4.0)
         except Exception:
             pass
         try:
-            await ctx.bot.session.close()
+            await asyncio.wait_for(ctx.bot.session.close(), timeout=4.0)
         except Exception:
             pass
+        logger.info("HiDL shutdown complete.")
 
 
 if __name__ == "__main__":

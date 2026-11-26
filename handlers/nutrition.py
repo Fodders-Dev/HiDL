@@ -6,6 +6,8 @@ import datetime
 from html import escape as _h
 import io
 import re
+import secrets
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import F, Router, types
@@ -57,6 +59,39 @@ class MealAddState(StatesGroup):
 
 class MealRefineState(StatesGroup):
     waiting_input = State()
+
+
+_MEAL_PREVIEW_CACHE: Dict[Tuple[int, str], Tuple[float, Dict[str, Any]]] = {}
+_MEAL_PREVIEW_TTL_SEC = 3600.0
+_MEAL_PREVIEW_MAX_ITEMS = 300
+
+
+def _prune_meal_preview_cache(now_ts: float) -> None:
+    expired = [k for k, (ts, _) in _MEAL_PREVIEW_CACHE.items() if (now_ts - ts) > _MEAL_PREVIEW_TTL_SEC]
+    for k in expired:
+        _MEAL_PREVIEW_CACHE.pop(k, None)
+    if len(_MEAL_PREVIEW_CACHE) > _MEAL_PREVIEW_MAX_ITEMS:
+        oldest = sorted(_MEAL_PREVIEW_CACHE.items(), key=lambda item: item[1][0])
+        for k, _ in oldest[: len(_MEAL_PREVIEW_CACHE) - _MEAL_PREVIEW_MAX_ITEMS]:
+            _MEAL_PREVIEW_CACHE.pop(k, None)
+
+
+def _store_meal_preview(tg_id: int, pid: str, parsed: Dict[str, Any]) -> None:
+    now_ts = time.monotonic()
+    _prune_meal_preview_cache(now_ts)
+    _MEAL_PREVIEW_CACHE[(int(tg_id), str(pid))] = (now_ts, dict(parsed))
+
+
+def _get_meal_preview(tg_id: int, pid: str) -> Optional[Dict[str, Any]]:
+    now_ts = time.monotonic()
+    _prune_meal_preview_cache(now_ts)
+    entry = _MEAL_PREVIEW_CACHE.get((int(tg_id), str(pid)))
+    return dict(entry[1]) if entry else None
+
+
+def _pop_meal_preview(tg_id: int, pid: str) -> Optional[Dict[str, Any]]:
+    entry = _MEAL_PREVIEW_CACHE.pop((int(tg_id), str(pid)), None)
+    return dict(entry[1]) if entry else None
 
 
 def _progress_bar(current: float, target: float, width: int = 10) -> str:
@@ -220,12 +255,32 @@ async def kbju_add_start(callback: types.CallbackQuery, state: FSMContext) -> No
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data == "kbju:cancel")
+@router.callback_query(lambda c: c.data == "kbju:cancel" or (bool(c.data) and c.data.startswith("kbju:cancel:")))
 async def kbju_add_cancel(callback: types.CallbackQuery, state: FSMContext, db) -> None:
-    await state.clear()
+    raw_cb = str(callback.data or "")
+    pid = raw_cb.split(":", 2)[2] if raw_cb.startswith("kbju:cancel:") else ""
+    tg_id = int(getattr(getattr(callback, "from_user", None), "id", 0) or 0)
+    data = await state.get_data()
+    previews = dict(data.get("meal_previews") or {})
+    if pid:
+        previews.pop(pid, None)
+        _pop_meal_preview(tg_id, pid)
+        if previews:
+            latest = list(previews.values())[-1]
+            await state.update_data(meal_previews=previews, meal_preview=latest)
+        else:
+            await state.clear()
+    else:
+        for k in list(previews.keys()):
+            _pop_meal_preview(tg_id, k)
+        await state.clear()
+
     user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
-    text, kb = await render_kbju_card(db, user)
-    await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    if pid and previews:
+        await safe_edit(callback.message, "Ок, это фото убрала 👌", reply_markup=None)
+    else:
+        text, kb = await render_kbju_card(db, user)
+        await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("Отменено")
 
 
@@ -243,12 +298,28 @@ async def _show_meal_preview(message: types.Message, state: FSMContext, parsed: 
         await message.answer(msg, reply_markup=cancel_kb, parse_mode="HTML")
         return
 
+    pid = secrets.token_hex(4)
+    tg_id = int(
+        getattr(getattr(message, "from_user", None), "id", None)
+        or getattr(getattr(message, "chat", None), "id", 0)
+        or 0
+    )
+    data = await state.get_data()
+    previews = dict(data.get("meal_previews") or {})
+    previews[pid] = dict(parsed)
+    while len(previews) > 10:
+        oldest_key = next(iter(previews))
+        previews.pop(oldest_key, None)
+        _pop_meal_preview(tg_id, oldest_key)
+    if tg_id:
+        _store_meal_preview(tg_id, pid, parsed)
+
     await state.set_state(MealAddState.confirm)
-    await state.update_data(meal_preview=parsed)
+    await state.update_data(meal_previews=previews, meal_preview=parsed, last_preview_id=pid)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Записать в КБЖУ", callback_data="kbju:confirm")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="kbju:cancel")],
+            [InlineKeyboardButton(text="✅ Записать в КБЖУ", callback_data=f"kbju:confirm:{pid}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"kbju:cancel:{pid}")],
         ]
     )
     label_note = "\n🏷 <i>Этикетку запомнила на будущее.</i>" if parsed.get("is_nutrition_label") else ""
@@ -318,12 +389,20 @@ async def kbju_add_text(message: types.Message, state: FSMContext, db) -> None:
     await _show_meal_preview(message, state, parsed)
 
 
-@router.callback_query(lambda c: c.data == "kbju:confirm")
+@router.callback_query(lambda c: c.data == "kbju:confirm" or (bool(c.data) and c.data.startswith("kbju:confirm:")))
 async def kbju_confirm_cb(callback: types.CallbackQuery, state: FSMContext, db) -> None:
+    raw_cb = str(callback.data or "")
+    pid = raw_cb.split(":", 2)[2] if raw_cb.startswith("kbju:confirm:") else ""
+    tg_id = int(getattr(getattr(callback, "from_user", None), "id", 0) or 0)
     data = await state.get_data()
-    preview = data.get("meal_preview") or {}
+    previews = dict(data.get("meal_previews") or {})
+    if pid:
+        preview = previews.get(pid) or _get_meal_preview(tg_id, pid) or {}
+    else:
+        preview = data.get("meal_preview") or {}
     if not preview or not preview.get("ok"):
-        await state.clear()
+        if not previews:
+            await state.clear()
         await callback.answer("Запись устарела, введи заново.", show_alert=True)
         return
 
@@ -348,7 +427,18 @@ async def kbju_confirm_cb(callback: types.CallbackQuery, state: FSMContext, db) 
     await pulse_service.close_open_food_pulse_slot(
         db, user, str(preview.get("meal_slot") or ""), now_utc=now_utc
     )
-    await state.clear()
+    if pid:
+        previews.pop(pid, None)
+        _pop_meal_preview(tg_id, pid)
+    else:
+        last_pid = str(data.get("last_preview_id") or "")
+        if last_pid:
+            previews.pop(last_pid, None)
+            _pop_meal_preview(tg_id, last_pid)
+    if previews:
+        await state.update_data(meal_previews=previews, meal_preview=list(previews.values())[-1])
+    else:
+        await state.clear()
     text, kb = await render_kbju_card(db, user, now_utc=now_utc)
     meal_desc = f"{preview.get('raw_input') or ''} {preview.get('title') or ''}".strip()
     deduct_rows = await _pantry_deduct_rows_for_meal(db, user, meal_desc)
@@ -417,7 +507,6 @@ async def kbju_confirm_text(message: types.Message, state: FSMContext, db) -> No
 
 @router.message(MealAddState.confirm, F.photo)
 async def kbju_confirm_photo(message: types.Message, state: FSMContext, db) -> None:
-    await state.clear()
     from handlers.inbox import handle_unsolicited_photo
 
     await handle_unsolicited_photo(message, state, db)

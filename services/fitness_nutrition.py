@@ -1289,6 +1289,20 @@ async def _maybe_save_label_product(
     )
 
 
+def infer_meal_slot(raw_text: str, category_hint: str = "", default: str = "snack") -> str:
+    """Определить приём пищи (breakfast/lunch/dinner/snack) по подсказке и тексту."""
+    combined = f"{category_hint or ''} {raw_text or ''}".casefold().replace("ё", "е")
+    if re.search(r"\b(?:breakfast|завтрак|позавтракал\w*|с\s+утра)\b", combined):
+        return "breakfast"
+    if re.search(r"\b(?:lunch|обед|пообедал\w*)\b", combined):
+        return "lunch"
+    if re.search(r"\b(?:dinner|ужин|поужинал\w*)\b", combined):
+        return "dinner"
+    if re.search(r"\b(?:snack|перекус\w*|полдник)\b", combined):
+        return "snack"
+    return default if default in {"breakfast", "lunch", "dinner", "snack"} else "snack"
+
+
 async def parse_meal_input(
     *,
     raw_text: str = "",
@@ -1301,10 +1315,12 @@ async def parse_meal_input(
     allow_web_lookup: bool = True,
     web_lookup_fn: Optional[nutrition_web.SearchFn] = None,
     title_hint: str = "",
+    meal_slot_hint: str = "",
 ) -> Dict[str, Any]:
     """Распознать приём пищи (КБЖУ) по фото тарелки/этикетки, тексту, этикетке или меню в сети."""
     client = llm_client_instance or default_llm_client
     clean_text = str(raw_text or "").strip()
+    inferred_slot = infer_meal_slot(clean_text, category_hint=meal_slot_hint)
 
     if image_bytes:
         if not client.is_configured():
@@ -1384,12 +1400,12 @@ async def parse_meal_input(
             serving_g=float(label_hit.get("serving_g") or 100.0),
             source="text_label",
         )
-        return {"ok": True, "used_llm": False, "estimated": False, **label_hit}
+        return {"ok": True, "used_llm": False, "estimated": False, **label_hit, "meal_slot": inferred_slot}
 
     # 1b. Напитки без калорий (кола зеро / без сахара, вода, чай/американо без сахара)
     zero_hit = _parse_zero_calorie_drink(clean_text, title_hint=title_hint)
     if zero_hit is not None:
-        return {"ok": True, "used_llm": False, **zero_hit}
+        return {"ok": True, "used_llm": False, **zero_hit, "meal_slot": inferred_slot}
 
     # 2. Многоуровневый справочник: личные этикетки -> SQLite кэш -> OpenFoodFacts / Web Search
     allow_net_now = bool(
@@ -1408,11 +1424,23 @@ async def parse_meal_input(
     if lookup_rec is not None:
         scaled = nutrition_web.scale_lookup_record(lookup_rec, clean_text)
         if scaled is not None:
+            eff_q = vague_q
+            if allow_clarification:
+                title_low = str(scaled.get("title") or "").casefold()
+                if any(tok in title_low for tok in ("не включ", "не указан", "без учёта", "без учета")):
+                    eff_q = "Уточни объём/порцию недостающего напитка или добавок (или ответь «примерно»)"
+                elif (
+                    vague_q
+                    and float(scaled.get("serving_g") or 0) > 0
+                    and scaled.get("lookup_source") in {"web_search", "openfoodfacts"}
+                    and "половник" in vague_q
+                ):
+                    eff_q = None
             return {
                 "ok": True,
                 "used_llm": scaled["lookup_source"] == "web_search",
                 "title": scaled["title"],
-                "meal_slot": "snack",
+                "meal_slot": inferred_slot,
                 "kcal": scaled["kcal"],
                 "protein_g": scaled["protein_g"],
                 "fat_g": scaled["fat_g"],
@@ -1420,8 +1448,8 @@ async def parse_meal_input(
                 "estimated": scaled["lookup_source"] not in {"my_label", "openfoodfacts"},
                 "lookup_source": scaled["lookup_source"],
                 "lookup_url": scaled["lookup_url"],
-                "needs_clarification": bool(vague_q),
-                "clarification_question": vague_q or "",
+                "needs_clarification": bool(eff_q),
+                "clarification_question": eff_q or "",
             }
 
     # 3. Умный LLM-разбор (если настроен)
@@ -1473,13 +1501,17 @@ async def parse_meal_input(
             norm = _normalize_nutrition_dict(res.data, estimated=True, allow_zero=True)
             if norm:
                 slot = str(res.data.get("meal_slot") or "snack").strip().lower()
+                if slot not in {"breakfast", "lunch", "dinner", "snack"}:
+                    slot = inferred_slot
+                elif slot == "snack" and inferred_slot != "snack":
+                    slot = inferred_slot
                 clar_q = str(res.data.get("clarification_question") or "").strip() if allow_clarification else ""
                 needs_clar = bool(res.data.get("needs_clarification")) and bool(clar_q) and allow_clarification
                 return {
                     "ok": True,
                     "used_llm": True,
                     "title": str(res.data.get("title") or clean_text[:60]).strip(),
-                    "meal_slot": slot if slot in {"breakfast", "lunch", "dinner", "snack"} else "snack",
+                    "meal_slot": slot,
                     "needs_clarification": needs_clar,
                     "clarification_question": clar_q,
                     **norm,
@@ -1495,6 +1527,7 @@ async def parse_meal_input(
         "needs_clarification": bool(vague_q),
         "clarification_question": vague_q or "",
         **offline,
+        "meal_slot": inferred_slot,
     }
 
 
