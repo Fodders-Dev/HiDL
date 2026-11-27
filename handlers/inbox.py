@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import html
 import io
@@ -124,6 +125,23 @@ _SCALE_CAPTION_KEYWORDS = (
     "mi fit",
     "zepp",
 )
+
+_CART_CAPTION_KEYWORDS = (
+    "корзин",
+    "вкусвилл",
+    "vkusvill",
+    "перекрёст",
+    "перекрест",
+    "самокат",
+    "лавка",
+    "чек",
+    "закупк",
+    "в холодильник",
+    "купили продукты",
+)
+
+_INBOX_ALBUM_DEBOUNCE_SEC = 1.2
+_INBOX_ALBUM_BUFFERS: dict[str, dict[str, Any]] = {}
 
 
 def _is_image_document(doc: Any) -> tuple[bool, str]:
@@ -406,6 +424,20 @@ async def _process_unsolicited_image(
         await nutrition._show_meal_preview(message, state, parsed_meal)
         return
 
+    # 6. Если ни тарелка, ни весы не нашлись — проверяем, не скрин ли это корзины/чека
+    if parsed_meal.get("error") == "no_meal_found":
+        from handlers import kitchen
+        from services import kitchen_ai
+
+        parsed_cart = await kitchen_ai.parse_cart_input(
+            raw_text=caption,
+            image_bytes=img_bytes,
+            image_mime=image_mime,
+        )
+        if parsed_cart.get("ok") and len(parsed_cart.get("items") or []) >= 2:
+            await kitchen._show_cart_preview(message, state, parsed_cart)  # noqa: SLF001
+            return
+
     await message.answer(
         "Не смогла разобрать по фото ни еду, ни замеры весов. "
         "Если это блюдо — подпиши коротко (например <code>Гречка 150 г</code>), если весы Xiaomi — пришли как файл без сжатия.",
@@ -414,9 +446,30 @@ async def _process_unsolicited_image(
     )
 
 
+async def _flush_inbox_photo_album(
+    batch: list[types.Message],
+    state: FSMContext,
+    db,
+    user: dict[str, Any],
+) -> None:
+    if not batch:
+        return
+    captions = " ".join(str(getattr(m, "caption", None) or "").lower() for m in batch)
+    if len(batch) >= 3 or any(w in captions for w in _CART_CAPTION_KEYWORDS):
+        from handlers import kitchen
+
+        await kitchen.handle_cart_photo_batch_from_chat(batch, state)
+        return
+    for msg in batch:
+        img_bytes = await _download_telegram_file_bytes(msg.bot, msg.photo[-1])
+        if img_bytes:
+            await _process_unsolicited_image(msg, state, db, user, img_bytes, "image/jpeg")
+
+
 @router.message(StateFilter(None), F.photo)
 async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db) -> None:
-    """Обработать фото тарелки, этикетки или умных весов прямо из общего чата."""
+    """Обработать фото тарелки, этикетки, корзины или умных весов прямо из общего чата."""
+    from handlers import kitchen
     from handlers.nutrition import MealAddState
 
     cur_state = await state.get_state()
@@ -425,6 +478,33 @@ async def handle_unsolicited_photo(message: types.Message, state: FSMContext, db
     user = dict(await ensure_user(db, message.from_user.id, message.from_user.full_name))
     if is_student_mode(user):
         return
+
+    caption = str(getattr(message, "caption", None) or "").strip().lower()
+    if any(w in caption for w in _CART_CAPTION_KEYWORDS):
+        await kitchen.handle_cart_photo_from_chat(message, state)
+        return
+
+    mgid = getattr(message, "media_group_id", None)
+    if mgid:
+        buf_key = f"{int(message.chat.id)}:{mgid}"
+        buf = _INBOX_ALBUM_BUFFERS.get(buf_key)
+        if buf is None:
+            buf = {"messages": [message]}
+            _INBOX_ALBUM_BUFFERS[buf_key] = buf
+
+            async def _flush() -> None:
+                try:
+                    await asyncio.sleep(_INBOX_ALBUM_DEBOUNCE_SEC)
+                finally:
+                    entry = _INBOX_ALBUM_BUFFERS.pop(buf_key, None)
+                if entry and entry.get("messages"):
+                    await _flush_inbox_photo_album(list(entry["messages"]), state, db, user)
+
+            buf["task"] = asyncio.create_task(_flush())
+        else:
+            buf["messages"].append(message)
+        return
+
     img_bytes = await _download_telegram_file_bytes(message.bot, message.photo[-1])
     if not img_bytes:
         await message.answer("Не удалось загрузить фото — попробуй ещё раз или напиши текстом.")

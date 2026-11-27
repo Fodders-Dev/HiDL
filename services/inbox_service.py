@@ -708,7 +708,10 @@ async def _persist_meal_item(
 
 
 _TASK_DATE_HINT_RE = re.compile(
-    r"(?:завтра|послезавтра|сегодня|понедель|вторник|сред[ау]|четверг|пятниц|суббот|воскрес|\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b|\b\d{4}-\d{2}-\d{2}\b)",
+    r"(?:завтра|послезавтра|сегодня|через\s+\d+\s*(?:дн|день|дня|дней|суток)|"
+    r"понедель|вторник|сред[ау]|четверг|пятниц|суббот|воскрес|"
+    r"январ|феврал|март|апрел|ма[йяе]|июн|июл|август|сентябр|октябр|ноябр|декабр|"
+    r"\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b|\b\d{4}-\d{2}-\d{2}\b)",
     re.IGNORECASE,
 )
 
@@ -719,6 +722,8 @@ def _resolve_task_plan_date(
     now_utc: datetime.datetime,
     tz_str: str,
 ) -> str:
+    if item.schedule and getattr(item.schedule, "resolved_date", None) and item.schedule.resolved_date >= local_date:
+        return str(item.schedule.resolved_date)
     d_hint = str(getattr(item, "date_hint", None) or "").strip()
     quote = str(getattr(item, "source_quote", None) or "").strip()
     if not d_hint and not _TASK_DATE_HINT_RE.search(quote):
@@ -1158,7 +1163,7 @@ async def _persist_parsed_items(
                 p_res = await pulse_service.record_hygiene_tick(db, user, cid, slot, now_utc=now)
                 karma = {"delta": p_res.get("delta", 0), "score_after": p_res.get("score_after")}
             else:
-                slot_key = slot if slot in {"wake", "lunch", "dinner"} else "lunch"
+                slot_key = slot if slot in {"wake", "breakfast", "lunch", "dinner"} else "lunch"
                 dom = "sleep" if slot_key == "wake" else "food"
                 chk = await repo.get_pulse_checkin(db, user["id"], local_date, slot_key)
                 if chk is None:
@@ -1595,6 +1600,45 @@ def _get_recent_context(
     else:
         _DIALOG_HISTORY.pop(int(user_id), None)
     return list(fresh)
+
+
+def record_active_recipe_context(
+    user_id: int,
+    recipe: dict[str, Any],
+    pantry_match: Optional[dict[str, Any]] = None,
+    *,
+    now_utc: Optional[datetime.datetime] = None,
+) -> None:
+    """Запомнить в диалоге карточку открытого рецепта для последующих вопросов в чате."""
+    title = str(recipe.get("title") or "Рецепт").strip()
+    t_min = int(recipe.get("time_minutes") or 15)
+    ing_parts = [
+        f"{str(i.get('name') or '').strip()} {i.get('qty', '')} {i.get('unit', '')}".strip()
+        for i in (recipe.get("ingredients") or [])[:10]
+        if isinstance(i, dict) and i.get("name")
+    ]
+    have_parts = [
+        f"{h.get('name')} (в холодильнике: {h.get('pantry_name')})"
+        for h in ((pantry_match or {}).get("have") or [])[:8]
+        if h.get("name")
+    ]
+    steps = [str(s).strip() for s in (recipe.get("steps") or [])[:4] if s]
+    summary = f"Открыт рецепт «{title}» ({t_min} мин). Ингредиенты: {', '.join(ing_parts)}."
+    if have_parts:
+        summary += f" Совпадения дома: {', '.join(have_parts)}."
+    if steps:
+        summary += f" Шаги: {' '.join(steps)}"
+    _append_dialog_turn(
+        user_id,
+        "assistant",
+        summary[:900],
+        now_utc=now_utc,
+        meta={
+            "query_type": "recipe_view",
+            "recipe_id": str(recipe.get("id") or ""),
+            "recipe_title": title,
+        },
+    )
 
 
 def _append_dialog_turn(

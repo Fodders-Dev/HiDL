@@ -17,11 +17,12 @@ def format_quantity(amount: float | int | None, unit: str | None) -> str:
     # normalize common units for RU UI
     u_map = {"g": "г", "гр": "г", "kg": "кг", "ml": "мл", "l": "л"}
     u_norm = u_map.get(u.lower(), u)
-    # Для красивого вывода избегаем длинных хвостов после запятой
-    if abs(value - int(value)) < 1e-6:
-        num = f"{int(value)}"
+    # Для красивого вывода избегаем научной нотации (3e+02) и длинных хвостов
+    rounded = round(value, 2)
+    if abs(rounded - round(rounded)) < 1e-6:
+        num = str(int(round(rounded)))
     else:
-        num = f"{value:.2g}"
+        num = f"{rounded:.2f}".rstrip("0").rstrip(".")
     return f"{num} {u_norm or 'шт'}".strip()
 
 

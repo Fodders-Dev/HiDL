@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import io
 import json
@@ -104,6 +105,112 @@ def _get_adapted_recipe(user_id: int, aid: str) -> Optional[Dict[str, Any]]:
     _prune_adapted_recipes(now_ts)
     entry = _ADAPTED_RECIPES.get((int(user_id), str(aid)))
     return dict(entry[1]) if entry else None
+
+
+_SHARED_COOKED_MEALS: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_SHARED_COOKED_TTL_SEC = 86400.0
+_SHARED_COOKED_MAX = 128
+
+_COOK_LOG_BASE: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}
+_COOK_LOG_BASE_TTL_SEC = 86400.0
+_COOK_LOG_BASE_MAX = 128
+
+_CART_ALBUM_DEBOUNCE_SEC = 1.5
+_CART_ALBUM_BUFFERS: Dict[str, Dict[str, Any]] = {}
+
+
+def _prune_ttl_map(store: Dict[Any, Tuple[float, Dict[str, Any]]], ttl: float, max_items: int) -> None:
+    now_ts = time.monotonic()
+    for k in [k for k, (ts, _) in store.items() if (now_ts - ts) > ttl]:
+        store.pop(k, None)
+    if len(store) > max_items:
+        oldest = sorted(store.items(), key=lambda it: it[1][0])
+        for k, _ in oldest[: len(store) - max_items]:
+            store.pop(k, None)
+
+
+def _store_shared_cooked_meal(share_id: str, payload: Dict[str, Any]) -> None:
+    _prune_ttl_map(_SHARED_COOKED_MEALS, _SHARED_COOKED_TTL_SEC, _SHARED_COOKED_MAX)
+    _SHARED_COOKED_MEALS[share_id] = (time.monotonic(), dict(payload))
+
+
+def _get_shared_cooked_meal(share_id: str) -> Optional[Dict[str, Any]]:
+    _prune_ttl_map(_SHARED_COOKED_MEALS, _SHARED_COOKED_TTL_SEC, _SHARED_COOKED_MAX)
+    entry = _SHARED_COOKED_MEALS.get(str(share_id))
+    return entry[1] if entry else None
+
+
+def _store_cook_log_base(user_id: int, log_id: int, payload: Dict[str, Any]) -> None:
+    _prune_ttl_map(_COOK_LOG_BASE, _COOK_LOG_BASE_TTL_SEC, _COOK_LOG_BASE_MAX)
+    _COOK_LOG_BASE[(int(user_id), int(log_id))] = (time.monotonic(), dict(payload))
+
+
+def _get_cook_log_base(user_id: int, log_id: int) -> Optional[Dict[str, Any]]:
+    _prune_ttl_map(_COOK_LOG_BASE, _COOK_LOG_BASE_TTL_SEC, _COOK_LOG_BASE_MAX)
+    entry = _COOK_LOG_BASE.get((int(user_id), int(log_id)))
+    return dict(entry[1]) if entry else None
+
+
+def _short_pantry_label(name: str, max_len: int = 18) -> str:
+    clean = re.sub(r"\([^)]*\)", "", str(name or "")).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    if len(clean) <= max_len:
+        return clean
+    words = clean.split()
+    out: List[str] = []
+    cur_len = 0
+    for w in words:
+        nxt = cur_len + (1 if out else 0) + len(w)
+        if nxt > max_len:
+            break
+        out.append(w)
+        cur_len = nxt
+    if out:
+        return " ".join(out)
+    return clean[: max(1, max_len - 1)].rstrip() + "…"
+
+
+def _build_tail_cleanup_rows(deducted: List[Dict[str, Any]]) -> List[List[InlineKeyboardButton]]:
+    rows: List[List[InlineKeyboardButton]] = []
+    for d in deducted:
+        pid = d.get("pantry_id")
+        if pid is None:
+            continue
+        rem = float(d.get("remaining") or 0)
+        before = float(d.get("before") or 0)
+        unit = str(d.get("unit") or "шт")
+        if rem <= 0.01:
+            continue
+        small_ratio = before > 0 and rem <= (before * 0.35 + 1e-6)
+        small_weight = unit.strip().lower() in {"г", "g", "гр", "мл", "ml"} and rem <= 150.0
+        if small_ratio or small_weight:
+            lbl = _short_pantry_label(str(d.get("name") or "Продукт"), 16)
+            qty_txt = format_quantity(rem, unit)
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"🗑 Кончилось: {lbl} ({qty_txt})",
+                    callback_data=f"kitchen:tail_del:{int(pid)}",
+                )
+            ])
+        if len(rows) >= 3:
+            break
+    return rows
+
+
+def _build_portion_edit_row(log_id: int, current_serv: float) -> List[InlineKeyboardButton]:
+    opts = [(0.5, "½ порц."), (1.0, "1 порц."), (2.0, "2 порц.")]
+    row: List[InlineKeyboardButton] = []
+    for val, lbl in opts:
+        if abs(current_serv - val) < 0.05:
+            continue
+        val_str = "0.5" if val == 0.5 else str(int(val))
+        row.append(
+            InlineKeyboardButton(
+                text=f"✏️ Я съел {lbl}",
+                callback_data=f"kitchen:cook_edit_log:{int(log_id)}:{val_str}",
+            )
+        )
+    return row
 
 
 class RecipeImportState(StatesGroup):
@@ -872,12 +979,16 @@ def _render_recipe_card_payload(
     nutr = fitness_nutrition.estimate_recipe_nutrition(recipe)
     title = _h(recipe.get("title", "Рецепт"))
     desc = _h(recipe.get("desc", ""))
+    prep_warn = kitchen_ai.detect_recipe_prep_warning(recipe)
     text = f"<b>{title}</b>\n{desc}\n\n"
-    text += f"⏱ {int(recipe.get('time_minutes', 15))} мин • 🍽 {servings} порц.\n"
+    text += f"⏱ {int(recipe.get('time_minutes', 15))} мин • ❄️ Спишется с холодильника: <b>на {servings} порц.</b>\n"
     text += (
         f"🔥 ~<b>{nutr['kcal']} ккал</b> на 1 порцию "
-        f"(Б {nutr['protein_g']:g}г / Ж {nutr['fat_g']:g}г / У {nutr['carbs_g']:g}г)\n\n"
+        f"(Б {nutr['protein_g']:g}г / Ж {nutr['fat_g']:g}г / У {nutr['carbs_g']:g}г)\n"
     )
+    if prep_warn:
+        text += f"⏳ <b>Подготовка заранее:</b> {_h(prep_warn)}\n"
+    text += "\n"
     if adapted_id and substitutions:
         swap_parts = []
         for s in substitutions:
@@ -888,13 +999,25 @@ def _render_recipe_card_payload(
         if swap_parts:
             text += "🔄 <b>Замены под холодильник:</b>\n• " + "\n• ".join(swap_parts) + "\n\n"
 
+    have = match["have"]
+    missing = match["missing"]
+    have_by_ing: Dict[str, str] = {}
+    for h_item in have:
+        h_name = str(h_item.get("name") or "").strip().casefold().replace("ё", "е")
+        p_name = str(h_item.get("pantry_name") or "").strip()
+        if h_name and p_name:
+            have_by_ing[h_name] = p_name
+
     text += f"🧾 <b>Ингредиенты</b> (на {servings} порц.):\n"
     for ing in recipe.get("ingredients") or []:
         qty = _scale_qty(ing.get("qty", 0), factor, ing.get("unit", ""))
-        text += _format_ing_line(ing.get("name", "ингредиент"), qty, ing.get("unit", "")) + "\n"
+        ing_name = str(ing.get("name") or "ингредиент")
+        line = _format_ing_line(ing_name, qty, ing.get("unit", ""))
+        matched_p = have_by_ing.get(ing_name.strip().casefold().replace("ё", "е"), "")
+        if matched_p and matched_p.casefold().replace("ё", "е") != ing_name.strip().casefold().replace("ё", "е"):
+            line += f" <i>(дома: {_h(matched_p)})</i>"
+        text += line + "\n"
 
-    have = match["have"]
-    missing = match["missing"]
     total_ns = len(have) + len(missing)
     if pantry or missing:
         if not missing:
@@ -924,18 +1047,13 @@ def _render_recipe_card_payload(
     if adapted_id:
         rows.append([
             InlineKeyboardButton(
-                text="🍳 Приготовил + 1 порц. в КБЖУ",
+                text=f"🍳 Приготовил ({servings} порц.) + мне 1 порц. в КБЖУ",
                 callback_data=f"kitchen:cook_and_log_ad:{adapted_id}:{servings}:1",
             )
         ])
         rows.append([
-            InlineKeyboardButton(text="🔥 Приготовил (+3 кармы)", callback_data=f"kitchen:cook_fast_ad:{adapted_id}:{servings}"),
+            InlineKeyboardButton(text=f"❄️ Только списать {servings} порц.", callback_data=f"kitchen:cook_deduct_ad:{adapted_id}:{servings}"),
             InlineKeyboardButton(text="⬅️ Вернуть оригинал", callback_data=f"kitchen:cook_view:{rid}:{servings}:{category}:{page}"),
-        ])
-        rows.append([
-            InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kitchen:cook_and_log_ad:{adapted_id}:{servings}:0.5"),
-            InlineKeyboardButton(text="🍽 1 порц.", callback_data=f"kitchen:cook_and_log_ad:{adapted_id}:{servings}:1"),
-            InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kitchen:cook_and_log_ad:{adapted_id}:{servings}:2"),
         ])
         rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)])
     else:
@@ -959,22 +1077,19 @@ def _render_recipe_card_payload(
                 )
             ])
         rows.append([
-            InlineKeyboardButton(text="🍳 Приготовил + 1 порц. в КБЖУ", callback_data=f"kitchen:cook_and_log:{rid}:{servings}:1")
+            InlineKeyboardButton(
+                text=f"🍳 Приготовил ({servings} порц.) + мне 1 порц. в КБЖУ",
+                callback_data=f"kitchen:cook_and_log:{rid}:{servings}:1",
+            )
         ])
         action_row = [
-            InlineKeyboardButton(text="🔥 Приготовил (+3 кармы)", callback_data=f"kitchen:cook_fast:{rid}:{servings}")
+            InlineKeyboardButton(text=f"❄️ Только списать {servings} порц.", callback_data=f"kitchen:cook_deduct:{rid}:{servings}")
         ]
         if missing:
             action_row.append(
                 InlineKeyboardButton(text=f"🛒 Докупить ({len(missing)})", callback_data=f"kitchen:add_miss:{rid}:{servings}")
             )
         rows.append(action_row)
-        rows.append([
-            InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kbju:log_recipe:{rid}:0.5"),
-            InlineKeyboardButton(text="🍽 1 порц.", callback_data=f"kbju:log_recipe:{rid}:1"),
-            InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kbju:log_recipe:{rid}:2"),
-        ])
-        rows.append([InlineKeyboardButton(text="✅ Проверить продукты", callback_data=f"kitchen:cook_check:{rid}:{servings}:{category}:{page}")])
         rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)])
 
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -994,6 +1109,11 @@ async def view_recipe(callback: types.CallbackQuery, db):
         return
 
     pantry = rows_to_dicts(await repo.list_pantry_items(db, user["id"]))
+    from services import inbox_service
+
+    inbox_service.record_active_recipe_context(
+        int(user["id"]), recipe, kitchen_ai.match_recipe_to_pantry(recipe, pantry, servings=servings)
+    )
     text, kb = _render_recipe_card_payload(
         recipe, pantry, servings=servings, category=category, page=page
     )
@@ -1100,6 +1220,13 @@ async def adapt_apply_cb(callback: types.CallbackQuery, db):
         return
 
     pantry = rows_to_dicts(await repo.list_pantry_items(db, user["id"]))
+    from services import inbox_service
+
+    inbox_service.record_active_recipe_context(
+        int(user["id"]),
+        stored["adapted_recipe"],
+        kitchen_ai.match_recipe_to_pantry(stored["adapted_recipe"], pantry, servings=servings),
+    )
     text, kb = _render_recipe_card_payload(
         stored["adapted_recipe"],
         pantry,
@@ -1111,6 +1238,66 @@ async def adapt_apply_cb(callback: types.CallbackQuery, db):
     )
     await safe_edit(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("Рецепт адаптирован под холодильник ✅")
+
+
+async def _notify_partners_after_cook(
+    callback: types.CallbackQuery,
+    db,
+    user: dict,
+    recipe: Dict[str, Any],
+    per_serv: Dict[str, Any],
+    servings: int,
+) -> None:
+    actor_name = _h(user.get("name") or "Партнёр")
+    title = str(recipe.get("title") or "Блюдо")
+    bot = getattr(callback, "bot", None)
+    if servings >= 2:
+        share_id = secrets.token_hex(4)
+        kcal = float(per_serv.get("kcal") or 0)
+        p_g = float(per_serv.get("protein_g") or 0)
+        f_g = float(per_serv.get("fat_g") or 0)
+        c_g = float(per_serv.get("carbs_g") or 0)
+        _store_shared_cooked_meal(
+            share_id,
+            {
+                "actor_id": int(user["id"]),
+                "actor_name": str(user.get("name") or "Партнёр"),
+                "title": title,
+                "recipe_id": str(recipe.get("adapted_from_id") or recipe.get("id") or ""),
+                "kcal": kcal,
+                "protein_g": p_g,
+                "fat_g": f_g,
+                "carbs_g": c_g,
+                "claimed_uids": set(),
+            },
+        )
+        nutr_note = (
+            f"\n🔥 ~<b>{round(kcal)} ккал</b> за 1 порцию "
+            f"(Б {p_g:g}г / Ж {f_g:g}г / У {c_g:g}г)"
+            if kcal > 0
+            else ""
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🍽 Я тоже поел(а) — 1 порц.", callback_data=f"kitchen:partner_eat:{share_id}:1")],
+            [
+                InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kitchen:partner_eat:{share_id}:0.5"),
+                InlineKeyboardButton(text="Не ела", callback_data=f"kitchen:partner_eat:{share_id}:0"),
+            ],
+        ])
+        await household_service.notify_household_partners(
+            bot,
+            db,
+            user,
+            f"🍳 <b>{actor_name}</b> приготовил(а) на {servings} порц.: <b>{_h(title)}</b>.{nutr_note}\nЗаписать тебе в КБЖУ?",
+            reply_markup=kb,
+        )
+        return
+    await household_service.notify_household_partners(
+        bot,
+        db,
+        user,
+        f"🍳 <b>{actor_name}</b> приготовил(а): <b>{_h(title)}</b>.",
+    )
 
 
 async def _handle_cook_and_log_result(
@@ -1139,7 +1326,7 @@ async def _handle_cook_and_log_result(
     f_g = round(float(per_serv.get("fat_g") or 0) * log_servings, 1)
     c_g = round(float(per_serv.get("carbs_g") or 0) * log_servings, 1)
 
-    await repo.add_meal_log(
+    meal_log_id = await repo.add_meal_log(
         db,
         int(user["id"]),
         local_date,
@@ -1152,20 +1339,24 @@ async def _handle_cook_and_log_result(
         carbs_g=c_g,
         source="recipe",
     )
+    _store_cook_log_base(
+        int(user["id"]),
+        int(meal_log_id),
+        {
+            "title": str(recipe.get("title") or "Блюдо"),
+            "per_serv": dict(per_serv),
+            "deducted": list(res.get("deducted") or []),
+            "marked_slot": res.get("marked_slot"),
+        },
+    )
     from services import pulse_service
 
     pulse_extra = await pulse_service.close_open_food_pulse_slot(db, user, "", now_utc=now_utc)
-    actor_name = _h(user.get("name") or "Партнёр")
-    await household_service.notify_household_partners(
-        getattr(callback, "bot", None),
-        db,
-        user,
-        f"🍳 <b>{actor_name}</b> приготовил(а): <b>{_h(recipe.get('title'))}</b>.",
-    )
+    await _notify_partners_after_cook(callback, db, user, recipe, per_serv, servings)
 
     lines = [
-        f"🍳 <b>Приготовлено и учтено: {_h(recipe.get('title'))}!</b>",
-        f"🔥 Записано в КБЖУ ({log_servings:g} порц.): <b>{kcal} ккал</b> (Б {p_g:g}г / Ж {f_g:g}г / У {c_g:g}г)",
+        f"🍳 <b>Приготовлено ({servings} порц.) и учтено: {_h(recipe.get('title'))}!</b>",
+        f"🔥 Записано в твой КБЖУ ({log_servings:g} порц.): <b>{kcal} ккал</b> (Б {p_g:g}г / Ж {f_g:g}г / У {c_g:g}г)",
     ]
     deducted = res.get("deducted") or []
     if deducted:
@@ -1179,7 +1370,9 @@ async def _handle_cook_and_log_result(
         slot_ru = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}.get(str(closed_slot), "Еда")
         lines.append(f"💓 Чек-ин Пульса «{slot_ru}» закрыт.")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb_rows: List[List[InlineKeyboardButton]] = [
+        _build_portion_edit_row(int(meal_log_id), log_servings),
+        *_build_tail_cleanup_rows(deducted),
         [
             InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
             InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
@@ -1188,8 +1381,8 @@ async def _handle_cook_and_log_result(
             InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
             InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main"),
         ],
-    ])
-    await safe_edit(callback.message, "\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    ]
+    await safe_edit(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
     await callback.answer("Списала продукты и записала КБЖУ! 🍽")
 
 
@@ -1277,17 +1470,11 @@ async def _handle_cook_fast_result(
     recipe = res["recipe"]
     log_rid = str(recipe.get("adapted_from_id") or recipe.get("id") or rid)
     nutr = res.get("nutrition_per_serving") or {}
-    actor_name = _h(user.get("name") or "Партнёр")
-    await household_service.notify_household_partners(
-        getattr(callback, "bot", None),
-        db,
-        user,
-        f"🍳 <b>{actor_name}</b> приготовил(а): <b>{_h(recipe.get('title'))}</b>.",
-    )
-    lines = [f"🍽 <b>Приготовлено: {_h(recipe.get('title'))}!</b>"]
+    await _notify_partners_after_cook(callback, db, user, recipe, nutr, servings)
+    lines = [f"🍽 <b>Приготовлено ({servings} порц.): {_h(recipe.get('title'))}!</b>"]
     if nutr.get("kcal"):
         lines.append(
-            f"🔥 1 порция: ~<b>{nutr['kcal']} ккал</b> "
+            f"🔥 Продукты списаны без записи в твой КБЖУ · 1 порция ~<b>{nutr['kcal']} ккал</b> "
             f"(Б {float(nutr['protein_g']):g}г / Ж {float(nutr['fat_g']):g}г / У {float(nutr['carbs_g']):g}г)"
         )
     deducted = res.get("deducted") or []
@@ -1319,10 +1506,10 @@ async def _handle_cook_fast_result(
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🍽 ½ порц.", callback_data=f"kbju:log_recipe:{log_rid}:0.5"),
-            InlineKeyboardButton(text="🍽 1 порц.", callback_data=f"kbju:log_recipe:{log_rid}:1"),
-            InlineKeyboardButton(text="🍽 2 порц.", callback_data=f"kbju:log_recipe:{log_rid}:2"),
+            InlineKeyboardButton(text="🍽 ½ порц. себе", callback_data=f"kbju:log_recipe:{log_rid}:0.5"),
+            InlineKeyboardButton(text="🍽 1 порц. себе", callback_data=f"kbju:log_recipe:{log_rid}:1"),
         ],
+        *_build_tail_cleanup_rows(deducted),
         [
             InlineKeyboardButton(text="🍳 Что приготовить ещё?", callback_data="kitchen:quick_pick"),
             InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
@@ -1333,10 +1520,10 @@ async def _handle_cook_fast_result(
         ],
     ])
     await safe_edit(callback.message, "\n".join(lines), reply_markup=kb, parse_mode="HTML")
-    await callback.answer("Приятного аппетита! 🍽")
+    await callback.answer("Продукты списаны! 🍽")
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_fast:"))
+@router.callback_query(lambda c: c.data and (c.data.startswith("kitchen:cook_fast:") or c.data.startswith("kitchen:cook_deduct:")))
 async def cook_fast_commit(callback: types.CallbackQuery, db):
     parts = callback.data.split(":")
     rid = parts[2] if len(parts) > 2 else ""
@@ -1345,7 +1532,7 @@ async def cook_fast_commit(callback: types.CallbackQuery, db):
     await _handle_cook_fast_result(callback, db, user, rid=rid, servings=servings)
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_fast_ad:"))
+@router.callback_query(lambda c: c.data and (c.data.startswith("kitchen:cook_fast_ad:") or c.data.startswith("kitchen:cook_deduct_ad:")))
 async def cook_fast_adapted_commit(callback: types.CallbackQuery, db):
     parts = callback.data.split(":")
     aid = parts[2] if len(parts) > 2 else ""
@@ -1363,6 +1550,181 @@ async def cook_fast_adapted_commit(callback: types.CallbackQuery, db):
         servings=servings,
         recipe_override=stored["adapted_recipe"],
     )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_edit_log:"))
+async def cook_edit_logged_portion_cb(callback: types.CallbackQuery, db):
+    parts = (callback.data or "").split(":")
+    try:
+        log_id = int(parts[2])
+        new_serv = max(0.25, min(4.0, float(parts[3])))
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    uid = int(user["id"])
+    existing = await repo.get_meal_log(db, uid, log_id)
+    if not existing:
+        await callback.answer("Запись КБЖУ не найдена.", show_alert=True)
+        return
+
+    base_info = _get_cook_log_base(uid, log_id)
+    if base_info and base_info.get("per_serv"):
+        per_serv = base_info["per_serv"]
+    else:
+        old_s = max(0.25, float(existing.get("servings") or 1.0))
+        per_serv = {
+            "kcal": float(existing.get("kcal") or 0) / old_s,
+            "protein_g": float(existing.get("protein_g") or 0) / old_s,
+            "fat_g": float(existing.get("fat_g") or 0) / old_s,
+            "carbs_g": float(existing.get("carbs_g") or 0) / old_s,
+        }
+
+    kcal = round(float(per_serv.get("kcal") or 0) * new_serv)
+    p_g = round(float(per_serv.get("protein_g") or 0) * new_serv, 1)
+    f_g = round(float(per_serv.get("fat_g") or 0) * new_serv, 1)
+    c_g = round(float(per_serv.get("carbs_g") or 0) * new_serv, 1)
+    await repo.update_meal_log(
+        db,
+        uid,
+        log_id,
+        servings=new_serv,
+        kcal=kcal,
+        protein_g=p_g,
+        fat_g=f_g,
+        carbs_g=c_g,
+    )
+
+    title = str((base_info or {}).get("title") or existing.get("title") or "Блюдо")
+    deducted = list((base_info or {}).get("deducted") or [])
+    lines = [
+        f"🍳 <b>Обновила твою порцию: {_h(title)}!</b>",
+        f"🔥 Записано в твой КБЖУ ({new_serv:g} порц.): <b>{kcal} ккал</b> (Б {p_g:g}г / Ж {f_g:g}г / У {c_g:g}г)",
+    ]
+    if deducted:
+        ded_str = ", ".join(f"{_h(d['name'])} (ост. {format_quantity(d['remaining'], d['unit'])})" for d in deducted[:5])
+        lines.append(f"❄️ Списано из холодильника: {ded_str}")
+
+    kb_rows: List[List[InlineKeyboardButton]] = [
+        _build_portion_edit_row(log_id, new_serv),
+        *_build_tail_cleanup_rows(deducted),
+        [
+            InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today"),
+            InlineKeyboardButton(text="📅 Меню на 3 дня", callback_data="kitchen:meal_plan"),
+        ],
+        [
+            InlineKeyboardButton(text="❄️ Холодильник", callback_data="kitchen:fridge"),
+            InlineKeyboardButton(text="⬅️ Меню кухни", callback_data="kitchen:main"),
+        ],
+    ]
+    await safe_edit(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+    await callback.answer(f"Порция обновлена: {new_serv:g} порц. ✅")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:tail_del:"))
+async def tail_delete_pantry_cb(callback: types.CallbackQuery, db):
+    parts = (callback.data or "").split(":")
+    try:
+        pid = int(parts[2])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    deleted = await repo.delete_pantry_item(db, int(user["id"]), pid)
+
+    cur_markup = getattr(callback.message, "reply_markup", None)
+    if cur_markup and getattr(cur_markup, "inline_keyboard", None):
+        target_cb = f"kitchen:tail_del:{pid}"
+        new_rows = []
+        for row in cur_markup.inline_keyboard:
+            kept = [btn for btn in row if getattr(btn, "callback_data", None) != target_cb]
+            if kept:
+                new_rows.append(kept)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=new_rows))
+        except Exception:
+            pass
+    await callback.answer("Убрала остаток из холодильника 🗑" if deleted else "Уже убрано 👍")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("kitchen:partner_eat:"))
+async def partner_eat_shared_cb(callback: types.CallbackQuery, db):
+    parts = (callback.data or "").split(":")
+    share_id = parts[2] if len(parts) > 2 else ""
+    try:
+        eat_serv = float(parts[3]) if len(parts) > 3 else 1.0
+    except ValueError:
+        eat_serv = 1.0
+
+    user = dict(await ensure_user(db, callback.from_user.id, callback.from_user.full_name))
+    uid = int(user["id"])
+    if is_student_mode(user):
+        await callback.answer("Раздел КБЖУ отключён в учебном режиме.", show_alert=True)
+        return
+
+    shared = _get_shared_cooked_meal(share_id)
+    if not shared:
+        await callback.answer("Кнопка устарела — можно записать приём пищи в чате.", show_alert=True)
+        return
+
+    if eat_serv <= 0:
+        shared.setdefault("claimed_uids", set()).add(uid)
+        await safe_edit(
+            callback.message,
+            f"👌 Ок, не записывала <b>{_h(shared['title'])}</b> в твой КБЖУ.",
+            parse_mode="HTML",
+        )
+        await callback.answer("Не записывала 👍")
+        return
+
+    claimed = shared.setdefault("claimed_uids", set())
+    if uid in claimed:
+        await callback.answer("Уже записано в твой КБЖУ 👍")
+        return
+
+    eat_serv = max(0.25, min(3.0, eat_serv))
+    now_utc = datetime.datetime.utcnow()
+    local_date = local_date_str(now_utc, user.get("timezone") or "UTC")
+    kcal = round(float(shared.get("kcal") or 0) * eat_serv)
+    p_g = round(float(shared.get("protein_g") or 0) * eat_serv, 1)
+    f_g = round(float(shared.get("fat_g") or 0) * eat_serv, 1)
+    c_g = round(float(shared.get("carbs_g") or 0) * eat_serv, 1)
+
+    await repo.add_meal_log(
+        db,
+        uid,
+        local_date,
+        str(shared.get("title") or "Блюдо"),
+        recipe_id=str(shared.get("recipe_id") or ""),
+        servings=eat_serv,
+        kcal=kcal,
+        protein_g=p_g,
+        fat_g=f_g,
+        carbs_g=c_g,
+        source="recipe_shared",
+    )
+    claimed.add(uid)
+    from services import pulse_service
+
+    pulse_extra = await pulse_service.close_open_food_pulse_slot(db, user, "", now_utc=now_utc)
+    pulse_note = ""
+    if pulse_extra and pulse_extra.get("slot"):
+        slot_ru = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}.get(str(pulse_extra["slot"]), "Еда")
+        pulse_note = f"\n💓 Чек-ин Пульса «{slot_ru}» закрыт."
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Мой КБЖУ", callback_data="kbju:today")]
+    ])
+    await safe_edit(
+        callback.message,
+        f"🍽 Записала в твой КБЖУ ({eat_serv:g} порц.): <b>{_h(shared['title'])}</b>\n"
+        f"🔥 <b>{kcal} ккал</b> (Б {p_g:g}г / Ж {f_g:g}г / У {c_g:g}г){pulse_note}",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    await callback.answer("Записала в твой КБЖУ! 🍽")
 
 @router.callback_query(lambda c: c.data and c.data.startswith("kitchen:cook_check:"))
 async def cook_check_ingredients(callback: types.CallbackQuery, state: FSMContext, db):
@@ -1556,7 +1918,8 @@ def _render_meal_plan_payload(plan_data: dict) -> Tuple[str, InlineKeyboardMarku
             kbju_note = f" · ~{est_k} ккал, Б {est_p}г" if (show_kbju and est_k > 0) else ""
             miss_n = int(slot.get("missing_count") or 0)
             miss_note = f" · ⚠️ нет {miss_n} прод." if (miss_n > 0 and d_str == start_date and slot.get("status") != "cooked") else ""
-            lines.append(f"{icon} {s_lbl}: <b>{_h(slot.get('title'))}</b> · {t_min} мин{kbju_note}{miss_note}")
+            prep_note = " · ⏳ заранее" if (slot.get("prep_warning") and slot.get("status") != "cooked") else ""
+            lines.append(f"{icon} {s_lbl}: <b>{_h(slot.get('title'))}</b> · {t_min} мин{kbju_note}{miss_note}{prep_note}")
         if show_kbju and d_str in daily_summary:
             ds = daily_summary[d_str]
             p_gap = int(ds.get("target_protein_g") or 0) - int(ds.get("protein_g") or 0)
@@ -2013,6 +2376,53 @@ async def fridge_save(callback: types.CallbackQuery, state: FSMContext, db):
 
 
 # --- HANDLERS: CART / RECEIPT IMPORT ---
+def _merge_cart_previews(existing: Optional[Dict[str, Any]], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Объединить несколько распознанных скриншотов корзины/чека без дублей и повторного суммирования итога."""
+    base = dict(existing or {})
+    merged_items: List[Dict[str, Any]] = []
+    seen_keys: set[tuple[str, float, str]] = set()
+    for src in (base.get("items") or [], incoming.get("items") or []):
+        for raw_it in src:
+            if not isinstance(raw_it, dict):
+                continue
+            name = str(raw_it.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                amt = round(float(raw_it.get("amount") or 1.0), 2)
+            except (TypeError, ValueError):
+                amt = 1.0
+            unit = str(raw_it.get("unit") or "шт").strip().lower()
+            key = (re.sub(r"\s+", " ", name.casefold().replace("ё", "е")), amt, unit)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged_items.append(dict(raw_it))
+
+    prev_total = base.get("total_amount")
+    new_total = incoming.get("total_amount")
+    total_vals = [float(v) for v in (prev_total, new_total) if v is not None and float(v) > 0]
+    merged_total = max(total_vals) if total_vals else None
+
+    store = str(base.get("store") or incoming.get("store") or "").strip()
+    prev_photos = int(base.get("photos_count") or (1 if base.get("items") else 0))
+    inc_photos = int(incoming.get("photos_count") or (1 if (incoming.get("items") or incoming.get("ok") is not None) else 0))
+    prev_failed = int(base.get("failed_photos") or 0)
+    inc_failed = int(incoming.get("failed_photos") or (0 if incoming.get("ok") else 1))
+    last_err = incoming.get("error") or base.get("error")
+
+    return {
+        "ok": bool(merged_items),
+        "items": merged_items,
+        "total_amount": merged_total,
+        "store": store,
+        "photos_count": max(1, prev_photos + inc_photos) if (prev_photos or inc_photos) else 0,
+        "failed_photos": prev_failed + inc_failed,
+        "used_llm": bool(base.get("used_llm") or incoming.get("used_llm")),
+        "error": None if merged_items else last_err,
+    }
+
+
 async def _show_cart_preview(message: types.Message, state: FSMContext, parsed: dict) -> None:
     items = list(parsed.get("items") or [])
     if not parsed.get("ok") or not items:
@@ -2029,16 +2439,26 @@ async def _show_cart_preview(message: types.Message, state: FSMContext, parsed: 
     await state.update_data(cart_preview=parsed)
 
     store = str(parsed.get("store") or "").strip()
-    header = f"🛒 <b>Разобрала корзину{f' ({_h(store)})' if store else ''}: {len(items)} поз.</b>"
+    photos_cnt = int(parsed.get("photos_count") or 1)
+    failed_cnt = int(parsed.get("failed_photos") or 0)
+    ctx_parts = []
+    if store:
+        ctx_parts.append(_h(store))
+    if photos_cnt > 1:
+        ctx_parts.append(f"{photos_cnt} скрин.")
+    ctx_note = f" ({', '.join(ctx_parts)})" if ctx_parts else ""
+    header = f"🛒 <b>Разобрала корзину{ctx_note}: {len(items)} поз.</b>"
     lines = [header]
-    for it in items[:20]:
+    for it in items[:25]:
         lines.append(f"• {_h(it['name'])} ({format_quantity(it['amount'], it['unit'])})")
-    if len(items) > 20:
-        lines.append(f"… и ещё {len(items) - 20} поз.")
+    if len(items) > 25:
+        lines.append(f"… и ещё {len(items) - 25} поз.")
+    if failed_cnt > 0:
+        lines.append(f"\n⚠️ Не удалось разобрать фото: {failed_cnt} (остальные сохранила).")
 
     total_amt = parsed.get("total_amount")
     rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text="🧊 Всё в холодильник", callback_data="kitchen:cart_confirm:pantry")]
+        [InlineKeyboardButton(text=f"🧊 Всё в холодильник ({len(items)} поз.)", callback_data="kitchen:cart_confirm:pantry")]
     ]
     if total_amt is not None and float(total_amt) > 0:
         amt_val = float(total_amt)
@@ -2049,6 +2469,7 @@ async def _show_cart_preview(message: types.Message, state: FSMContext, parsed: 
                 callback_data="kitchen:cart_confirm:both",
             )
         ])
+    lines.append("\n<i>Если скринов было больше — просто докинь ещё фото сюда же.</i>")
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="kitchen:cancel_fsm")])
     await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
@@ -2059,8 +2480,8 @@ async def cart_import_start(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(CartImportState.waiting_input)
     await callback.message.answer(
         "📥 <b>Импорт корзины / чека</b>\n\n"
-        "Пришли <b>скриншот (фото)</b> корзины или чека (например, из Перекрёстка) — либо вставь <b>список покупок текстом</b>.\n"
-        "Я сама разберу продукты, вычеркну их из списка покупок и положу в холодильник.",
+        "Пришли <b>1 или сразу 3–4 скриншота</b> корзины/чека (например, ВкусВилл или Перекрёсток) — либо вставь <b>список покупок текстом</b>.\n"
+        "Я сама склею все позиции без дублей, вычеркну их из покупок и положу в общий холодильник.",
         reply_markup=_cancel_fsm_keyboard(),
         parse_mode="HTML",
     )
@@ -2079,15 +2500,74 @@ async def _download_photo_bytes(message: types.Message) -> bytes:
     return img_bytes
 
 
-@router.message(CartImportState.waiting_input, F.photo)
-async def cart_import_photo(message: types.Message, state: FSMContext):
-    img_bytes = await _download_photo_bytes(message)
-    parsed = await kitchen_ai.parse_cart_input(
-        raw_text=message.caption or "",
-        image_bytes=img_bytes,
-        image_mime="image/jpeg",
+async def _parse_cart_messages_batch(
+    messages: List[types.Message],
+    state: FSMContext,
+    existing_preview: Optional[Dict[str, Any]] = None,
+) -> None:
+    caption = next((str(getattr(m, "caption", None) or "").strip() for m in messages if getattr(m, "caption", None)), "")
+    blobs: List[bytes] = []
+    for msg in messages:
+        blobs.append(await _download_photo_bytes(msg))
+    parsed_list = await asyncio.gather(
+        *[
+            kitchen_ai.parse_cart_input(
+                raw_text=caption if idx == 0 else "",
+                image_bytes=blob,
+                image_mime="image/jpeg",
+            )
+            for idx, blob in enumerate(blobs)
+        ]
     )
-    await _show_cart_preview(message, state, parsed)
+    acc = dict(existing_preview) if existing_preview else None
+    for parsed in parsed_list:
+        acc = _merge_cart_previews(acc, parsed)
+    await _show_cart_preview(messages[-1], state, acc or {"ok": False, "items": [], "error": "no_items_found"})
+
+
+async def handle_cart_photo_batch_from_chat(messages: List[types.Message], state: FSMContext) -> None:
+    """Принять пачку скриншотов корзины напрямую из свободного чата и показать единое превью."""
+    if not messages:
+        return
+    data = await state.get_data()
+    cur_state = await state.get_state()
+    existing = data.get("cart_preview") if cur_state == CartImportState.confirm.state else None
+    await _parse_cart_messages_batch(messages, state, existing_preview=existing)
+
+
+async def handle_cart_photo_from_chat(message: types.Message, state: FSMContext) -> None:
+    """Принять одиночный или альбомный скриншот корзины из экрана импорта или свободного чата."""
+    mgid = getattr(message, "media_group_id", None)
+    if mgid:
+        buf_key = f"{int(message.chat.id)}:{mgid}"
+        buf = _CART_ALBUM_BUFFERS.get(buf_key)
+        if buf is None:
+            buf = {"messages": [message], "task": None}
+            _CART_ALBUM_BUFFERS[buf_key] = buf
+
+            async def _flush_album() -> None:
+                try:
+                    await asyncio.sleep(_CART_ALBUM_DEBOUNCE_SEC)
+                finally:
+                    entry = _CART_ALBUM_BUFFERS.pop(buf_key, None)
+                if entry and entry.get("messages"):
+                    await handle_cart_photo_batch_from_chat(list(entry["messages"]), state)
+
+            buf["task"] = asyncio.create_task(_flush_album())
+        else:
+            buf["messages"].append(message)
+        return
+
+    data = await state.get_data()
+    cur_state = await state.get_state()
+    existing = data.get("cart_preview") if cur_state == CartImportState.confirm.state else None
+    await _parse_cart_messages_batch([message], state, existing_preview=existing)
+
+
+@router.message(CartImportState.waiting_input, F.photo)
+@router.message(CartImportState.confirm, F.photo)
+async def cart_import_photo(message: types.Message, state: FSMContext):
+    await handle_cart_photo_from_chat(message, state)
 
 
 @router.message(CartImportState.waiting_input, lambda m: bool(m.text and not m.text.startswith("/")))

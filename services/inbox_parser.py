@@ -130,7 +130,7 @@ _SHOPPING_TRIGGER_RE = re.compile(
 
 _TASK_TRIGGER_RE = re.compile(
     r"(?iu)(?:\bнадо\b|\bнужно\b|\bнеобходимо\b|\bне\s+забыть\b|\bпредстоит\b|"
-    r"\bзаняться\b|\bдобавь\s+в\s+план\b|\bсделать\b)"
+    r"\bзаняться\b|\b(?:запиши|добавь|поставь)\s+в\s+план\w*\b|\bв\s+планах\b|\bсделать\b)"
 )
 
 _TASK_ACTION_START_RE = re.compile(
@@ -155,9 +155,32 @@ _VAGUE_WHEN_RE = re.compile(
     r"\bв\s+следующ\w+\s+(?:понедель|вторник|сред|четвер|пятниц|суббот|воскрес)\w*\b)"
 )
 
+_RU_MONTHS = {
+    "январ": 1,
+    "феврал": 2,
+    "март": 3,
+    "апрел": 4,
+    "ма": 5,
+    "июн": 6,
+    "июл": 7,
+    "август": 8,
+    "сентябр": 9,
+    "октябр": 10,
+    "ноябр": 11,
+    "декабр": 12,
+}
+
+_RU_MONTH_DATE_RE = re.compile(
+    r"\b(\d{1,2})\s+(январ[яь]|феврал[яь]|март[а]?|апрел[яь]|ма[йя]|июн[яь]|июл[яь]|"
+    r"август[а]?|сентябр[яь]|октябр[яь]|ноябр[яь]|декабр[яь])(?:\s+(\d{4}))?\b",
+    re.IGNORECASE,
+)
+
 _RELATIVE_DATE_MARKER_RE = re.compile(
     r"(?iu)(?:\bсегодня\b|\bзавтра\b|\bпослезавтра\b|\bчерез\s+\d+\s*(?:дн|день|дня|дней|суток)\b|"
     r"\bпонедель|\bвторник|\bсред|\bчетвер|\bпятниц|\bсуббот|\bвоскрес|"
+    r"\b\d{1,2}\s+(?:январ[яь]|феврал[яь]|март[а]?|апрел[яь]|ма[йя]|июн[яь]|июл[яь]|"
+    r"август[а]?|сентябр[яь]|октябр[яь]|ноябр[яь]|декабр[яь])\b|"
     r"\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b|\b\d{4}-\d{2}-\d{2}\b)"
 )
 
@@ -186,11 +209,11 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "today": планы, дела, напоминания на сегодня.
 - "calendar": события в календаре / расписание / встречи на сегодня и ближайшие дни.
 - "shopping": список покупок / что купить.
-- "food": что приготовить / поесть / на ужин, обед, завтрак.
+- "food": ТОЛЬКО вопрос что приготовить / поесть / идеи на приём пищи ("что приготовить", "что у нас на ужин", "что бы поесть"). Если пользователь спрашивает по конкретному блюду/ингредиенту ("какая фасоль — консервированная или замачивать?", "сколько варить?"), используй "advice", а НЕ "food"!
 - "diary": поиск в записях дневника/входящих (в query_term укажи ключевую тему, например "папа").
 - "karma": уровень кармы, долги по сферам, статус режима.
 - "pantry": что сейчас есть в холодильнике/кладовке дома.
-- "advice": запрос совета или объяснения по текущей ситуации, питанию, дефициту/профициту калорий, набору/сбросу веса, весам, белку и тренировкам ("что мне сейчас делать", "дай совет", "2210 ккал это надо есть или нельзя больше?", "если переем, буду толстеть?", "почему вес стоит?", "что такое висцеральный жир?").
+- "advice": запрос совета или объяснения по текущей ситуации, питанию, кулинарии/рецепту, дефициту/профициту калорий, набору/сбросу веса, весам, белку и тренировкам ("что мне сейчас делать", "дай совет", "2210 ккал это надо есть или нельзя больше?", "если переем, буду толстеть?", "почему вес стоит?", "а че за фасоль — консервированная или замачивать надо?", "сколько варить гречку?").
 - "meal_check": пользователь только ДУМАЕТ / ПЛАНИРУЕТ / СПРАШИВАЕТ, стоит ли съесть или выпить конкретное блюдо/напиток ("думаю съесть мороженое", "хочу заказать шаурму, норм?", "можно мне сейчас латте с круассаном?"). В "query_term" верни чистое название блюда/напитка (НЕ создавай meal_log!).
 - "kbju": ТОЛЬКО короткий запрос показать сводку/остаток калорий и БЖУ за сегодня ("сколько калорий осталось", "что мне добрать по белку", "мой кбжу", "покажи кбжу"). Если человек спрашивает ЗАЧЕМ/ПОЧЕМУ/МОЖНО ЛИ больше/буду ли толстеть — это "advice", а НЕ "kbju"!
 
@@ -205,7 +228,7 @@ _INBOX_SYSTEM_PROMPT = """Ты — умный роутер и модуль ра�
 - "meal_log": пользователь сообщает, что КОНКРЕТНО съел, выпил или поел на приём пищи ("поел суп", "съел овсянку с бананом", "выпил капучино на овсяном в Surf Coffee", "на обед был борщ", "пообедал борщом", "позавтракал сырниками"). В title укажи полное описание еды с граммами/местом.
 - "weight_log": замеры веса или умных весов ("взвесился 84.8, жир 22.1, мышцы 61").
 - "workout_log": выполненная тренировка/активность ("сделал 15 минут с гантелями", "пробежал 20 мин", "позанимался на турнике").
-- "pulse_log": только голая отметка Пульса БЕЗ конкретного блюда/названия еды (category: "wake"|"lunch"|"dinner"|"water"|"teeth"|"bedtime", например "я поел", "уже пообедал", "выпил воды", "почистил зубы", "ложусь спать"). Если сказано "съел овсянку и выпил воды" -> верни ОДНОВРЕМЕННО meal_log ("овсянка") и pulse_log (category="water").
+- "pulse_log": только голая отметка Пульса БЕЗ конкретного блюда/названия еды (category: "wake"|"breakfast"|"lunch"|"dinner"|"water"|"teeth"|"bedtime", например "я поел", "уже позавтракал", "уже пообедал", "выпил воды", "почистил зубы", "ложусь спать"). НИКОГДА не возвращай pulse_log вместе с meal_log за одну и ту же еду (meal_log сам закроет Пульс), и не ставь category="wake" для завтрака/еды. Если сказано "съел овсянку и выпил воды" -> верни ОДНОВРЕМЕННО meal_log ("овсянка") и pulse_log (category="water").
 - "rollover_tasks": перенести незавершённые дела/хвосты дня на завтра ("перенеси хвосты на завтра").
 - "shift_bedtime": перенести время отбоя сегодня на час HH:MM (time_hint="HH:MM", например "ложусь в 00:30").
 - "shift_wake": изменить время подъёма/будильника ("завтра подъёмы будут в 6:30", "подъём в 7:00", time_hint="HH:MM") или отметить день без будильника ("завтра без будильника").
@@ -355,6 +378,32 @@ def _extract_date_from_text(src: str, local_today: datetime.date) -> Optional[da
         except ValueError:
             pass
 
+    m_ru_date = _RU_MONTH_DATE_RE.search(txt)
+    if m_ru_date:
+        dd = int(m_ru_date.group(1))
+        m_word = m_ru_date.group(2).lower().replace("ё", "е")
+        yy = int(m_ru_date.group(3)) if m_ru_date.group(3) else None
+        mm = next((val for stem, val in _RU_MONTHS.items() if m_word.startswith(stem)), None)
+        if mm and 1 <= dd <= 31:
+            if yy is not None:
+                try:
+                    return datetime.date(yy, mm, dd)
+                except ValueError:
+                    pass
+            else:
+                try:
+                    cand = datetime.date(local_today.year, mm, dd)
+                except ValueError:
+                    cand = None
+                if cand is not None:
+                    if cand < local_today:
+                        try:
+                            cand = datetime.date(local_today.year + 1, mm, dd)
+                        except ValueError:
+                            cand = None
+                    if cand is not None:
+                        return cand
+
     # DD.MM without year (ignore HH.MM preceded by "в"/"на")
     for m_dm in re.finditer(r"(?<![вк]\s)\b(\d{1,2})\.(\d{1,2})\b(?!\.\d)", txt):
         dd, mm = int(m_dm.group(1)), int(m_dm.group(2))
@@ -493,6 +542,7 @@ def resolve_temporal_expression(
     has_vague = bool(_VAGUE_WHEN_RE.search(raw_lower))
     has_explicit_cal = bool(
         re.search(r"\b\d{1,2}\.\d{1,2}(?:\.\d{4})?\b|\b\d{4}-\d{2}-\d{2}\b", raw_lower)
+        or _RU_MONTH_DATE_RE.search(raw_lower)
     )
     if has_vague and not has_explicit_cal:
         # Preserve time if user wrote "потом в 18:00" -> still vague date
@@ -743,7 +793,14 @@ _PULSE_LOG_RULES = (
     ),
     (
         re.compile(
-            r"(?iu)^(?:я\s+|уже\s+|сегодня\s+|только\s+что\s+)*(?:пообедал[аи]?|поел[аи]?|позавтракал[аи]?)(?:\s+(?:дома|хорошо|вкусно|плотно|уже))?$"
+            r"(?iu)^(?:я\s+|уже\s+|сегодня\s+|только\s+что\s+)*позавтракал[аи]?(?:\s+(?:дома|хорошо|вкусно|плотно|уже))?$"
+        ),
+        "breakfast",
+        "Завтрак",
+    ),
+    (
+        re.compile(
+            r"(?iu)^(?:я\s+|уже\s+|сегодня\s+|только\s+что\s+)*(?:пообедал[аи]?|поел[аи]?)(?:\s+(?:дома|хорошо|вкусно|плотно|уже))?$"
         ),
         "lunch",
         "Приём пищи",
@@ -1054,12 +1111,14 @@ def _apply_guardrails(
             item.title = _capitalize_first(quote)
         else:
             slot = (item.category or "").strip().lower()
-            if slot not in {"wake", "lunch", "dinner", "water", "teeth", "bedtime"}:
+            if slot not in {"wake", "breakfast", "lunch", "dinner", "water", "teeth", "bedtime"}:
                 slot = "lunch"
                 for pat, slot_key, _ in _PULSE_LOG_RULES:
                     if pat.search(quote):
                         slot = slot_key
                         break
+            if slot == "wake" and "завтрак" in f"{item.title} {quote}".lower():
+                slot = "breakfast"
             item.category = slot
             item.title = _capitalize_first(item.title or quote)
     elif kind in {"shift_bedtime", "shift_wake"}:
@@ -1083,6 +1142,16 @@ def _apply_guardrails(
         m_rd = _REMINDER_DELETE_RE.search(quote)
         raw_rd = (m_rd.group(1) if m_rd else item.title or quote).strip(" ,.?!\"'«»")
         item.title = _capitalize_first(raw_rd) or _capitalize_first(quote)
+    elif kind == "task":
+        item.title = _capitalize_first(item.title or quote)
+        if date_hint or _RELATIVE_DATE_MARKER_RE.search(quote.lower()):
+            item.schedule = resolve_temporal_expression(
+                date_hint=date_hint,
+                time_hint=time_hint,
+                raw_fragment=quote,
+                now_utc=now_utc,
+                tz_str=tz_str,
+            )
     else:
         item.title = _capitalize_first(item.title or quote)
 
@@ -1445,6 +1514,14 @@ _QUERY_FOOD_RE = re.compile(
     r"что\s+(?:у\s+нас\s+)?на\s+(?:ужин|обед|завтрак))\b"
 )
 
+_COOKING_QUESTION_RE = re.compile(
+    r"(?iu)(?:\b(?:замач\w*|замоч\w*|консервирован\w*|вар[ие]т\w*|сварить|тушить|жарить|печь|духовк\w*|"
+    r"сколько\s+(?:минут|времени|варить|готовить|держать)|"
+    r"как\s+(?:понять|готовить|варить|заменять|заменить)|"
+    r"какая\s+(?:фасоль|чечевица|крупа|мука)|"
+    r"(?:можно|надо|нужно)\s+(?:ли\s+)?(?:замачивать|замочить|заменить|добавить|пропустить))\b)"
+)
+
 _QUERY_DIARY_RE = re.compile(
     r"(?iu)(?:что\s+я\s+(?:писал[аи]?|говорил[аи]?|записывал[аи]?|отмечал[аи]?)\s+(?:про|о|об)\s+(.+)|"
     r"(?:найди|поищи|покажи)\s+в\s+дневнике(?:\s+(?:про|о|об))?\s*(.*)|"
@@ -1578,11 +1655,25 @@ def _try_deterministic_intent(
         return chat_res
 
     raw = (clean_text or "").strip()
-    if not raw or len(_split_clauses(raw)) > 1:
+    if not raw:
+        return None
+
+    prev_qt = _latest_assistant_query_type(recent_context)
+    if not _QUERY_FOOD_RE.search(raw) and (
+        _COOKING_QUESTION_RE.search(raw)
+        or (
+            "?" in raw
+            and prev_qt == "recipe_view"
+            and not _TASK_TRIGGER_RE.search(raw)
+            and not _SHOPPING_TRIGGER_RE.search(raw)
+        )
+    ):
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="advice", query_term=raw)
+
+    if len(_split_clauses(raw)) > 1:
         return None
 
     stripped_punct = re.sub(r"[?!.,;:\s]+$", "", raw).strip()
-    prev_qt = _latest_assistant_query_type(recent_context)
     if prev_qt and _MORE_FOLLOWUP_RE.fullmatch(stripped_punct):
         return InboxParseResult(
             items=[],
@@ -1617,8 +1708,12 @@ def _try_deterministic_intent(
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="advice", query_term=raw)
     if _QUERY_SHOPPING_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="shopping")
+    if _COOKING_QUESTION_RE.search(raw) and not _QUERY_FOOD_RE.search(raw):
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="advice", query_term=raw)
     if _QUERY_FOOD_RE.search(raw):
         return InboxParseResult(items=[], used_llm=False, intent="query", query_type="food")
+    if "?" in raw and _latest_assistant_query_type(recent_context) == "recipe_view":
+        return InboxParseResult(items=[], used_llm=False, intent="query", query_type="advice", query_term=raw)
     m_diary = _QUERY_DIARY_RE.search(raw)
     if m_diary:
         term = next((g for g in m_diary.groups() if g and g.strip()), "") or ""
@@ -1863,6 +1958,17 @@ def validate_and_normalize_llm_items(
                 time_hint=time_hint,
             )
         )
+    if any(it.kind == "meal_log" for it in out):
+        out = [
+            it for it in out
+            if not (
+                it.kind == "pulse_log"
+                and (
+                    it.category in {"breakfast", "lunch", "dinner"}
+                    or (it.category == "wake" and "завтрак" in f"{it.title} {it.source_quote}".lower())
+                )
+            )
+        ]
     return _dedupe_items(out)
 
 
@@ -1928,6 +2034,18 @@ async def analyze_inbox_text(
             )
             if query_type != "none" and intent == "capture" and not items:
                 intent = "query"
+            if (
+                query_type == "food"
+                and not _QUERY_FOOD_RE.search(clean_text)
+                and (
+                    _COOKING_QUESTION_RE.search(clean_text)
+                    or ("?" in clean_text and _latest_assistant_query_type(recent_context) == "recipe_view")
+                )
+            ):
+                intent = "query"
+                query_type = "advice"
+                query_term = clean_text
+                items = []
             # Защита: вопрос "думаю/хочу съесть ..." никогда не должен молча логироваться как meal_log
             if (
                 len(_split_clauses(clean_text)) <= 1

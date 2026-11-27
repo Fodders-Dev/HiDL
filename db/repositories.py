@@ -905,6 +905,26 @@ def _pantry_from_base(amount_base: float, target_unit: str) -> float:
     return round(amount_base, 2)
 
 
+_OAT_MILK_EXCLUDE_WORDS = ("йогурт", "десерт", "сливк", "коктейл", "кисел", "каш", "хлоп")
+_OAT_MILK_INCLUDE_WORDS = (
+    "овсяное молоко",
+    "молоко овсяное",
+    "напиток овсяный",
+    "овсяный напиток",
+    "nemoloko",
+    "немолоко",
+)
+
+
+def _pantry_canonical_merge_group(name: str) -> Optional[str]:
+    low = re.sub(r"\s+", " ", (name or "").strip()).casefold().replace("ё", "е")
+    if not low or any(w in low for w in _OAT_MILK_EXCLUDE_WORDS):
+        return None
+    if any(w in low for w in _OAT_MILK_INCLUDE_WORDS):
+        return "milk_oat"
+    return None
+
+
 async def upsert_pantry_item_merged(
     conn: aiosqlite.Connection,
     user_id: int,
@@ -944,6 +964,16 @@ async def upsert_pantry_item_merged(
         ),
         None,
     )
+    if match_row is None:
+        cand_group = _pantry_canonical_merge_group(clean_name)
+        if cand_group is not None:
+            match_row = next(
+                (
+                    r for r in existing_rows
+                    if _pantry_canonical_merge_group(str(r["name"] or "")) == cand_group
+                ),
+                None,
+            )
     now = utc_now_str()
     if match_row:
         cur_amt = float(match_row["amount"] or 0)

@@ -85,7 +85,21 @@ _CANONICAL_ALIASES: List[Tuple[str, Tuple[str, ...]]] = [
         ),
     ),
     ("milk_coconut", ("кокосовое молоко",)),
-    ("milk_oat", ("овсяное молоко", "растительное молоко", "соевое молоко", "миндальное молоко")),
+    ("oat_yogurt", ("йогурт овсяный", "овсяный йогурт", "йогурт nemoloko", "растительный йогурт")),
+    (
+        "milk_oat",
+        (
+            "овсяное молоко",
+            "молоко овсяное",
+            "напиток овсяный",
+            "овсяный напиток",
+            "немолоко",
+            "nemoloko",
+            "растительное молоко",
+            "соевое молоко",
+            "миндальное молоко",
+        ),
+    ),
     ("oat_cream", ("овсяные сливки", "растительные сливки")),
     ("milk_dairy", ("молоко",)),
     ("green_beans", ("стручковая фасоль", "фасоль стручковая")),
@@ -426,6 +440,49 @@ def is_staple_ingredient(name: str) -> bool:
     return False
 
 
+def is_dry_legume_item(name: str) -> bool:
+    """Вернуть True, если продукт в холодильнике — сухие/неготовые бобовые (требуют замачивания и долгой варки)."""
+    low = str(name or "").casefold().replace("ё", "е")
+    if not low:
+        return False
+    if "сух" in low and any(k in low for k in ("фасол", "нут", "горох")):
+        return True
+    return "колот" in low and "горох" in low
+
+
+def recipe_expects_ready_legume(recipe: Dict[str, Any], ing_name: str) -> bool:
+    """Вернуть True, если рецепт ожидает готовую/консервированную фасоль, нут или горох, а не сухую."""
+    low = str(ing_name or "").casefold().replace("ё", "е")
+    if not any(k in low for k in ("фасол", "нут", "горох")):
+        return False
+    if "сух" in low or "стручк" in low or "колот" in low:
+        return False
+    if any(k in low for k in ("консерв", "варен", "в томате")):
+        return True
+    try:
+        t_min = int(recipe.get("time_minutes") or 25)
+    except (TypeError, ValueError):
+        t_min = 25
+    return t_min <= 25
+
+
+def detect_recipe_prep_warning(recipe: Dict[str, Any]) -> Optional[str]:
+    """Определить, нужна ли рецепту предварительная подготовка заранее (замачивание, на ночь, маринад, разморозка)."""
+    steps = [str(s) for s in (recipe.get("steps") or []) if s]
+    blob = " ".join([str(recipe.get("title") or ""), str(recipe.get("desc") or ""), *steps]).casefold().replace("ё", "е")
+    if not blob:
+        return None
+    if "на ночь" in blob or "с вечера" in blob:
+        return "Подготовка с вечера (на ночь)"
+    if "замоч" in blob or "замачив" in blob:
+        return "Нужно замочить заранее"
+    if "маринов" in blob:
+        return "Нужно замариновать заранее"
+    if "размороз" in blob:
+        return "Нужно разморозить заранее"
+    return None
+
+
 @lru_cache(maxsize=16384)
 def ingredients_match(name_a: str, name_b: str) -> bool:
     """Сопоставить два названия ингредиентов по синонимам и русским основам."""
@@ -497,10 +554,12 @@ def match_recipe_to_pantry(
             continue
 
         total_non_staple += 1
+        expects_ready_leg = recipe_expects_ready_legume(recipe, ing_name)
         matching_rows = [
             p for p in pantry_items
             if ingredients_match(ing_name, str(p.get("name") or ""))
             and float(p.get("amount") or 0) > 1e-6
+            and not (expects_ready_leg and is_dry_legume_item(str(p.get("name") or "")))
         ]
         matched_pantry = matching_rows[0] if matching_rows else None
         if not matched_pantry:
@@ -951,7 +1010,13 @@ async def commit_cooked_recipe(
             await repo.delete_pantry_item(db, user_id, pid)
         else:
             await repo.update_pantry_item(db, user_id, pid, amount=round(new_amt, 2))
-        deducted.append({"name": item["pantry_name"], "remaining": round(new_amt, 2), "unit": p_unit})
+        deducted.append({
+            "pantry_id": pid,
+            "name": item["pantry_name"],
+            "before": round(cur_amt, 2),
+            "remaining": round(new_amt, 2),
+            "unit": p_unit,
+        })
 
     # Отметить в сегодняшнем меню, если совпадает рецепт (или исходный id адаптированного) или слот
     target_rid = str(recipe.get("adapted_from_id") or recipe.get("id") or recipe_id)
@@ -1320,7 +1385,7 @@ _PANTRY_BOOSTER_CATALOG: Tuple[Tuple[str, Tuple[str, ...], str, int, float, floa
     ("beans", ("нут", "фасол", "эдамаме"), "фасоль/нут", 185, 11.0, 2.0, 30.0, True, False, True),
     ("peanut_butter", ("арахисовая паста", "ореховая паста", "миндаль", "грецк"), "арахисовая паста 30 г", 180, 8.0, 15.0, 6.0, True, True, False),
     ("hummus", ("хумус",), "хумус", 160, 6.0, 10.0, 12.0, True, False, True),
-    ("yogurt", ("йогурт", "nemoloko"), "растительный йогурт", 110, 3.0, 3.0, 17.0, True, True, False),
+    ("yogurt", ("йогурт",), "растительный йогурт", 110, 3.0, 3.0, 17.0, True, True, False),
     ("seeds", ("чиа", "кунжут", "тыквенные семеч"), "семена", 115, 4.0, 9.0, 4.0, True, True, True),
     # Невеганские опции (только при profile != 'vegan')
     ("cottage_cheese", ("творог",), "творог 150 г", 165, 25.0, 4.0, 5.0, False, True, True),
@@ -2092,8 +2157,10 @@ async def get_meal_plan_view(
             rec = recipes_by_id.get(str(r.get("recipe_id") or ""))
             if rec:
                 r["missing_count"] = len(match_recipe_to_pantry(rec, pantry, servings=1)["missing"])
+                r["prep_warning"] = detect_recipe_prep_warning(rec)
             else:
                 r["missing_count"] = 0
+                r["prep_warning"] = None
 
     missing = await compute_meal_plan_missing_shopping(db, user, enriched_rows)
     export_data = build_shopping_export(missing)
