@@ -887,11 +887,12 @@ async def commit_cooked_recipe(
     *,
     servings: int = 2,
     meal_slot: Optional[str] = None,
+    recipe_override: Optional[Dict[str, Any]] = None,
     now_utc: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
     """Списать продукты за приготовленное блюдо, обновить меню и начислить карму/закрыть Пульс."""
     user_id = int(user["id"])
-    recipe = await get_recipe_for_user(db, user_id, recipe_id)
+    recipe = dict(recipe_override) if isinstance(recipe_override, dict) else await get_recipe_for_user(db, user_id, recipe_id)
     if not recipe:
         return {"ok": False, "error": "Рецепт не найден."}
 
@@ -952,11 +953,12 @@ async def commit_cooked_recipe(
             await repo.update_pantry_item(db, user_id, pid, amount=round(new_amt, 2))
         deducted.append({"name": item["pantry_name"], "remaining": round(new_amt, 2), "unit": p_unit})
 
-    # Отметить в сегодняшнем меню, если совпадает рецепт или слот
+    # Отметить в сегодняшнем меню, если совпадает рецепт (или исходный id адаптированного) или слот
+    target_rid = str(recipe.get("adapted_from_id") or recipe.get("id") or recipe_id)
     today_plan = await repo.get_meal_plan_for_date(db, user_id, local_date)
     marked_slot: Optional[str] = None
     for slot_row in today_plan:
-        if str(slot_row.get("recipe_id") or "") == str(recipe["id"]):
+        if str(slot_row.get("recipe_id") or "") == target_rid:
             await repo.mark_meal_plan_status(db, user_id, local_date, str(slot_row["meal_slot"]), "cooked")
             marked_slot = str(slot_row["meal_slot"])
             break
@@ -1536,6 +1538,8 @@ def _pick_recipe_for_plan_slot(
     recent_ids: Set[str],
     planned_ingredients: Iterable[str],
     coverage_by_id: Optional[Dict[str, float]] = None,
+    missing_count_by_id: Optional[Dict[str, int]] = None,
+    expiring_hits_by_id: Optional[Dict[str, int]] = None,
     nutrition_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
     slot_target_kcal: float = 0.0,
     slot_target_protein: float = 0.0,
@@ -1562,8 +1566,12 @@ def _pick_recipe_for_plan_slot(
         t_min = int(recipe.get("time_minutes") or 25)
         if coverage_by_id is not None and rid in coverage_by_id:
             cov = coverage_by_id[rid]
+            miss_cnt = int((missing_count_by_id or {}).get(rid, 0))
         else:
-            cov = float(match_recipe_to_pantry(recipe, pantry, servings=2)["coverage"])
+            m_res = match_recipe_to_pantry(recipe, pantry, servings=2)
+            cov = float(m_res["coverage"])
+            miss_cnt = len(m_res["missing"])
+        exp_hits = int((expiring_hits_by_id or {}).get(rid, 0))
 
         score = 0.0
         if meal_slot in tags:
@@ -1575,6 +1583,16 @@ def _pick_recipe_for_plan_slot(
 
         # В первый день максимально опираемся на то, что уже лежит в холодильнике
         score += cov * (46.0 if day_idx == 0 else 22.0)
+        if day_idx == 0:
+            if miss_cnt == 0:
+                score += 16.0
+            elif miss_cnt >= 2:
+                score -= 14.0 * float(miss_cnt - 1)
+            score += 10.0 * min(3, exp_hits)
+        else:
+            if miss_cnt >= 3:
+                score -= 6.0 * float(miss_cnt - 2)
+            score += 5.0 * min(2, exp_hits)
 
         # Баланс КБЖУ и сытности под реальные цели пользователя
         if nutrition_by_id and rid in nutrition_by_id and slot_target_kcal > 0:
@@ -1718,6 +1736,26 @@ async def _attach_plan_nutrition(
     return enriched_rows, targets, daily_summary
 
 
+def _expiring_pantry_id_set(
+    pantry: List[Dict[str, Any]],
+    base_date: datetime.date,
+    *,
+    window_days: int = 3,
+) -> Set[int]:
+    ids: Set[int] = set()
+    for p in pantry:
+        exp_raw = str(p.get("expires_at") or "").strip()
+        if not exp_raw:
+            continue
+        try:
+            exp_dt = datetime.date.fromisoformat(exp_raw[:10])
+        except ValueError:
+            continue
+        if (exp_dt - base_date).days <= window_days:
+            ids.add(int(p.get("id") or 0))
+    return ids
+
+
 async def generate_meal_plan(
     db,
     user: Dict[str, Any],
@@ -1758,10 +1796,21 @@ async def generate_meal_plan(
     planned_ingredients: Set[str] = set()
     saved_rows: List[Dict[str, Any]] = []
     virtual_pantry: List[Dict[str, Any]] = [dict(p) for p in pantry]
-    coverage_by_id: Dict[str, float] = {
-        str(r.get("id") or ""): float(match_recipe_to_pantry(r, virtual_pantry, servings=2)["coverage"])
-        for r in candidates
-    }
+    exp_ids = _expiring_pantry_id_set(virtual_pantry, base_date)
+
+    def _compute_pantry_maps() -> Tuple[Dict[str, float], Dict[str, int], Dict[str, int]]:
+        cov_m: Dict[str, float] = {}
+        miss_m: Dict[str, int] = {}
+        exp_m: Dict[str, int] = {}
+        for r in candidates:
+            rid_k = str(r.get("id") or "")
+            m_res = match_recipe_to_pantry(r, virtual_pantry, servings=2)
+            cov_m[rid_k] = float(m_res["coverage"])
+            miss_m[rid_k] = len(m_res["missing"])
+            exp_m[rid_k] = sum(1 for h in m_res["have"] if int(h.get("pantry_id") or 0) in exp_ids)
+        return cov_m, miss_m, exp_m
+
+    coverage_by_id, missing_count_by_id, expiring_hits_by_id = _compute_pantry_maps()
     nutrition_by_id: Dict[str, Dict[str, Any]] = {
         str(r.get("id") or ""): fitness_nutrition.estimate_recipe_nutrition(r)
         for r in candidates
@@ -1787,6 +1836,8 @@ async def generate_meal_plan(
                 recent_ids=recent_ids,
                 planned_ingredients=planned_ingredients,
                 coverage_by_id=coverage_by_id,
+                missing_count_by_id=missing_count_by_id,
+                expiring_hits_by_id=expiring_hits_by_id,
                 nutrition_by_id=nutrition_by_id if use_kbju else None,
                 slot_target_kcal=slot_kcal,
                 slot_target_protein=slot_p,
@@ -1814,10 +1865,7 @@ async def generate_meal_plan(
             )
             slot_ings = list(enriched.get("ingredients") or picked.get("ingredients") or [])
             _consume_virtual_pool(virtual_pantry, slot_ings)
-            coverage_by_id = {
-                str(r.get("id") or ""): float(match_recipe_to_pantry(r, virtual_pantry, servings=2)["coverage"])
-                for r in candidates
-            }
+            coverage_by_id, missing_count_by_id, expiring_hits_by_id = _compute_pantry_maps()
             row = await repo.upsert_meal_plan_slot(
                 db,
                 user_id,
@@ -2017,6 +2065,36 @@ async def get_meal_plan_view(
     enriched_rows, final_targets, daily_summary = await _attach_plan_nutrition(
         db, user, [dict(r) for r in rows], profile
     )
+    pantry = rows_to_dicts(await repo.list_pantry_items(db, user_id))
+    recipes_all = await load_recipes_for_user(db, user_id)
+    recipes_by_id = {str(r.get("id") or ""): r for r in recipes_all}
+
+    distinct_dates = {str(r.get("plan_date") or "") for r in enriched_rows if r.get("plan_date")}
+    is_incomplete = len(distinct_dates) < eff_days
+    today_uncooked = [
+        r for r in enriched_rows
+        if str(r.get("plan_date") or "") == base_date_str and r.get("status") != "cooked"
+    ]
+    all_today_old = False
+    if today_uncooked:
+        old_flags: List[bool] = []
+        for r in today_uncooked:
+            c_raw = str(r.get("created_at") or "").strip().replace("Z", "")
+            try:
+                c_dt = datetime.datetime.fromisoformat(c_raw)
+                old_flags.append((now - c_dt) > datetime.timedelta(hours=48))
+            except Exception:
+                old_flags.append(False)
+        all_today_old = bool(old_flags) and all(old_flags)
+
+    for r in enriched_rows:
+        if r.get("status") != "cooked":
+            rec = recipes_by_id.get(str(r.get("recipe_id") or ""))
+            if rec:
+                r["missing_count"] = len(match_recipe_to_pantry(rec, pantry, servings=1)["missing"])
+            else:
+                r["missing_count"] = 0
+
     missing = await compute_meal_plan_missing_shopping(db, user, enriched_rows)
     export_data = build_shopping_export(missing)
     return {
@@ -2027,9 +2105,330 @@ async def get_meal_plan_view(
         "nutrition_targets": final_targets,
         "daily_summary": daily_summary,
         "items": enriched_rows,
+        "is_stale": bool(is_incomplete or all_today_old),
         "missing_shopping": missing,
         "missing_shopping_grouped": export_data["groups"],
         "shopping_export_text": export_data["plain_text"],
+    }
+
+
+_ADAPT_SUBSTITUTION_FAMILIES: Tuple[Tuple[str, Tuple[str, ...], bool, str], ...] = (
+    ("herbs", ("петруш", "укроп", "кинз", "базилик", "руккол", "шпинат", "зелен", "салат"), False, "зелень в конце можно пропустить"),
+    ("nuts_seeds", ("миндал", "кешью", "грецк", "фундук", "кедров", "семечк", "кунжут", "чиа", "орех"), True, "посыпка для хруста — можно спокойно пропустить"),
+    ("tomatoes", ("вялен", "пассат", "рублен", "томат", "черри", "помидор"), True, "акцент для вкуса — можно пропустить"),
+    ("plant_milk_cream", ("овсян", "кокосов", "соев", "миндальн", "растительн", "немолок", "nemoloko", "сливк", "молок"), False, ""),
+    ("legumes", ("фасол", "нут", "чечевиц", "эдамаме", "горошек"), False, ""),
+    ("grains_pasta", ("бурый рис", "киноа", "булгур", "кускус", "рис", "гречк", "спагетти", "макарон", "лапш"), False, ""),
+    ("bread_wrap", ("пита", "тортиль", "лаваш", "чиабатт", "хлеб", "батон"), False, ""),
+    ("minor_garnish", ("лимон", "лайм", "имбир", "дрожж", "сироп", "мед", "мёд", "каперс", "оливк"), True, "необязательная добавка — можно пропустить"),
+)
+
+_MEAT_FISH_WORDS = (
+    "куриц", "индейк", "говяд", "свин", "рыб", "лосос", "тунец",
+    "креветк", "ветчин", "бекон", "колбас", "фарш",
+)
+_DAIRY_EGG_WORDS = (
+    "яйц", "творог", "сыр", "сметан", "сливочн", "сливк", "сгущен",
+    "молок", "кефир", "ряженк", "йогурт", "teos",
+)
+_PLANT_ALT_MARKERS = (
+    "овсян", "кокос", "соев", "миндал", "растител", "веган", "немолок", "nemoloko", "тофу",
+)
+
+
+def _pantry_item_allowed_for_adapt(p_name: str, meal_profile: str) -> bool:
+    low = str(p_name or "").casefold().replace("ё", "е")
+    if meal_profile in {"vegan", "vegetarian"}:
+        if any(w in low for w in _MEAT_FISH_WORDS) and not any(m in low for m in ("растител", "веган", "соев", "тофу")):
+            return False
+        if meal_profile == "vegan":
+            if any(w in low for w in _DAIRY_EGG_WORDS) and not any(m in low for m in _PLANT_ALT_MARKERS):
+                return False
+    return True
+
+
+def _match_sub_family(name: str) -> Optional[Tuple[str, bool, str]]:
+    low = str(name or "").casefold().replace("ё", "е")
+    if not low:
+        return None
+    # Не путать арахисовую пасту / томатную пасту с орехами или лапшой
+    if "паст" in low and ("арахис" in low or "орех" in low):
+        return None
+    for fam, kws, skippable, skip_reason in _ADAPT_SUBSTITUTION_FAMILIES:
+        if fam == "plant_milk_cream":
+            has_dairy_like = "сливк" in low or "молок" in low or "немолок" in low or "nemoloko" in low
+            if not has_dairy_like or "масл" in low or "сыр" in low or "йогурт" in low or "хлоп" in low or "каш" in low:
+                continue
+            return fam, skippable, skip_reason
+        if fam == "tomatoes":
+            if not any(k in low for k in ("томат", "помидор", "черри", "пассат")):
+                continue
+            return fam, ("вялен" in low), skip_reason
+        if fam == "nuts_seeds":
+            if "молоко" in low or "паст" in low:
+                continue
+        if fam == "grains_pasta" and "паст" in low and ("арахис" in low or "томат" in low):
+            continue
+        if any(kw in low for kw in kws):
+            return fam, skippable, skip_reason
+    return None
+
+
+def _is_small_garnish_qty(qty: float, unit: str) -> bool:
+    u = str(unit or "").strip().lower()
+    if any(tok in u for tok in ("щеп", "по вкусу", "кап")):
+        return True
+    base, kind = to_base(float(qty or 1.0), u)
+    if kind in {"weight", "volume"}:
+        return base <= 30.0
+    if any(tok in u for tok in ("ч.л", "ст.л", "зуб")):
+        return float(qty or 1.0) <= 2.0
+    return False
+
+
+def _offline_substitute_missing(
+    missing_items: List[Dict[str, Any]],
+    pantry: List[Dict[str, Any]],
+    *,
+    have_pantry_ids: Set[int],
+    meal_profile: str,
+    base_date: datetime.date,
+) -> List[Dict[str, Any]]:
+    """Детерминированный подбор замен из реального холодильника с приоритетом истекающих продуктов."""
+    exp_ids = _expiring_pantry_id_set(pantry, base_date)
+
+    def _pantry_sort_key(p: Dict[str, Any]) -> Tuple[int, int, str, int]:
+        pid = int(p.get("id") or 0)
+        not_used = 0 if pid not in have_pantry_ids else 1
+        not_exp = 0 if pid in exp_ids else 1
+        exp = str(p.get("expires_at") or "9999-12-31")
+        return (not_exp, not_used, exp, pid)
+
+    sorted_pantry = sorted(
+        [p for p in pantry if float(p.get("amount") or 0) > 1e-6 and _pantry_item_allowed_for_adapt(str(p.get("name") or ""), meal_profile)],
+        key=_pantry_sort_key,
+    )
+
+    subs: List[Dict[str, Any]] = []
+    for miss in missing_items:
+        m_name = str(miss.get("name") or "").strip()
+        m_qty = float(miss.get("qty") or 1.0)
+        m_unit = str(miss.get("unit") or "")
+        fam_info = _match_sub_family(m_name)
+        if not fam_info:
+            subs.append({"missing_name": m_name, "action": "keep", "replacement": "", "reason": "нет прямой замены"})
+            continue
+        fam, skippable, skip_reason = fam_info
+
+        cand_pantry = None
+        for p in sorted_pantry:
+            pid = int(p.get("id") or 0)
+            p_name = str(p.get("name") or "")
+            if pid in have_pantry_ids:
+                continue
+            p_fam = _match_sub_family(p_name)
+            if p_fam and p_fam[0] == fam:
+                cand_pantry = p
+                break
+
+        if cand_pantry is not None and not ("вялен" in m_name.casefold() and _is_small_garnish_qty(m_qty, m_unit)):
+            p_name = str(cand_pantry["name"])
+            is_exp = int(cand_pantry.get("id") or 0) in exp_ids
+            reason = "истекает скоро — в дело!" if is_exp else "есть в холодильнике"
+            subs.append({
+                "missing_name": m_name,
+                "action": "replace",
+                "replacement": p_name,
+                "pantry_id": int(cand_pantry["id"]),
+                "reason": reason,
+            })
+        elif skippable and _is_small_garnish_qty(m_qty, m_unit):
+            subs.append({
+                "missing_name": m_name,
+                "action": "skip",
+                "replacement": "",
+                "reason": skip_reason or "второстепенная добавка — можно пропустить",
+            })
+        elif cand_pantry is not None:
+            subs.append({
+                "missing_name": m_name,
+                "action": "replace",
+                "replacement": str(cand_pantry["name"]),
+                "pantry_id": int(cand_pantry["id"]),
+                "reason": "есть в холодильнике",
+            })
+        else:
+            subs.append({"missing_name": m_name, "action": "keep", "replacement": "", "reason": "нечем заменить дома"})
+    return subs
+
+
+_ADAPT_SYSTEM_PROMPT = (
+    "Ты — шеф-повар HiDL. Пользователь хочет приготовить рецепт, но 1-3 ингредиентов нет дома.\n"
+    "Подбери замену или пропуск СТРОГО из доступных продуктов в списке «В холодильнике» (никаких выдуманных продуктов!).\n"
+    "Ответь СТРОГО валидным JSON:\n"
+    "{\"substitutions\": [{\"missing_name\": str, \"action\": \"replace\"|\"skip\"|\"keep\", "
+    "\"replacement\": str, \"reason\": str}], \"note\": str}.\n"
+    "Правила:\n"
+    "1. Если action='replace', replacement ОБЯЗАН дословно совпадать с названием одного из продуктов в списке холодильника.\n"
+    "2. Отдавай приоритет продуктам с пометкой [истекает].\n"
+    "3. Посыпки/мелкие акценты (орехи 10-20 г, вяленые томаты, лимон/зелень для подачи) можно помечать action='skip' или заменять похожим.\n"
+    "4. Строго соблюдай профиль питания пользователя (vegan -> без молочки, яиц и мяса)."
+)
+
+
+async def adapt_recipe_to_pantry(
+    db,
+    user: Dict[str, Any],
+    recipe_id: str,
+    *,
+    servings: int = 2,
+    llm_client_instance: Optional[LLMClient] = None,
+    now_utc: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    """Подобрать замены или пропуск для 1-3 недостающих продуктов рецепта строго по реальному холодильнику."""
+    user_id = int(user["id"])
+    recipe = await get_recipe_for_user(db, user_id, recipe_id)
+    if not recipe:
+        return {"ok": False, "error": "not_found", "message": "Рецепт не найден."}
+
+    now = now_utc or datetime.datetime.utcnow()
+    tz = str(user.get("timezone") or "UTC")
+    base_date = datetime.date.fromisoformat(local_date_str(now, tz))
+    pantry = rows_to_dicts(await repo.list_pantry_items(db, user_id))
+    profile = await get_user_meal_profile(db, user_id)
+
+    match = match_recipe_to_pantry(recipe, pantry, servings=servings)
+    missing = list(match["missing"])
+    have = list(match["have"])
+    if not missing:
+        return {"ok": True, "already_complete": True, "orig_recipe": recipe, "adapted_recipe": recipe, "substitutions": []}
+
+    if not pantry or (match["coverage"] < 0.50 and len(missing) > 3):
+        return {
+            "ok": False,
+            "error": "too_many_missing",
+            "missing": missing,
+            "coverage": match["coverage"],
+            "orig_recipe": recipe,
+        }
+
+    have_ids = {int(h["pantry_id"]) for h in have if h.get("pantry_id") is not None}
+    offline_subs = _offline_substitute_missing(
+        missing, pantry, have_pantry_ids=have_ids, meal_profile=profile, base_date=base_date
+    )
+    subs_by_missing: Dict[str, Dict[str, Any]] = {
+        str(s["missing_name"]).casefold(): s for s in offline_subs
+    }
+
+    client = llm_client_instance or default_llm_client
+    used_llm = False
+    note = ""
+    if client.is_configured() and len(missing) <= 4:
+        exp_ids = _expiring_pantry_id_set(pantry, base_date)
+        pantry_lines = []
+        for p in pantry[:45]:
+            if float(p.get("amount") or 0) <= 1e-6:
+                continue
+            if not _pantry_item_allowed_for_adapt(str(p.get("name") or ""), profile):
+                continue
+            tag = " [истекает]" if int(p.get("id") or 0) in exp_ids else ""
+            pantry_lines.append(f"- {p['name']} ({format_quantity(p.get('amount'), p.get('unit'))}){tag}")
+        miss_lines = [f"- {m['name']} ({m['qty']:g} {m['unit']})".strip() for m in missing]
+        if pantry_lines:
+            prompt = (
+                f"Рецепт: {recipe.get('title')}\n"
+                f"Профиль питания: {profile}\n\n"
+                f"Не хватает:\n" + "\n".join(miss_lines) + "\n\n"
+                f"В холодильнике:\n" + "\n".join(pantry_lines)
+            )
+            llm_res = await client.complete_json(_ADAPT_SYSTEM_PROMPT, prompt, temperature=0.1, max_tokens=500)
+            if llm_res.ok and isinstance(llm_res.data, dict):
+                raw_subs = llm_res.data.get("substitutions") or []
+                note = str(llm_res.data.get("note") or "").strip()
+                if isinstance(raw_subs, list):
+                    used_llm = True
+                    for raw_s in raw_subs:
+                        if not isinstance(raw_s, dict):
+                            continue
+                        m_name = str(raw_s.get("missing_name") or "").strip()
+                        act = str(raw_s.get("action") or "").strip().lower()
+                        rep = str(raw_s.get("replacement") or "").strip()
+                        reason = str(raw_s.get("reason") or "").strip()
+                        key = m_name.casefold()
+                        if key not in subs_by_missing:
+                            # Поиск по частичному совпадению имени
+                            key = next((k for k in subs_by_missing if k in key or key in k), "")
+                        if not key:
+                            continue
+                        if act == "replace":
+                            matched_p = next(
+                                (
+                                    p for p in pantry
+                                    if float(p.get("amount") or 0) > 1e-6
+                                    and _pantry_item_allowed_for_adapt(str(p.get("name") or ""), profile)
+                                    and (
+                                        str(p.get("name") or "").casefold() == rep.casefold()
+                                        or ingredients_match(rep, str(p.get("name") or ""))
+                                    )
+                                ),
+                                None,
+                            )
+                            if matched_p is not None:
+                                subs_by_missing[key] = {
+                                    "missing_name": subs_by_missing[key]["missing_name"],
+                                    "action": "replace",
+                                    "replacement": str(matched_p["name"]),
+                                    "pantry_id": int(matched_p["id"]),
+                                    "reason": reason or "есть в холодильнике",
+                                }
+                        elif act == "skip":
+                            subs_by_missing[key] = {
+                                "missing_name": subs_by_missing[key]["missing_name"],
+                                "action": "skip",
+                                "replacement": "",
+                                "reason": reason or "можно пропустить",
+                            }
+
+    ordered_subs = [subs_by_missing[str(m["name"]).casefold()] for m in missing]
+    # Пересобрать адаптированный список ингредиентов
+    new_ingredients: List[Dict[str, Any]] = []
+    for ing in recipe.get("ingredients") or []:
+        if not isinstance(ing, dict):
+            continue
+        iname = str(ing.get("name") or "").strip()
+        sub = subs_by_missing.get(iname.casefold())
+        if sub is None:
+            new_ingredients.append(dict(ing))
+        elif sub["action"] == "replace" and sub.get("replacement"):
+            upd = dict(ing)
+            upd["name"] = sub["replacement"]
+            new_ingredients.append(upd)
+        elif sub["action"] == "skip":
+            continue
+        else:
+            new_ingredients.append(dict(ing))
+
+    orig_nutrition = fitness_nutrition.estimate_recipe_nutrition(recipe)
+    adapted_recipe = dict(recipe)
+    adapted_recipe["adapted_from_id"] = str(recipe.get("id") or recipe_id)
+    adapted_recipe["title"] = f"{recipe.get('title', 'Рецепт')} (под холодильник)"
+    adapted_recipe["ingredients"] = new_ingredients
+    adapted_recipe["nutrition"] = None
+    adapted_nutrition = fitness_nutrition.estimate_recipe_nutrition(adapted_recipe)
+    adapted_recipe["nutrition"] = adapted_nutrition
+
+    after_match = match_recipe_to_pantry(adapted_recipe, pantry, servings=servings)
+    return {
+        "ok": True,
+        "already_complete": False,
+        "orig_recipe": recipe,
+        "adapted_recipe": adapted_recipe,
+        "substitutions": ordered_subs,
+        "orig_nutrition": orig_nutrition,
+        "adapted_nutrition": adapted_nutrition,
+        "remaining_missing": after_match["missing"],
+        "used_llm": used_llm,
+        "note": note,
     }
 
 
