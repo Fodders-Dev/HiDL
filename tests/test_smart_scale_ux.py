@@ -357,8 +357,9 @@ class SmartScaleUXTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Atomic Habits", cb_card.message.edit_text.call_args.args[0])
 
     async def test_5_weigh_in_scheduler_reminders_and_karma_penalty(self) -> None:
-        # 8 days old weight entry -> should trigger morning reminder AND -5 karma penalty
-        old_ts = (datetime.datetime.utcnow() - datetime.timedelta(days=8)).isoformat()
+        # 8 days old weight entry relative to now_morn -> should trigger morning reminder AND -5 karma penalty
+        now_morn = datetime.datetime(2026, 11, 25, 6, 0, 0)
+        old_ts = (now_morn - datetime.timedelta(days=8)).isoformat()
         await self.db.execute(
             "INSERT INTO weights (user_id, weight, body_fat_pct, visceral_fat, source, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (self.u_id, 100.0, 30.0, 15.0, "scale_photo", old_ts),
@@ -382,7 +383,6 @@ class SmartScaleUXTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
 
         # 06:00 UTC = 09:00 Europe/Moscow (within wake 08:00..10:30 window)
-        now_morn = datetime.datetime(2026, 11, 25, 6, 0, 0)
         bot_mock = SimpleNamespace(send_message=AsyncMock())
         sched = ReminderScheduler(bot_mock, self.db)
         sent = await sched._tick_weight_prompt(now_utc=now_morn)
